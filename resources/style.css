@@ -1,0 +1,206 @@
+/* Sidebar */
+.sidebar-section {
+  font-weight: bold;
+  font-size: smaller;
+  opacity: 0.6;
+  margin: 10px 12px 2px 12px;
+}
+
+.thread-title.unread {
+  font-weight: 800;
+}
+
+.thread-preview.unread {
+  opacity: 1;
+  font-weight: 600;
+}
+
+.unread-dot {
+  background-color: @accent_bg_color;
+  border-radius: 9999px;
+  min-width: 9px;
+  min-height: 9px;
+}
+
+/* Stories tray */
+.story-ring {
+  border-radius: 9999px;
+  padding: 3px;
+  background: alpha(currentColor, 0.18);
+}
+
+.story-ring.unseen {
+  background-image: linear-gradient(45deg, #f9ce34, #ee2a7b 55%, #6228d7);
+}
+
+.story-ring.own {
+  background: alpha(currentColor, 0.1);
+}
+
+.story-ring > .story-gap {
+  border-radius: 9999px;
+  padding: 2px;
+  background-color: @window_bg_color;
+}
+
+.story-button {
+  padding: 4px;
+}
+
+/* Posts */
+.post {
+  padding-bottom: 6px;
+}
+
+.post-media {
+  background-color: black;
+}
+
+.post-header {
+  padding: 10px 12px;
+}
+
+.username {
+  font-weight: bold;
+}
+
+.like-button.liked {
+  color: #ed4956;
+}
+
+.media-counter {
+  background-color: alpha(black, 0.6);
+  color: white;
+  border-radius: 9999px;
+  padding: 2px 8px;
+  font-size: smaller;
+  font-weight: bold;
+}
+
+.caught-up {
+  padding: 32px 12px 48px 12px;
+}
+
+.caught-up .ok-icon {
+  color: @success_color;
+}
+
+/* Chat */
+.chat-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid alpha(currentColor, 0.1);
+}
+
+.composer {
+  padding: 8px 12px;
+  border-top: 1px solid alpha(currentColor, 0.1);
+}
+
+.bubble {
+  padding: 7px 12px;
+  border-radius: 18px;
+}
+
+.bubble.incoming {
+  background-color: alpha(currentColor, 0.09);
+}
+
+.bubble.outgoing {
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+}
+
+.bubble.outgoing link,
+.bubble.outgoing label link {
+  color: @accent_fg_color;
+}
+
+.bubble.pending {
+  opacity: 0.6;
+}
+
+.bubble.bare {
+  padding: 0;
+  background: none;
+}
+
+.bubble-card {
+  border-radius: 14px;
+  background-color: alpha(currentColor, 0.07);
+}
+
+.rounded {
+  border-radius: 14px;
+}
+
+.emoji-big {
+  font-size: 34px;
+}
+
+.reaction {
+  font-size: smaller;
+  border-radius: 9999px;
+  padding: 0 6px;
+  background-color: @window_bg_color;
+  border: 1px solid alpha(currentColor, 0.15);
+}
+
+.reply-quote {
+  font-size: smaller;
+  opacity: 0.7;
+  border-left: 2px solid alpha(currentColor, 0.4);
+  padding-left: 6px;
+  margin-bottom: 2px;
+}
+
+.day-separator {
+  font-size: smaller;
+  opacity: 0.55;
+  margin: 10px 0 4px 0;
+}
+
+.info-message {
+  font-size: smaller;
+  font-style: italic;
+  opacity: 0.6;
+}
+
+/* Story viewer */
+.story-viewer {
+  background-color: black;
+  color: white;
+}
+
+.story-viewer .story-top {
+  padding: 10px 10px 6px 10px;
+  background-image: linear-gradient(to bottom, alpha(black, 0.55), alpha(black, 0));
+}
+
+.story-viewer progressbar.horizontal > trough,
+.story-viewer progressbar.horizontal > trough > progress {
+  min-height: 3px;
+  min-width: 0;
+}
+
+.story-viewer progressbar.horizontal > trough {
+  background-color: alpha(white, 0.35);
+}
+
+.story-viewer progressbar.horizontal > trough > progress {
+  background-color: white;
+}
+
+.story-viewer button {
+  color: white;
+}
+
+/* Profile */
+.profile-counts {
+  font-weight: 600;
+}
+
+.grid-badge {
+  color: white;
+  margin: 6px;
+  -gtk-icon-shadow: 0 1px 2px alpha(black, 0.6);
+}

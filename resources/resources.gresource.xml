@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/io/github/eliavandini/Finsta">
+    <file compressed="true">style.css</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/heart-outline-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/heart-filled-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/comment-symbolic.svg</file>
+  </gresource>
+</gresources>
