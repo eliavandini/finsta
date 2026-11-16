@@ -75,9 +75,10 @@ permissions. **Log Out** on your profile removes it.
 
 ## Caveats
 
-Instagram has no public API for personal accounts, so Finsta uses the private
-API that Instagram's own apps use, the same approach as tools like instaloader
-and instagrapi. That means:
+Instagram has no public API for personal accounts, so Finsta uses the
+internal API that instagram.com itself calls, with your web login's cookies
+and the user agent of the browser you signed in with. (It used to pose as the
+iPhone app, which Instagram now rejects.) That means:
 
 - It can break whenever Instagram changes its API.
 - Using unofficial clients is against Instagram's terms and could get an

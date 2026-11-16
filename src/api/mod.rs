@@ -1,6 +1,7 @@
-//! A small client for the endpoints of Instagram's private (mobile) API that
-//! Finsta needs. Authentication reuses the cookies of a normal instagram.com
-//! web login.
+//! A small client for the parts of Instagram's web API (the JSON endpoints
+//! instagram.com itself calls) that Finsta needs. Authentication is the
+//! cookies of a normal instagram.com login, sent the way the website sends
+//! them, with the user agent of the browser that signed in.
 
 pub mod models;
 pub mod session;
@@ -11,15 +12,23 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use reqwest::Method;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 pub use models::*;
 pub use session::Session;
 
-const DEFAULT_API: &str = "https://i.instagram.com/api/v1/";
-const USER_AGENT: &str = "Instagram 361.0.0.35.82 (iPhone14,3; iOS 17_5_1; en_US; en; scale=3.00; 1284x2778; 674117118) AppleWebKit/420+";
-const APP_ID: &str = "124024574287414";
+const WEB_API: &str = "https://www.instagram.com/api/v1/";
+/// instagram.com also calls a few routes on the API host; used when the
+/// website's own host doesn't serve a route.
+const API_HOST: &str = "https://i.instagram.com/api/v1/";
+/// The app id of instagram.com, sent by the website with every API call.
+const WEB_APP_ID: &str = "936619743392459";
+const ASBD_ID: &str = "359341";
+/// Used when the session was pasted in and the browser it came from is unknown.
+pub const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:145.0) Gecko/20100101 Firefox/145.0";
 
 /// Returned (inside `anyhow::Error`) when Instagram no longer accepts the session.
 #[derive(Debug)]
@@ -77,11 +86,21 @@ struct Inner {
     http: reqwest::Client,
     session: RwLock<Session>,
     base: String,
-    pigeon_session: String,
+    api_host: String,
+    /// Retry on the API host when instagram.com doesn't serve a route.
+    fallback: bool,
+    /// Route families ("direct_v2", "feed", ...) found to be served only by the API host.
+    api_host_routes: RwLock<HashSet<String>>,
 }
 
-fn timezone_offset() -> String {
-    chrono::Local::now().offset().local_minus_utc().to_string()
+/// "direct_v2/threads/123/" -> "direct_v2". Related routes live on the same host.
+fn route_key(path: &str) -> String {
+    path.split('/').next().unwrap_or_default().to_string()
+}
+
+/// Media ids look like "<media pk>_<owner pk>"; the web endpoints want the pk.
+fn media_pk(media_id: &str) -> &str {
+    media_id.split('_').next().unwrap_or(media_id)
 }
 
 fn random_token() -> String {
@@ -95,15 +114,21 @@ impl Client {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
+            // A redirect means "log in" or "verify it's you"; handle it instead of following it.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build HTTP client");
-        let base = std::env::var("FINSTA_API_BASE").unwrap_or_else(|_| DEFAULT_API.to_string());
+        // Both can point at a mock server for testing (see dev/mock_api.py).
+        let custom = std::env::var("FINSTA_API_BASE").ok();
+        let custom_host = std::env::var("FINSTA_API_HOST").ok();
         Client {
             inner: Arc::new(Inner {
                 http,
                 session: RwLock::new(session),
-                base,
-                pigeon_session: format!("UFS-{}-0", uuid::Uuid::new_v4()),
+                fallback: custom.is_none() || custom_host.is_some(),
+                api_host: custom_host.unwrap_or_else(|| API_HOST.to_string()),
+                base: custom.unwrap_or_else(|| WEB_API.to_string()),
+                api_host_routes: RwLock::new(HashSet::new()),
             }),
         }
     }
@@ -116,11 +141,8 @@ impl Client {
         self.inner.session.read().unwrap().user_id()
     }
 
-    fn device_uuid(&self) -> String {
-        self.inner.session.read().unwrap().device_uuid.clone()
-    }
-
-    fn headers(&self) -> HeaderMap {
+    /// The headers instagram.com sends with its own API calls.
+    fn headers(&self, method: &Method, base: &str) -> HeaderMap {
         let s = self.inner.session.read().unwrap();
         let mut h = HeaderMap::new();
         let mut put = |k: &'static str, v: &str| {
@@ -128,21 +150,22 @@ impl Client {
                 h.insert(HeaderName::from_static(k), v);
             }
         };
-        put("user-agent", USER_AGENT);
-        put("x-ig-app-id", APP_ID);
-        put("x-ig-capabilities", "36r/F/8=");
-        put("x-ig-connection-type", "WiFi");
-        put("x-ig-app-locale", "en_US");
-        put("x-ig-device-locale", "en_US");
-        put("x-ig-mapped-locale", "en_US");
-        put("x-ig-timezone-offset", &timezone_offset());
-        put("x-ig-www-claim", if s.www_claim.is_empty() { "0" } else { &s.www_claim });
-        put("x-ig-device-id", &s.device_uuid);
-        put("x-pigeon-session-id", &self.inner.pigeon_session);
-        put("x-ads-opt-out", "1");
-        put("x-fb-http-engine", "Liger");
+        let ua = if s.user_agent.is_empty() { DEFAULT_USER_AGENT } else { &s.user_agent };
+        put("user-agent", ua);
+        put("accept", "*/*");
+        put("accept-language", "en-US,en;q=0.9");
+        put("x-ig-app-id", WEB_APP_ID);
+        put("x-asbd-id", ASBD_ID);
         put("x-csrftoken", &s.csrf_token());
-        put("accept-language", "en-US");
+        put("x-ig-www-claim", if s.www_claim.is_empty() { "0" } else { &s.www_claim });
+        put("x-requested-with", "XMLHttpRequest");
+        put("referer", "https://www.instagram.com/");
+        put("sec-fetch-dest", "empty");
+        put("sec-fetch-mode", "cors");
+        put("sec-fetch-site", if base.starts_with(WEB_API) { "same-origin" } else { "same-site" });
+        if method == Method::POST {
+            put("origin", "https://www.instagram.com");
+        }
         let cookie = s
             .cookies
             .iter()
@@ -184,75 +207,63 @@ impl Client {
         }
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
-        let req = req.headers(self.headers()).build()?;
-        let what = format!("{} {}", req.method(), req.url().path());
-        let resp = match self.inner.http.execute(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("finsta: {what} failed: {e}");
-                return Err(e.into());
+    async fn call(
+        &self,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+        form: Option<&[(&str, String)]>,
+    ) -> Result<Value> {
+        let path = path.trim_start_matches('/');
+        let route = route_key(path);
+        let mut api_host = self.inner.fallback && self.inner.api_host_routes.read().unwrap().contains(&route);
+        loop {
+            let base = if api_host { &self.inner.api_host } else { &self.inner.base };
+            let mut req = self.inner.http.request(method.clone(), format!("{base}{path}")).query(query);
+            if let Some(form) = form {
+                req = req.form(form);
             }
-        };
-        let status = resp.status();
-        let final_url = resp.url().clone();
-        self.absorb_headers(resp.headers());
-        let text = resp.text().await?;
-        let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        let message = json["message"].as_str().unwrap_or_default().to_string();
-        let failed = !status.is_success() || json.is_null() || json["status"].as_str() == Some("fail");
-        if failed {
-            // Never logs cookies or headers, only what Instagram said.
-            eprintln!("finsta: {what} -> HTTP {status}: {}", describe_failure(&json, &text, &final_url));
-        }
-
-        // Checked before the 401 test: Instagram also answers 401 with
-        // "Please wait a few minutes" when it throttles a valid session.
-        if status.as_u16() == 429 || message.contains("wait a few minutes") {
-            bail!("Instagram is rate limiting requests. Try again in a few minutes.");
-        }
-        if message == "checkpoint_required" || message == "challenge_required" || json["challenge"].is_object() {
-            bail!(
-                "Instagram wants to verify this login. Open instagram.com in a browser, confirm it was you, then try again."
+            let req = req.headers(self.headers(&method, base)).build()?;
+            let what = format!(
+                "{} {}{}",
+                req.method(),
+                req.url().host_str().unwrap_or_default(),
+                req.url().path()
             );
-        }
-        if status.as_u16() == 401
-            || message == "login_required"
-            || json["require_login"].as_bool() == Some(true)
-            || json["logout_reason"].is_number()
-        {
-            return Err(LoginRequired.into());
-        }
-        if !status.is_success() || json["status"].as_str() == Some("fail") {
-            if message.is_empty() {
-                bail!("Instagram returned an error ({status})");
-            }
-            bail!("Instagram: {message}");
-        }
-        if json.is_null() {
-            bail!("Instagram returned an unexpected response");
-        }
-        Ok(json)
-    }
+            let resp = match self.inner.http.execute(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("finsta: {what} failed: {e}");
+                    return Err(e.into());
+                }
+            };
+            let status = resp.status();
+            let location = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            self.absorb_headers(resp.headers());
+            let text = resp.text().await?;
+            let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
 
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.inner.base, path.trim_start_matches('/'))
+            if status.as_u16() == 404 && !json.is_object() && self.inner.fallback && !api_host {
+                eprintln!("finsta: {what} -> HTTP 404 page, retrying on the API host");
+                self.inner.api_host_routes.write().unwrap().insert(route.clone());
+                api_host = true;
+                continue;
+            }
+            return check_response(&what, status, &location, &json, &text);
+        }
     }
 
     pub async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
-        let req = self.inner.http.get(self.url(path)).query(query);
-        self.send(req).await
+        self.call(Method::GET, path, query, None).await
     }
 
     pub async fn post(&self, path: &str, form: &[(&str, String)]) -> Result<Value> {
-        let req = self.inner.http.post(self.url(path)).form(form);
-        self.send(req).await
-    }
-
-    /// POST with the `signed_body` envelope newer endpoints expect.
-    pub async fn post_signed(&self, path: &str, data: Value) -> Result<Value> {
-        let body = format!("SIGNATURE.{data}");
-        self.post(path, &[("signed_body", body)]).await
+        self.call(Method::POST, path, &[], Some(form)).await
     }
 
     // ----- Users ---------------------------------------------------------
@@ -270,14 +281,13 @@ impl Client {
     pub async fn set_following(&self, pk: &str, follow: bool) -> Result<FriendshipStatus> {
         let action = if follow { "create" } else { "destroy" };
         let v = self
-            .post_signed(
+            .post(
                 &format!("friendships/{action}/{pk}/"),
-                json!({
-                    "user_id": pk,
-                    "_uuid": self.device_uuid(),
-                    "radio_type": "wifi-none",
-                    "container_module": "profile",
-                }),
+                &[
+                    ("container_module", "profile".into()),
+                    ("nav_chain", String::new()),
+                    ("user_id", pk.to_string()),
+                ],
             )
             .await?;
         Ok(parse(&v["friendship_status"]).unwrap_or_default())
@@ -286,25 +296,35 @@ impl Client {
     pub async fn search_users(&self, query: &str) -> Result<Vec<User>> {
         let v = self
             .get(
-                "users/search/",
+                "web/search/topsearch/",
                 &[
-                    ("q", query.to_string()),
-                    ("count", "20".into()),
-                    ("timezone_offset", timezone_offset()),
+                    ("context", "user".to_string()),
+                    ("query", query.to_string()),
+                    ("include_reel", "false".into()),
                 ],
             )
             .await?;
-        Ok(parse(&v["users"]).unwrap_or_default())
+        // Entries are {"position": n, "user": {...}}.
+        let users = v["users"]
+            .as_array()
+            .map(|list| {
+                list.iter()
+                    .filter_map(|u| parse::<User>(if u["user"].is_object() { &u["user"] } else { u }))
+                    .filter(|u| !u.pk.is_empty())
+                    .take(20)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(users)
     }
 
     /// The ids of every account the signed-in user follows.
     pub async fn following_ids(&self) -> Result<HashSet<String>> {
         let me = self.user_id();
-        let rank_token = uuid::Uuid::new_v4().to_string();
         let mut ids = HashSet::new();
         let mut max_id: Option<String> = None;
-        for _ in 0..40 {
-            let mut q = vec![("count", "200".to_string()), ("rank_token", rank_token.clone())];
+        for _ in 0..60 {
+            let mut q = vec![("count", "100".to_string())];
             if let Some(m) = &max_id {
                 q.push(("max_id", m.clone()));
             }
@@ -339,24 +359,18 @@ impl Client {
     // ----- Home feed -----------------------------------------------------
 
     pub async fn timeline(&self, max_id: Option<String>, refresh: bool) -> Result<TimelinePage> {
-        let uuid = self.device_uuid();
+        let device_id = {
+            let s = self.inner.session.read().unwrap();
+            s.cookies.get("ig_did").cloned().unwrap_or_else(|| s.device_uuid.clone())
+        };
         let mut form: Vec<(&str, String)> = vec![
-            ("_uuid", uuid.clone()),
-            ("device_id", uuid.clone()),
-            ("phone_id", uuid),
-            ("is_prefetch", "0".into()),
-            ("is_pull_to_refresh", if refresh { "1" } else { "0" }.into()),
+            ("device_id", device_id),
+            ("is_async_ads_double_request", "0".into()),
+            ("is_async_ads_in_headload_enabled", "0".into()),
+            ("is_async_ads_rti", "0".into()),
+            ("rti_delivery_backend", "0".into()),
             ("feed_view_info", "[]".into()),
-            ("seen_posts", String::new()),
-            ("unseen_posts", String::new()),
-            ("battery_level", "100".into()),
-            ("is_charging", "1".into()),
-            ("will_sound_on", "0".into()),
-            ("is_on_screen", "true".into()),
-            ("is_dark_mode", "0".into()),
-            ("timezone_offset", timezone_offset()),
-            ("request_id", uuid::Uuid::new_v4().to_string()),
-            ("session_id", self.inner.pigeon_session.clone()),
+            ("is_pull_to_refresh", if refresh { "1" } else { "0" }.into()),
         ];
         match max_id {
             Some(m) => {
@@ -404,27 +418,18 @@ impl Client {
 
     pub async fn like(&self, media_id: &str, like: bool) -> Result<()> {
         let action = if like { "like" } else { "unlike" };
-        self.post_signed(
-            &format!("media/{media_id}/{action}/"),
-            json!({
-                "media_id": media_id,
-                "_uuid": self.device_uuid(),
-                "radio_type": "wifi-none",
-                "module_name": "feed_timeline",
-                "container_module": "feed_timeline",
-                "delivery_class": "organic",
-                "is_carousel_bumped_post": "false",
-            }),
-        )
-        .await?;
+        self.post(&format!("web/likes/{}/{action}/", media_pk(media_id)), &[]).await?;
         Ok(())
     }
 
     pub async fn comments(&self, media_id: &str) -> Result<Vec<Comment>> {
         let v = self
             .get(
-                &format!("media/{media_id}/comments/"),
-                &[("can_support_threading", "true".into())],
+                &format!("media/{}/comments/", media_pk(media_id)),
+                &[
+                    ("can_support_threading", "true".into()),
+                    ("permalink_enabled", "false".into()),
+                ],
             )
             .await?;
         Ok(parse(&v["comments"]).unwrap_or_default())
@@ -432,42 +437,41 @@ impl Client {
 
     pub async fn add_comment(&self, media_id: &str, text: &str) -> Result<Comment> {
         let v = self
-            .post_signed(
-                &format!("media/{media_id}/comment/"),
-                json!({
-                    "comment_text": text,
-                    "_uuid": self.device_uuid(),
-                    "idempotence_token": uuid::Uuid::new_v4().to_string(),
-                    "container_module": "comments_v2_feed_timeline",
-                    "delivery_class": "organic",
-                    "radio_type": "wifi-none",
-                }),
+            .post(
+                &format!("web/comments/{}/add/", media_pk(media_id)),
+                &[("comment_text", text.to_string()), ("replied_to_comment_id", String::new())],
             )
             .await?;
-        parse(&v["comment"]).ok_or_else(|| anyhow!("Comment was not posted"))
+        // The website gets {"id", "text", "created_time", "from": {...}} back.
+        let raw = if v["comment"].is_object() {
+            v["comment"].clone()
+        } else {
+            let from = &v["from"];
+            json!({
+                "text": v["text"],
+                "created_at": v["created_time"],
+                "user": {
+                    "pk": from["id"],
+                    "username": from["username"],
+                    "full_name": from["full_name"],
+                    "profile_pic_url": from["profile_picture"],
+                },
+            })
+        };
+        let mut comment: Comment = parse(&raw).ok_or_else(|| anyhow!("Comment was not posted"))?;
+        if comment.text.is_empty() {
+            comment.text = text.to_string();
+        }
+        if comment.user.username.is_empty() {
+            comment.user.username = self.session().username;
+        }
+        Ok(comment)
     }
 
     // ----- Stories -------------------------------------------------------
 
     pub async fn reels_tray(&self) -> Result<Vec<Reel>> {
-        let v = match self.get("feed/reels_tray/", &[]).await {
-            Ok(v) => v,
-            Err(e) if is_login_required(&e) => return Err(e),
-            Err(_) => {
-                self.post(
-                    "feed/reels_tray/",
-                    &[
-                        ("reason", "cold_start".into()),
-                        ("_uuid", self.device_uuid()),
-                        ("timezone_offset", timezone_offset()),
-                        ("tray_session_id", uuid::Uuid::new_v4().to_string()),
-                        ("request_id", uuid::Uuid::new_v4().to_string()),
-                        ("page_size", "50".into()),
-                    ],
-                )
-                .await?
-            }
-        };
+        let v = self.get("feed/reels_tray/", &[("is_following_feed", "false".into())]).await?;
         Ok(parse(&v["tray"]).unwrap_or_default())
     }
 
@@ -542,18 +546,11 @@ impl Client {
     /// Sends a text message and returns the id of the thread it landed in.
     pub async fn send_text(&self, to: &Recipient, text: &str) -> Result<Option<String>> {
         let token = random_token();
-        let uuid = self.device_uuid();
         let mut form: Vec<(&str, String)> = vec![
             ("action", "send_item".into()),
-            ("is_x_transport_forward", "false".into()),
-            ("send_silently", "false".into()),
-            ("is_shh_mode", "0".into()),
-            ("send_attribution", "inbox".into()),
             ("client_context", token.clone()),
             ("mutation_token", token.clone()),
             ("offline_threading_id", token),
-            ("_uuid", uuid.clone()),
-            ("device_id", uuid),
         ];
         match to {
             Recipient::Thread(id) => form.push(("thread_ids", format!("[{id}]"))),
@@ -583,10 +580,7 @@ impl Client {
                 ("action", "mark_seen".into()),
                 ("thread_id", thread_id.into()),
                 ("item_id", item_id.into()),
-                ("_uuid", self.device_uuid()),
                 ("use_unified_inbox", "true".into()),
-                ("client_context", random_token()),
-                ("offline_threading_id", random_token()),
             ],
         )
         .await?;
@@ -598,37 +592,80 @@ impl Client {
     /// allowed views are used up.
     pub async fn mark_visual_seen(&self, thread_id: &str, item_id: &str, replay: bool) -> Result<()> {
         let action = if replay { "item_replayed" } else { "item_seen" };
-        let csrf = self.inner.session.read().unwrap().csrf_token();
         self.post(
             &format!("direct_v2/visual_threads/{thread_id}/{action}/"),
-            &[
-                ("item_ids", format!("[{item_id}]")),
-                ("_uuid", self.device_uuid()),
-                ("_csrftoken", csrf),
-            ],
+            &[("item_ids", format!("[{item_id}]"))],
         )
         .await?;
         Ok(())
     }
 
     pub async fn logout(&self) -> Result<()> {
-        let uuid = self.device_uuid();
         self.post(
-            "accounts/logout/",
-            &[
-                ("one_tap_app_login", "false".into()),
-                ("phone_id", uuid.clone()),
-                ("_uuid", uuid.clone()),
-                ("device_id", uuid),
-            ],
+            "web/accounts/logout/ajax/",
+            &[("one_tap_app_login", "0".into()), ("user_id", self.user_id())],
         )
         .await?;
         Ok(())
     }
 }
 
+/// Turn Instagram's answer into a value or a useful error, logging failures
+/// (never cookies or headers, only what Instagram said).
+fn check_response(
+    what: &str,
+    status: reqwest::StatusCode,
+    location: &str,
+    json: &Value,
+    text: &str,
+) -> Result<Value> {
+    let message = json["message"].as_str().unwrap_or_default();
+    let failed = !status.is_success() || !json.is_object() || json["status"].as_str() == Some("fail");
+    if failed {
+        eprintln!("finsta: {what} -> HTTP {status}: {}", describe_failure(json, text, location));
+    }
+
+    if status.is_redirection() {
+        if location.contains("/challenge") || location.contains("/checkpoint") {
+            bail!(VERIFY);
+        }
+        if location.contains("/accounts/login") {
+            return Err(LoginRequired.into());
+        }
+        bail!("Instagram redirected the request unexpectedly ({status})");
+    }
+    // Checked before the 401 test: Instagram also answers 401 with
+    // "Please wait a few minutes" when it throttles a valid session.
+    if status.as_u16() == 429 || message.contains("wait a few minutes") {
+        bail!("Instagram is rate limiting requests. Try again in a few minutes.");
+    }
+    if message == "checkpoint_required" || message == "challenge_required" || json["challenge"].is_object() {
+        bail!(VERIFY);
+    }
+    if status.as_u16() == 401
+        || message == "login_required"
+        || json["require_login"].as_bool() == Some(true)
+        || json["logout_reason"].is_number()
+    {
+        return Err(LoginRequired.into());
+    }
+    if failed {
+        if message.is_empty() {
+            bail!("Instagram returned an error ({status})");
+        }
+        bail!("Instagram: {message}");
+    }
+    Ok(json.clone())
+}
+
+const VERIFY: &str =
+    "Instagram wants to verify this login. Open instagram.com in a browser, confirm it was you, then try again.";
+
 /// A one-line summary of a failed response for the log.
-fn describe_failure(json: &Value, text: &str, url: &reqwest::Url) -> String {
+fn describe_failure(json: &Value, text: &str, location: &str) -> String {
+    if !location.is_empty() {
+        return format!("redirect to {}", location.split('?').next().unwrap_or_default());
+    }
     if json.is_object() {
         let out = json.to_string();
         if out.chars().count() > 400 {
@@ -641,8 +678,8 @@ fn describe_failure(json: &Value, text: &str, url: &reqwest::Url) -> String {
         .and_then(|(_, rest)| rest.split_once("</title>"))
         .map(|(t, _)| t.split_whitespace().collect::<Vec<_>>().join(" "));
     match title {
-        Some(t) => format!("HTML page \"{t}\" at {}{}", url.host_str().unwrap_or_default(), url.path()),
-        None if text.is_empty() => format!("empty body at {}{}", url.host_str().unwrap_or_default(), url.path()),
-        None => format!("{} bytes of non-JSON at {}{}", text.len(), url.host_str().unwrap_or_default(), url.path()),
+        Some(t) => format!("HTML page \"{t}\""),
+        None if text.is_empty() => "empty body".to_string(),
+        None => format!("{} bytes that aren't JSON", text.len()),
     }
 }

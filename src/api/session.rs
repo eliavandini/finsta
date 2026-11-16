@@ -20,6 +20,10 @@ pub struct Session {
     pub www_claim: String,
     #[serde(default)]
     pub username: String,
+    /// The browser user agent the session was created with; API calls use
+    /// the same one. Empty for pasted cookies (a default is used).
+    #[serde(default)]
+    pub user_agent: String,
 }
 
 impl Session {
@@ -29,6 +33,7 @@ impl Session {
             device_uuid: uuid::Uuid::new_v4().to_string(),
             www_claim: "0".into(),
             username: String::new(),
+            user_agent: String::new(),
         };
         let sessionid = session
             .cookies

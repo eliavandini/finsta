@@ -13,7 +13,8 @@ use webkit6::prelude::*;
 
 const LOGIN_URL: &str = "https://www.instagram.com/accounts/login/";
 
-pub fn open(parent: &adw::ApplicationWindow, on_done: impl Fn(BTreeMap<String, String>) + 'static) {
+/// Calls `on_done` with the instagram.com cookies and the browser's user agent.
+pub fn open(parent: &adw::ApplicationWindow, on_done: impl Fn(BTreeMap<String, String>, String) + 'static) {
     let network = webkit6::NetworkSession::new_ephemeral();
     let webview = webkit6::WebView::builder()
         .network_session(&network)
@@ -35,6 +36,11 @@ pub fn open(parent: &adw::ApplicationWindow, on_done: impl Fn(BTreeMap<String, S
         .content(&toolbar)
         .build();
 
+    // API calls reuse this, so they come from the same browser that signed in.
+    let user_agent = webkit6::prelude::WebViewExt::settings(&webview)
+        .and_then(|s| s.user_agent())
+        .map(|ua| ua.to_string())
+        .unwrap_or_default();
     let done = Rc::new(Cell::new(false));
     let on_done = Rc::new(on_done);
     let check = {
@@ -49,6 +55,7 @@ pub fn open(parent: &adw::ApplicationWindow, on_done: impl Fn(BTreeMap<String, S
             let done = done.clone();
             let window = window.clone();
             let on_done = on_done.clone();
+            let user_agent = user_agent.clone();
             cookies.cookies("https://www.instagram.com/", gtk::gio::Cancellable::NONE, move |res| {
                 let Ok(list) = res else { return };
                 let mut map = BTreeMap::new();
@@ -63,7 +70,7 @@ pub fn open(parent: &adw::ApplicationWindow, on_done: impl Fn(BTreeMap<String, S
                     if let Some(w) = window.upgrade() {
                         w.close();
                     }
-                    on_done(map);
+                    on_done(map, user_agent);
                 }
             });
         })

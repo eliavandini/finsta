@@ -24,14 +24,17 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
     let spinner = adw::Spinner::builder().visible(false).height_request(32).build();
 
     // Validate a set of cookies by fetching the account's profile.
-    let finish: Rc<dyn Fn(BTreeMap<String, String>)> = {
+    let finish: Rc<dyn Fn(BTreeMap<String, String>, String)> = {
         let error = error.clone();
         let spinner = spinner.clone();
         let content = content.clone();
-        Rc::new(move |cookies| {
+        Rc::new(move |cookies, user_agent| {
             error.set_visible(false);
             let session = match Session::from_cookies(cookies) {
-                Ok(s) => s,
+                Ok(mut s) => {
+                    s.user_agent = user_agent;
+                    s
+                }
                 Err(e) => {
                     error.set_label(&e.to_string());
                     error.set_visible(true);
@@ -89,7 +92,7 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
         let window = window.clone();
         button.connect_clicked(move |_| {
             let finish = finish.clone();
-            crate::ui::weblogin::open(&window, move |cookies| finish(cookies));
+            crate::ui::weblogin::open(&window, move |cookies, ua| finish(cookies, ua));
         });
         content.append(&button);
         content.append(
@@ -135,7 +138,7 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
             if !csrf.is_empty() {
                 cookies.insert("csrftoken".to_string(), csrf);
             }
-            finish(cookies);
+            finish(cookies, String::new());
         });
         let s = submit.clone();
         cookie_button.connect_clicked(move |_| s());

@@ -3,6 +3,13 @@
     python3 dev/mock_api.py 8765 [request-log-file]
     FINSTA_API_BASE=http://127.0.0.1:8765/api/v1/ XDG_CONFIG_HOME=/tmp/finsta-dev cargo run
 
+To test the fallback to the API host for routes instagram.com doesn't serve,
+run a second instance with "nodm" as the main host (it answers direct_v2
+routes with an HTML 404 page) and point FINSTA_API_HOST at the first one:
+
+    python3 dev/mock_api.py 8766 /dev/null nodm
+    FINSTA_API_BASE=http://127.0.0.1:8766/api/v1/ FINSTA_API_HOST=http://127.0.0.1:8765/api/v1/ cargo run
+
 Sign in with the session cookie "1000%3Aabc%3A1". Needs Pillow for the
 generated placeholder images.
 """
@@ -17,6 +24,7 @@ from urllib.parse import urlparse, parse_qs
 from PIL import Image, ImageDraw
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
+NO_DM = len(sys.argv) > 3 and sys.argv[3] == "nodm"
 BASE = f"http://127.0.0.1:{PORT}"
 NOW = int(time.time())
 ME = "1000"
@@ -186,10 +194,19 @@ class Handler(BaseHTTPRequestHandler):
             body = parse_qs(self.rfile.read(n).decode())
         LOG.append(f"{method} {path} {dict(q)} {body}")
         with open(sys.argv[2] if len(sys.argv) > 2 else "/dev/null", "a") as f:
-            f.write(f"{method} {path} q={dict(q)} body={body} cookie={self.headers.get('Cookie')} csrf={self.headers.get('X-CSRFToken')}\n")
+            f.write(f"{method} :{PORT}{path} q={dict(q)} body={body} cookie={self.headers.get('Cookie')} csrf={self.headers.get('X-CSRFToken')} app={self.headers.get('X-IG-App-ID')} xhr={self.headers.get('X-Requested-With')} origin={self.headers.get('Origin')} ua={self.headers.get('User-Agent')}\n")
         if path.startswith("/img/"):
             return self.serve_image(path[5:])
         p = path.replace("/api/v1/", "")
+        if NO_DM and p.startswith("direct_v2/"):
+            # Like instagram.com if it stopped serving a route: an HTML 404 page.
+            body = b"<!DOCTYPE html><html><head><title>Page Not Found \xe2\x80\xa2 Instagram</title></head></html>"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if m := re.match(r"users/(\d+)/info/", p):
             u = dict(USERS.get(m.group(1), USERS["1001"]))
             u.update({"biography": "Photos, mountains & coffee ☕\nBologna 🇮🇹", "external_url": "https://example.com", "follower_count": 1234, "following_count": 321, "media_count": 15})
@@ -248,8 +265,17 @@ class Handler(BaseHTTPRequestHandler):
             start = 0 if not q.get("max_id") else 12
             items = [media(str(600 + start + i), pk, f"post {start + i}", 86400 * (i + 1), w=1080, h=1080, carousel=3 if i % 5 == 1 else None) for i in range(12 if start == 0 else 3)]
             return self.send_json({"items": items, "more_available": start == 0, "next_max_id": "m2" if start == 0 else None, "status": "ok"})
-        if p == "users/search/":
-            return self.send_json({"users": [USERS["1001"], USERS["1005"], USERS["2002"]], "status": "ok"})
+        if p == "web/search/topsearch/":
+            return self.send_json({"users": [{"position": i, "user": USERS[k]} for i, k in enumerate(["1001", "1005", "2002"])], "places": [], "hashtags": [], "status": "ok"})
+        if m := re.match(r"friendships/(create|destroy)/(\d+)/", p):
+            return self.send_json({"friendship_status": {"following": m.group(1) == "create", "followed_by": True, "outgoing_request": False}, "status": "ok"})
+        if re.match(r"web/likes/\d+/(like|unlike)/", p):
+            return self.send_json({"status": "ok"})
+        if re.match(r"web/comments/\d+/add/", p):
+            me = USERS[ME]
+            return self.send_json({"id": "9001", "text": body.get("comment_text", [""])[0], "created_time": NOW, "from": {"id": ME, "username": me["username"], "full_name": me["full_name"], "profile_picture": me["profile_pic_url"]}, "status": "ok"})
+        if p == "web/accounts/logout/ajax/":
+            return self.send_json({"status": "ok"})
         if re.match(r"media/.+/comments/", p):
             return self.send_json({"comments": [
                 {"pk": 1, "text": "Wow, stunning! 😍", "user": USERS["1002"], "created_at": NOW - 5000, "comment_like_count": 3},
