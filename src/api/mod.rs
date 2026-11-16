@@ -8,7 +8,7 @@ pub mod session;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -64,22 +64,48 @@ pub fn is_rate_limited(err: &anyhow::Error) -> bool {
     err.downcast_ref::<RateLimited>().is_some()
 }
 
-/// Shared by every client: the limit applies to the account and connection.
-static COOLDOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+/// Paused endpoints (ids masked) and when they may be tried again. Instagram
+/// throttles endpoints separately, so one refusing doesn't stop the rest.
+/// Shared by every client, since the limits apply to the account.
+static COOLDOWNS: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
 
-/// How long requests stay paused after Instagram throttled them.
-pub fn cooldown_remaining() -> Option<Duration> {
-    let until = (*COOLDOWN_UNTIL.lock().unwrap())?;
+/// "users/123/info/" -> "users/*/info/"
+fn cooldown_key(path: &str) -> String {
+    path.trim_start_matches('/')
+        .split('/')
+        .map(|seg| {
+            if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit() || c == '_') {
+                "*"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// How long requests to `path` stay paused after Instagram throttled them.
+pub fn cooldown_remaining(path: &str) -> Option<Duration> {
+    let until = *COOLDOWNS.lock().unwrap().get(&cooldown_key(path))?;
     until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
 }
 
-fn start_cooldown(retry_after: Option<Duration>) {
+/// Whether any endpoint is currently paused.
+pub fn any_cooldown() -> bool {
+    let now = Instant::now();
+    COOLDOWNS.lock().unwrap().values().any(|until| *until > now)
+}
+
+fn start_cooldown(key: &str, retry_after: Option<Duration>) {
     let wait = retry_after
         .unwrap_or(Duration::from_secs(120))
         .clamp(Duration::from_secs(30), Duration::from_secs(900));
-    eprintln!("finsta: pausing requests for {}s", wait.as_secs());
-    *COOLDOWN_UNTIL.lock().unwrap() = Some(Instant::now() + wait);
+    eprintln!("finsta: pausing {key} for {}s", wait.as_secs());
+    COOLDOWNS.lock().unwrap().insert(key.to_string(), Instant::now() + wait);
 }
+
+/// The endpoint `Client::current_user` depends on.
+pub const ME_PATH: &str = "accounts/edit/web_form_data/";
 
 #[derive(Debug, Default, Clone)]
 pub struct Page<T> {
@@ -249,10 +275,11 @@ impl Client {
         query: &[(&str, String)],
         form: Option<&[(&str, String)]>,
     ) -> Result<Value> {
-        if cooldown_remaining().is_some() {
+        let path = path.trim_start_matches('/');
+        let pause_key = cooldown_key(path);
+        if cooldown_remaining(path).is_some() {
             return Err(RateLimited.into());
         }
-        let path = path.trim_start_matches('/');
         let route = route_key(path);
         let mut api_host = self.inner.fallback && self.inner.api_host_routes.read().unwrap().contains(&route);
         loop {
@@ -302,7 +329,7 @@ impl Client {
             if let Err(e) = &result
                 && is_rate_limited(e)
             {
-                start_cooldown(retry_after);
+                start_cooldown(&pause_key, retry_after);
             }
             return result;
         }
@@ -321,6 +348,81 @@ impl Client {
     pub async fn user_info(&self, pk: &str) -> Result<User> {
         let v = self.get(&format!("users/{pk}/info/"), &[]).await?;
         parse(&v["user"]).ok_or_else(|| anyhow!("Could not read profile"))
+    }
+
+    /// A profile by username, the way instagram.com's profile pages load it.
+    pub async fn user_by_username(&self, username: &str) -> Result<User> {
+        let v = self
+            .get("users/web_profile_info/", &[("username", username.to_string())])
+            .await?;
+        let u = &v["data"]["user"];
+        if !u.is_object() {
+            bail!("Could not read @{username}'s profile");
+        }
+        let pic = if u["profile_pic_url_hd"].is_string() { &u["profile_pic_url_hd"] } else { &u["profile_pic_url"] };
+        let raw = json!({
+            "pk": u["id"],
+            "username": u["username"],
+            "full_name": u["full_name"],
+            "profile_pic_url": pic,
+            "is_private": u["is_private"],
+            "is_verified": u["is_verified"],
+            "biography": u["biography"],
+            "external_url": u["external_url"],
+            "follower_count": u["edge_followed_by"]["count"],
+            "following_count": u["edge_follow"]["count"],
+            "media_count": u["edge_owner_to_timeline_media"]["count"],
+            "friendship_status": {
+                "following": u["followed_by_viewer"],
+                "followed_by": u["follows_viewer"],
+                "outgoing_request": u["requested_by_viewer"],
+            },
+        });
+        parse(&raw).ok_or_else(|| anyhow!("Could not read @{username}'s profile"))
+    }
+
+    /// The full profile of `user`: by username when known (what the website
+    /// does), otherwise by id.
+    pub async fn profile(&self, user: &User) -> Result<User> {
+        if user.username.is_empty() {
+            return self.user_info(&user.pk).await;
+        }
+        match self.user_by_username(&user.username).await {
+            Ok(u) => Ok(u),
+            Err(e) if is_login_required(&e) => Err(e),
+            Err(e) => {
+                eprintln!("finsta: profile by username failed ({e}); trying by id");
+                self.user_info(&user.pk).await
+            }
+        }
+    }
+
+    /// The signed-in account. Read from the same endpoint instagram.com's
+    /// settings page uses, since users/{id}/info/ is refused to the website.
+    pub async fn current_user(&self) -> Result<User> {
+        let v = self.get(ME_PATH, &[]).await?;
+        let form = &v["form_data"];
+        let username = form["username"].as_str().unwrap_or_default().to_string();
+        if username.is_empty() {
+            bail!("Could not read your profile");
+        }
+        {
+            let mut s = self.inner.session.write().unwrap();
+            if s.username != username {
+                s.username = username.clone();
+                let _ = s.save();
+            }
+        }
+        match self.user_by_username(&username).await {
+            Ok(u) => Ok(u),
+            Err(e) if is_login_required(&e) => Err(e),
+            Err(_) => Ok(User {
+                pk: self.user_id(),
+                full_name: form["first_name"].as_str().unwrap_or_default().to_string(),
+                username,
+                ..Default::default()
+            }),
+        }
     }
 
     pub async fn friendship(&self, pk: &str) -> Result<FriendshipStatus> {

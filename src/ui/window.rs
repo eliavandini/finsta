@@ -233,7 +233,7 @@ impl Main {
     }
 
     fn start(self: &Rc<Self>) {
-        if api::cooldown_remaining().is_some() {
+        if api::any_cooldown() {
             self.limit_toast.set(Some(std::time::Instant::now()));
             self.toast("Signed in. Instagram is limiting requests right now, so things will load in a few minutes.");
         }
@@ -248,7 +248,7 @@ impl Main {
 
     /// Load the signed-in account's profile, waiting out a rate limit first.
     fn load_me(self: &Rc<Self>) {
-        if let Some(wait) = api::cooldown_remaining() {
+        if let Some(wait) = api::cooldown_remaining(api::ME_PATH) {
             let weak = Rc::downgrade(self);
             glib::timeout_add_local_once(wait + std::time::Duration::from_secs(2), move || {
                 if let Some(main) = weak.upgrade()
@@ -261,9 +261,8 @@ impl Main {
         }
         let weak = Rc::downgrade(self);
         let client = self.client.clone();
-        let uid = client.user_id();
         glib::spawn_future_local(async move {
-            let res = rt::bg(async move { client.user_info(&uid).await }).await;
+            let res = rt::bg(async move { client.current_user().await }).await;
             let Some(main) = weak.upgrade() else { return };
             match res {
                 Ok(user) => {

@@ -51,8 +51,7 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
             glib::spawn_future_local(async move {
                 let c = client.clone();
                 let res = rt::bg(async move {
-                    let uid = c.user_id();
-                    c.user_info(&uid).await
+                    c.current_user().await
                 })
                 .await;
                 spinner.set_visible(false);

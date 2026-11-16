@@ -3,11 +3,12 @@
     python3 dev/mock_api.py 8765 [request-log-file]
     FINSTA_API_BASE=http://127.0.0.1:8765/api/v1/ XDG_CONFIG_HOME=/tmp/finsta-dev cargo run
 
-To test the fallback to the API host for routes instagram.com doesn't serve,
-run a second instance with "nodm" as the main host (it answers direct_v2
-routes with an HTML 404 page) and point FINSTA_API_HOST at the first one:
+To mimic how instagram.com behaved for web sessions in November 2026, run a
+second instance with "www" as the main host (it answers direct_v2 routes with
+an HTML 404 page and users/{id}/info/ with 429) and point FINSTA_API_HOST at
+the first one:
 
-    python3 dev/mock_api.py 8766 /dev/null nodm
+    python3 dev/mock_api.py 8766 /dev/null www
     FINSTA_API_BASE=http://127.0.0.1:8766/api/v1/ FINSTA_API_HOST=http://127.0.0.1:8765/api/v1/ cargo run
 
 Sign in with the session cookie "1000%3Aabc%3A1". Needs Pillow for the
@@ -24,7 +25,7 @@ from urllib.parse import urlparse, parse_qs
 from PIL import Image, ImageDraw
 
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8765
-NO_DM = len(sys.argv) > 3 and sys.argv[3] == "nodm"
+WWW = len(sys.argv) > 3 and sys.argv[3] == "www"
 BASE = f"http://127.0.0.1:{PORT}"
 NOW = int(time.time())
 ME = "1000"
@@ -198,7 +199,12 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/img/"):
             return self.serve_image(path[5:])
         p = path.replace("/api/v1/", "")
-        if NO_DM and p.startswith("direct_v2/"):
+        if WWW and re.match(r"users/\d+/info/", p):
+            self.send_response(429)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if WWW and p.startswith("direct_v2/"):
             # Like instagram.com if it stopped serving a route: an HTML 404 page.
             body = b"<!DOCTYPE html><html><head><title>Page Not Found \xe2\x80\xa2 Instagram</title></head></html>"
             self.send_response(404)
@@ -207,6 +213,21 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
+        if p == "accounts/edit/web_form_data/":
+            me = USERS[ME]
+            return self.send_json({"form_data": {"username": me["username"], "first_name": me["full_name"], "biography": ""}, "status": "ok"})
+        if p == "users/web_profile_info/":
+            name = q.get("username", [""])[0]
+            u = next((u for u in USERS.values() if u["username"] == name), None)
+            if not u:
+                return self.send_json({"data": {"user": None}, "status": "ok"}, 404)
+            return self.send_json({"data": {"user": {
+                "id": str(u["pk"]), "username": u["username"], "full_name": u["full_name"],
+                "profile_pic_url": u["profile_pic_url"], "profile_pic_url_hd": u["profile_pic_url"],
+                "is_private": False, "is_verified": u["is_verified"], "biography": "Photos, mountains & coffee ☕\nBologna 🇮🇹",
+                "external_url": "https://example.com", "edge_followed_by": {"count": 1234}, "edge_follow": {"count": 321},
+                "edge_owner_to_timeline_media": {"count": 15}, "followed_by_viewer": u["friendship_status"]["following"],
+                "follows_viewer": True, "requested_by_viewer": False}}, "status": "ok"})
         if m := re.match(r"users/(\d+)/info/", p):
             u = dict(USERS.get(m.group(1), USERS["1001"]))
             u.update({"biography": "Photos, mountains & coffee ☕\nBologna 🇮🇹", "external_url": "https://example.com", "follower_count": 1234, "following_count": 321, "media_count": 15})

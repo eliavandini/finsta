@@ -285,6 +285,7 @@ impl Profile {
         let Some(main) = self.main.upgrade() else { return };
         let client = main.client.clone();
         let pk = self.user.borrow().pk.clone();
+        let known = self.user.borrow().clone();
         let is_me = self.is_me;
         let weak = Rc::downgrade(self);
         self.loading_posts.set(true);
@@ -293,7 +294,7 @@ impl Profile {
                 let friendship = async {
                     if is_me { None } else { Some(client.friendship(&pk).await) }
                 };
-                tokio::join!(client.user_info(&pk), friendship, client.user_feed(&pk, None))
+                tokio::join!(client.profile(&known), friendship, client.user_feed(&pk, None))
             })
             .await;
             let Some(p) = weak.upgrade() else { return };
