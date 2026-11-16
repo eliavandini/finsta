@@ -13,6 +13,7 @@ fn main() -> glib::ExitCode {
     let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|_| {
+        gtk::Window::set_default_icon_name(APP_ID);
         let display = gdk::Display::default().expect("no display");
         gtk::IconTheme::for_display(&display).add_resource_path("/io/github/eliavandini/Finsta/icons");
         let css = gtk::CssProvider::new();

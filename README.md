@@ -35,21 +35,31 @@ There are no reels, no explore page, no suggested posts and no ads.
 - **Content**: home feed with stories, conversations, profiles and posts.
   On narrow windows the sidebar folds away.
 
-## Building
+## Installing
 
-You need Rust (stable), plus the development packages for GTK 4, libadwaita
-and WebKitGTK 6.0. GStreamer plugins are needed to play videos.
+You need Rust (via [rustup](https://rustup.rs)) and the development packages
+for GTK 4, libadwaita and WebKitGTK 6.0. Videos play through GStreamer, which
+needs gst-plugins-good and an H.264 decoder such as gst-libav.
 
 ```sh
 # Arch Linux
-sudo pacman -S gtk4 libadwaita webkitgtk-6.0 gst-plugins-good gst-plugin-gtk4
+sudo pacman -S --needed base-devel rustup gtk4 libadwaita webkitgtk-6.0 gst-plugins-good gst-libav
 
-cargo run --release
+./install.sh              # for your user, into ~/.local
+./install.sh --system     # for all users, into /usr/local (asks for sudo)
 ```
 
-WebKitGTK is only used for the sign-in window. To build without it, use
-`cargo build --no-default-features`; you can then sign in with a session
-cookie only.
+The script checks for missing libraries (and suggests the packages for Arch,
+Debian/Ubuntu, Fedora and openSUSE), builds a release binary, and installs it
+with a desktop entry and icon, so Finsta shows up in your app launcher.
+`./install.sh --uninstall` (plus `--system` if you used it) removes it again;
+your saved session in `~/.config/finsta` is left alone. Other options:
+`--prefix DIR`, `--no-webkit`, and `DESTDIR` for packaging.
+
+WebKitGTK is only used for the sign-in window. Without it (`--no-webkit`, or
+`cargo build --no-default-features`) you sign in with a session cookie.
+
+To just try it from the source tree: `cargo run --release`.
 
 ## Signing in
 

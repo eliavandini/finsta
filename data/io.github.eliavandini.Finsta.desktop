@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Finsta
+GenericName=Instagram Client
+Comment=Direct messages and a calm, following-only Instagram feed
+Exec=finsta
+Icon=io.github.eliavandini.Finsta
+Terminal=false
+Categories=Network;InstantMessaging;GTK;
+Keywords=instagram;messages;dm;chat;feed;stories;
+StartupNotify=true
