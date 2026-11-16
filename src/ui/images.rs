@@ -71,6 +71,14 @@ pub async fn texture(url: &str) -> Option<gdk::Texture> {
     Some(tex)
 }
 
+/// Download and decode without keeping a copy in the cache.
+pub async fn texture_uncached(url: &str) -> Option<gdk::Texture> {
+    if url.is_empty() {
+        return None;
+    }
+    rt::bg(fetch_and_decode(url.to_string())).await
+}
+
 pub fn load_picture(picture: &gtk::Picture, url: Option<String>) {
     let Some(url) = url.filter(|u| !u.is_empty()) else { return };
     if let Some(tex) = cached(&url) {

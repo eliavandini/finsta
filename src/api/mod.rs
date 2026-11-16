@@ -577,6 +577,24 @@ impl Client {
         Ok(())
     }
 
+    /// Tell Instagram a disappearing photo or video was opened (or replayed).
+    /// The sender sees this, and Instagram stops serving the media once the
+    /// allowed views are used up.
+    pub async fn mark_visual_seen(&self, thread_id: &str, item_id: &str, replay: bool) -> Result<()> {
+        let action = if replay { "item_replayed" } else { "item_seen" };
+        let csrf = self.inner.session.read().unwrap().csrf_token();
+        self.post(
+            &format!("direct_v2/visual_threads/{thread_id}/{action}/"),
+            &[
+                ("item_ids", format!("[{item_id}]")),
+                ("_uuid", self.device_uuid()),
+                ("_csrftoken", csrf),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn logout(&self) -> Result<()> {
         let uuid = self.device_uuid();
         self.post(

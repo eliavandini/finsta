@@ -133,6 +133,24 @@
   border-radius: 14px;
 }
 
+.disappearing {
+  border-radius: 18px;
+  padding: 8px 16px 8px 12px;
+  border: 1px solid alpha(currentColor, 0.2);
+}
+
+.disappearing.used {
+  opacity: 0.6;
+}
+
+button.disappearing.openable {
+  border-color: @accent_color;
+}
+
+button.disappearing.openable image {
+  color: @accent_color;
+}
+
 .emoji-big {
   font-size: 34px;
 }

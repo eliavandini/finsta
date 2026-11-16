@@ -396,6 +396,35 @@ pub struct DmItem {
     pub extra: serde_json::Map<String, Value>,
 }
 
+/// A photo or video sent with "View once" or "Allow replay".
+#[derive(Debug, Clone)]
+pub struct Disappearing {
+    /// Only present while you're still allowed to open it.
+    pub image: Option<String>,
+    pub video: Option<String>,
+    pub is_video: bool,
+    /// "once" or "replayable".
+    pub view_mode: String,
+    pub seen_user_ids: Vec<String>,
+    /// For messages you sent: what happened to it ("raven_opened", ...).
+    pub action: String,
+}
+
+impl Disappearing {
+    pub fn is_available(&self) -> bool {
+        self.image.is_some() || self.video.is_some()
+    }
+
+    /// How many times the recipient may open it.
+    pub fn allowed_views(&self) -> u32 {
+        if self.view_mode == "replayable" { 2 } else { 1 }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        if self.is_video { "video" } else { "photo" }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum DmContent {
     Text(String),
@@ -420,6 +449,7 @@ pub enum DmContent {
         duration_ms: i64,
     },
     Gif(Option<String>),
+    Disappearing(Disappearing),
     Info(String),
 }
 
@@ -485,6 +515,69 @@ impl DmItem {
         })
     }
 
+    /// The object describing a disappearing ("visual"/"raven") message.
+    fn visual(&self) -> &Value {
+        let v = self.get("visual_media");
+        if v.is_object() { v } else { self.get("raven_media") }
+    }
+
+    /// A field of the visual message; older responses put some of these on the item itself.
+    fn visual_field(&self, key: &str) -> &Value {
+        let v = &self.visual()[key];
+        if v.is_null() { self.get(key) } else { v }
+    }
+
+    fn disappearing(&self) -> DmContent {
+        let visual = self.visual();
+        let raw = if visual["media"].is_object() { &visual["media"] } else { visual };
+        let media = parse::<Media>(raw).unwrap_or_default();
+        let view_mode = non_empty(str_at(self.visual_field("view_mode"), &[])).unwrap_or("once".into());
+        let has_media = media.image_url(0).is_some() || media.video_url().is_some();
+        if view_mode == "permanent" && has_media {
+            // The sender chose "Keep in chat": it's an ordinary photo or video.
+            return DmContent::Media {
+                image: media.image_url(640),
+                video: media.video_url(),
+                aspect: media.aspect(),
+            };
+        }
+        let seen_user_ids = self
+            .visual_field("seen_user_ids")
+            .as_array()
+            .map(|ids| {
+                ids.iter()
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        DmContent::Disappearing(Disappearing {
+            image: media.image_url(1080),
+            video: media.video_url(),
+            is_video: media.is_video() || media.video_url().is_some(),
+            view_mode,
+            seen_user_ids,
+            action: str_at(self.visual_field("expiring_media_action_summary"), &["type"]),
+        })
+    }
+
+    /// The parts of a message that can change after it was sent and that
+    /// affect how it's shown (reactions, whether a disappearing photo was opened).
+    pub fn state_key(&self) -> String {
+        let mut key = self.reactions().join(",");
+        if let DmContent::Disappearing(d) = self.content() {
+            key.push_str(&format!(
+                "|{}|{}|{}",
+                d.seen_user_ids.join(","),
+                d.action,
+                d.is_available()
+            ));
+        }
+        key
+    }
+
     pub fn content(&self) -> DmContent {
         match self.item_type.as_str() {
             "text" => DmContent::Text(str_at(self.get("text"), &[])),
@@ -496,26 +589,15 @@ impl DmItem {
                         .unwrap_or_else(|| str_at(link, &["link_context", "link_url"])),
                 }
             }
-            "media" | "raven_media" | "visual_media" => {
-                let raw = match self.item_type.as_str() {
-                    "visual_media" => &self.get("visual_media")["media"],
-                    t => self.get(t),
-                };
-                match parse::<Media>(raw) {
-                    Some(m) if m.image_url(0).is_some() || m.video_url().is_some() => {
-                        DmContent::Media {
-                            image: m.image_url(640),
-                            video: m.video_url(),
-                            aspect: m.aspect(),
-                        }
-                    }
-                    _ => DmContent::Info(if self.item_type == "media" {
-                        "Photo unavailable".into()
-                    } else {
-                        "Disappearing photo or video — open the Instagram app to view it".into()
-                    }),
-                }
-            }
+            "media" => match parse::<Media>(self.get("media")) {
+                Some(m) if m.image_url(0).is_some() || m.video_url().is_some() => DmContent::Media {
+                    image: m.image_url(640),
+                    video: m.video_url(),
+                    aspect: m.aspect(),
+                },
+                _ => DmContent::Info("Photo unavailable".into()),
+            },
+            "raven_media" | "visual_media" => self.disappearing(),
             "media_share" => match parse::<Media>(self.get("media_share")) {
                 Some(m) => DmContent::Post(Box::new(m)),
                 None => DmContent::Info("Shared post unavailable".into()),
@@ -650,6 +732,7 @@ impl DmContent {
             DmContent::Shared { title, .. } => title.clone(),
             DmContent::Voice { .. } => "Voice message".into(),
             DmContent::Gif(_) => "Sent a GIF".into(),
+            DmContent::Disappearing(d) => format!("Sent a disappearing {}", d.kind()),
             DmContent::Info(i) => i.clone(),
         }
     }

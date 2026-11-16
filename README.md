@@ -21,6 +21,11 @@ There are no reels, no explore page, no suggested posts and no ads.
   older conversations load only when you press a button.
 - **Shared reels in chats open in your browser**, so a conversation can't
   turn into a reel feed.
+- **Disappearing photos and videos follow the sender's choice.** They show as
+  "Tap to view". Finsta tells Instagram when you open one, so the sender sees
+  "Opened", and shows it only after Instagram confirms. "View once" can't be
+  opened again; "Allow replay" allows one replay. Nothing is cached, and
+  videos play once without a scrubber.
 
 ## Layout
 
@@ -69,8 +74,12 @@ and instagrapi. That means:
   account flagged. Use it at your own risk.
 - New messages are fetched by polling (every 8 seconds in an open
   conversation, every 30 seconds for the conversation list), not pushed.
-- Disappearing photos, voice notes you record, sending media, and
-  end-to-end encrypted chats are not supported.
+- Sending photos, videos (including disappearing ones) and voice notes is not
+  supported yet.
+- Instagram can't tell when you screenshot a disappearing photo in Finsta, so
+  the sender won't get a screenshot alert.
+- Instagram itself dropped end-to-end encrypted chats on 8 May 2026, so all
+  remaining conversations work through the normal message API.
 
 ## Development
 

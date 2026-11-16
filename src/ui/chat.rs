@@ -2,19 +2,20 @@
 //! "Load Older Messages"; new ones are polled while the chat is open.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 use serde_json::Value;
 
-use crate::api::{DmContent, DmItem, Media, Recipient, Thread, User};
+use crate::api::{Disappearing, DmContent, DmItem, Media, Recipient, Thread, User};
 use crate::rt;
 use crate::ui::ratio_bin::RatioBin;
 use crate::ui::util;
 use crate::ui::window::Main;
-use crate::ui::{images, media_viewer};
+use crate::ui::media_viewer::{self, Ephemeral};
+use crate::ui::images;
 
 pub enum ChatTarget {
     Thread(Thread),
@@ -49,6 +50,17 @@ struct Chat {
     stick_to_bottom: Cell<bool>,
     keep_distance_from_bottom: Cell<Option<f64>>,
     last_marked: RefCell<String>,
+    /// Disappearing messages opened in this session: item id -> times opened.
+    /// Guards against showing them again before Instagram's state catches up.
+    local_views: RefCell<HashMap<String, u32>>,
+    opening: Cell<bool>,
+}
+
+enum VisualState {
+    View,
+    Replay,
+    Opened,
+    Gone,
 }
 
 pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
@@ -188,6 +200,8 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
         stick_to_bottom: Cell::new(true),
         keep_distance_from_bottom: Cell::new(None),
         last_marked: RefCell::new(String::new()),
+        local_views: RefCell::new(HashMap::new()),
+        opening: Cell::new(false),
     });
 
     chat.render_header();
@@ -406,8 +420,8 @@ impl Chat {
         if users_changed || !was_known {
             self.render_header();
         }
-        let added = self.merge(thread.items);
-        if added > 0 || initial || !self.pending.borrow().is_empty() {
+        let changed = self.merge(thread.items);
+        if changed || initial || !self.pending.borrow().is_empty() {
             self.pending.borrow_mut().clear();
             self.render();
         }
@@ -422,19 +436,104 @@ impl Chat {
         }
     }
 
-    fn merge(&self, items: Vec<DmItem>) -> usize {
-        let mut added = 0;
+    /// Add new messages and update ones whose reactions or opened-state
+    /// changed. Returns whether anything visible changed.
+    fn merge(&self, items: Vec<DmItem>) -> bool {
+        let mut changed = false;
         let mut list = self.items.borrow_mut();
         let mut ids = self.ids.borrow_mut();
         for item in items {
-            if item.item_id.is_empty() || !ids.insert(item.item_id.clone()) {
+            if item.item_id.is_empty() {
                 continue;
             }
-            list.push(item);
-            added += 1;
+            if ids.insert(item.item_id.clone()) {
+                list.push(item);
+                changed = true;
+            } else if let Some(existing) = list.iter_mut().find(|i| i.item_id == item.item_id)
+                && existing.state_key() != item.state_key()
+            {
+                *existing = item;
+                changed = true;
+            }
         }
         list.sort_by_key(|i| i.timestamp);
-        added
+        changed
+    }
+
+    fn visual_state(&self, item: &DmItem, d: &Disappearing) -> VisualState {
+        let local = self.local_views.borrow().get(&item.item_id).copied().unwrap_or(0);
+        let server = u32::from(d.seen_user_ids.contains(&self.viewer_id));
+        let views = local.max(server);
+        if d.is_available() && views < d.allowed_views() {
+            if views == 0 { VisualState::View } else { VisualState::Replay }
+        } else if views > 0 {
+            VisualState::Opened
+        } else {
+            VisualState::Gone
+        }
+    }
+
+    /// Open a disappearing photo or video. The view is reported to Instagram
+    /// first (so the sender sees "Opened"), and nothing is shown unless that
+    /// succeeds. Photos are downloaded before reporting, so an expired link
+    /// doesn't use up the view.
+    fn open_disappearing(self: &Rc<Self>, item_id: String) {
+        let Some(thread_id) = self.thread_id.borrow().clone() else { return };
+        let Some(item) = self.items.borrow().iter().find(|i| i.item_id == item_id).cloned() else {
+            return;
+        };
+        let DmContent::Disappearing(d) = item.content() else { return };
+        let replay = match self.visual_state(&item, &d) {
+            VisualState::View => false,
+            VisualState::Replay => true,
+            _ => return,
+        };
+        if self.opening.replace(true) {
+            return;
+        }
+        let Some(main) = self.main.upgrade() else { return };
+        let client = main.client.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let content = match (&d.video, &d.image) {
+                (Some(url), _) => Some(Ephemeral::Video(url.clone())),
+                (None, Some(url)) => images::texture_uncached(url).await.map(Ephemeral::Photo),
+                (None, None) => None,
+            };
+            let Some(c) = weak.upgrade() else { return };
+            let Some(main) = c.main.upgrade() else { return };
+            let Some(content) = content else {
+                c.opening.set(false);
+                main.toast(&format!("This {} couldn't be loaded. It may have expired.", d.kind()));
+                return;
+            };
+            let id = item_id.clone();
+            let res = rt::bg(async move { client.mark_visual_seen(&thread_id, &id, replay).await }).await;
+            c.opening.set(false);
+            if let Err(e) = res {
+                if crate::api::is_login_required(&e) {
+                    main.handle_error(&e);
+                } else {
+                    main.toast(&format!("Couldn't open the {}: Instagram didn't confirm the view. {e}", d.kind()));
+                }
+                return;
+            }
+            let views = match c.visual_state(&item, &d) {
+                VisualState::View => 1,
+                _ => d.allowed_views(),
+            };
+            c.local_views.borrow_mut().insert(item_id, views);
+            // The clicked button is about to be rebuilt; park focus in the
+            // composer so closing the viewer doesn't scroll to some other widget.
+            c.entry.grab_focus();
+            c.render();
+            let note = if views < d.allowed_views() {
+                "You can replay this once"
+            } else {
+                "You can't open this again after closing"
+            };
+            media_viewer::open_disappearing(&main, content, note);
+        });
     }
 
     fn load_latest(self: &Rc<Self>, initial: bool) {
@@ -588,6 +687,12 @@ impl Chat {
     }
 
     fn render(self: &Rc<Self>) {
+        // Rebuilding the list must not move the view if you've scrolled up.
+        if !self.stick_to_bottom.get() && self.keep_distance_from_bottom.get().is_none() {
+            let adj = self.scroller.vadjustment();
+            self.keep_distance_from_bottom
+                .set(Some(adj.upper() - adj.value() - adj.page_size()));
+        }
         util::clear_box(&self.list);
         let Some(main) = self.main.upgrade() else { return };
         let thread = self.thread.borrow().clone();
@@ -629,7 +734,7 @@ impl Chat {
                 None
             };
             self.list
-                .append(&message_widget(&main, item, is_me, group, sender.as_ref(), is_pending));
+                .append(&message_widget(self, &main, item, is_me, group, sender.as_ref(), is_pending));
             prev_ts = ts;
             prev_user = item.user_id.clone();
         }
@@ -804,7 +909,79 @@ fn post_card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
     card.upcast()
 }
 
+fn disappearing_widget(chat: &Rc<Chat>, item: &DmItem, d: &Disappearing, is_me: bool) -> gtk::Widget {
+    let icon = if d.is_video { "camera-video-symbolic" } else { "camera-photo-symbolic" };
+    let title = if d.is_video { "Video" } else { "Photo" };
+    let mode = if d.view_mode == "replayable" { "Replay allowed" } else { "View once" };
+    let (subtitle, openable) = if is_me {
+        let status = match d.action.as_str() {
+            "raven_opened" => "Opened",
+            "raven_replayed" => "Replayed",
+            "raven_screenshot" | "raven_screenshotted" => "Screenshot taken",
+            "raven_delivered" => "Delivered",
+            "raven_sending" => "Sending",
+            "raven_cannot_deliver" | "raven_failed" => "Not delivered",
+            _ if !d.seen_user_ids.is_empty() => "Opened",
+            _ => "Sent",
+        };
+        (format!("{mode} · {status}"), false)
+    } else {
+        match chat.visual_state(item, d) {
+            VisualState::View => (format!("{mode} · Tap to view"), true),
+            VisualState::Replay => ("Tap to replay".to_string(), true),
+            VisualState::Opened => ("Opened".to_string(), false),
+            VisualState::Gone => ("No longer available".to_string(), false),
+        }
+    };
+
+    let content = gtk::Box::builder().spacing(10).build();
+    content.append(&gtk::Image::from_icon_name(icon));
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    text.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .css_classes(["heading"])
+            .build(),
+    );
+    text.append(
+        &gtk::Label::builder()
+            .label(&subtitle)
+            .xalign(0.0)
+            .css_classes(["caption"])
+            .build(),
+    );
+    content.append(&text);
+
+    if !openable {
+        let b = gtk::Box::builder()
+            .css_classes(["disappearing", "used"])
+            .halign(if is_me { gtk::Align::End } else { gtk::Align::Start })
+            .build();
+        b.append(&content);
+        return b.upcast();
+    }
+    let button = gtk::Button::builder()
+        .child(&content)
+        .css_classes(["disappearing", "openable"])
+        .halign(gtk::Align::Start)
+        .tooltip_text(format!(
+            "Disappearing {}. The sender will see when you open it.",
+            d.kind()
+        ))
+        .build();
+    let weak = Rc::downgrade(chat);
+    let id = item.item_id.clone();
+    button.connect_clicked(move |_| {
+        if let Some(c) = weak.upgrade() {
+            c.open_disappearing(id.clone());
+        }
+    });
+    button.upcast()
+}
+
 fn message_widget(
+    chat: &Rc<Chat>,
     main: &Rc<Main>,
     item: &DmItem,
     is_me: bool,
@@ -932,9 +1109,12 @@ fn message_widget(
             thumb.set_halign(align);
             thumb
         }
+        DmContent::Disappearing(d) => disappearing_widget(chat, item, &d, is_me),
         DmContent::Info(_) => unreachable!(),
     };
-    bubble.set_tooltip_text(Some(&util::full_time(item.timestamp_secs())));
+    if bubble.tooltip_text().is_none() {
+        bubble.set_tooltip_text(Some(&util::full_time(item.timestamp_secs())));
+    }
     if pending {
         bubble.add_css_class("pending");
         bubble.set_tooltip_text(Some("Sending…"));

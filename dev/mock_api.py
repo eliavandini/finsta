@@ -105,7 +105,11 @@ THREADS = {
         "users": [USERS["1001"]], "last_activity_at": (NOW - 300) * 1_000_000,
         "last_seen_at": {ME: {"item_id": "m0", "timestamp": str((NOW - 9000) * 1_000_000)}},
         "items": [
+            dm("r3", "1001", 240, "raven_media", visual_media={"view_mode": "once", "seen_user_ids": [], "seen_count": 0, "media": {"media_type": 1, "original_width": 1080, "original_height": 1920, "image_versions2": {"candidates": [{"url": img("viewonce", 1080, 1920), "width": 1080, "height": 1920}]}}}),
+            dm("r2", "1001", 260, "raven_media", visual_media={"view_mode": "replayable", "seen_user_ids": [], "seen_count": 0, "media": {"media_type": 1, "original_width": 1080, "original_height": 1920, "image_versions2": {"candidates": [{"url": img("replayable", 1080, 1920), "width": 1080, "height": 1920}]}}}),
+            dm("r1", ME, 280, "raven_media", visual_media={"view_mode": "once", "seen_user_ids": ["1001"], "seen_count": 1, "media": {"media_type": 1}, "expiring_media_action_summary": {"type": "raven_opened", "count": 1}}),
             dm("m9", "1001", 300, "text", text="Are you coming tonight? 🍕"),
+            dm("r0", "1001", 310, "raven_media", visual_media={"view_mode": "once", "seen_user_ids": [ME], "seen_count": 1, "media": {"media_type": 2}}),
             dm("m8", "1001", 320, "media_share", media_share=media("503", "1005", "Golden hour in Bologna", 3600 * 9, w=1080, h=720)),
             dm("m7", ME, 3000, "like", like="❤️"),
             dm("m6", "1001", 3100, "media", media={"media_type": 1, "original_width": 1080, "original_height": 1350, "image_versions2": {"candidates": [{"url": img("dmphoto", 1080, 1350), "width": 1080, "height": 1350}]}}),
@@ -208,6 +212,17 @@ class Handler(BaseHTTPRequestHandler):
                 tt["items"] = t["items"][:5]
                 threads.append(tt)
             return self.send_json({"inbox": {"threads": threads, "has_older": False}, "viewer": USERS[ME], "status": "ok"})
+        if m := re.match(r"direct_v2/visual_threads/(\d+)/(item_seen|item_replayed)/", p):
+            ids = body.get("item_ids", ["[]"])[0].strip("[]").split(",")
+            for item in THREADS[m.group(1)]["items"]:
+                if item["item_id"] in ids and "visual_media" in item:
+                    v = item["visual_media"]
+                    if ME not in v["seen_user_ids"]:
+                        v["seen_user_ids"].append(ME)
+                    v["seen_count"] += 1
+                    if v["view_mode"] == "once" or m.group(2) == "item_replayed":
+                        v["media"] = {"media_type": v["media"]["media_type"]}
+            return self.send_json({"status": "ok"})
         if m := re.match(r"direct_v2/threads/(\d+)/items/.+/seen/", p):
             return self.send_json({"status": "ok"})
         if m := re.match(r"direct_v2/threads/(\d+)/$", p):
