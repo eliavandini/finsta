@@ -64,6 +64,7 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
                         on_success(session);
                     }
                     Err(e) => {
+                        eprintln!("finsta: sign-in check failed: {e:#}");
                         let msg = if crate::api::is_login_required(&e) {
                             "Instagram didn't accept this session. Sign in again to get a fresh one.".to_string()
                         } else {
@@ -123,8 +124,14 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
         let csrf_row = csrftoken.clone();
         let submit = Rc::new(move || {
             let mut cookies = BTreeMap::new();
-            cookies.insert("sessionid".to_string(), sid.text().trim().to_string());
-            let csrf = csrf_row.text().trim().to_string();
+            // Accept a pasted "sessionid=..." or "csrftoken=...; ..." as well.
+            let value = |text: glib::GString, name: &str| {
+                let t = text.trim();
+                let t = t.strip_prefix(name).and_then(|r| r.strip_prefix('=')).unwrap_or(t);
+                t.split(';').next().unwrap_or_default().trim().trim_matches('"').to_string()
+            };
+            cookies.insert("sessionid".to_string(), value(sid.text(), "sessionid"));
+            let csrf = value(csrf_row.text(), "csrftoken");
             if !csrf.is_empty() {
                 cookies.insert("csrftoken".to_string(), csrf);
             }

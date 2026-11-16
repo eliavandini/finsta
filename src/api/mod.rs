@@ -185,27 +185,43 @@ impl Client {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
-        let resp = req.headers(self.headers()).send().await?;
+        let req = req.headers(self.headers()).build()?;
+        let what = format!("{} {}", req.method(), req.url().path());
+        let resp = match self.inner.http.execute(req).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("finsta: {what} failed: {e}");
+                return Err(e.into());
+            }
+        };
         let status = resp.status();
+        let final_url = resp.url().clone();
         self.absorb_headers(resp.headers());
         let text = resp.text().await?;
         let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         let message = json["message"].as_str().unwrap_or_default().to_string();
+        let failed = !status.is_success() || json.is_null() || json["status"].as_str() == Some("fail");
+        if failed {
+            // Never logs cookies or headers, only what Instagram said.
+            eprintln!("finsta: {what} -> HTTP {status}: {}", describe_failure(&json, &text, &final_url));
+        }
 
+        // Checked before the 401 test: Instagram also answers 401 with
+        // "Please wait a few minutes" when it throttles a valid session.
+        if status.as_u16() == 429 || message.contains("wait a few minutes") {
+            bail!("Instagram is rate limiting requests. Try again in a few minutes.");
+        }
+        if message == "checkpoint_required" || message == "challenge_required" || json["challenge"].is_object() {
+            bail!(
+                "Instagram wants to verify this login. Open instagram.com in a browser, confirm it was you, then try again."
+            );
+        }
         if status.as_u16() == 401
             || message == "login_required"
             || json["require_login"].as_bool() == Some(true)
             || json["logout_reason"].is_number()
         {
             return Err(LoginRequired.into());
-        }
-        if message == "checkpoint_required" || message == "challenge_required" {
-            bail!(
-                "Instagram wants to verify this login. Open instagram.com in a browser, confirm it was you, then try again."
-            );
-        }
-        if status.as_u16() == 429 || message.contains("wait a few minutes") {
-            bail!("Instagram is rate limiting requests. Try again in a few minutes.");
         }
         if !status.is_success() || json["status"].as_str() == Some("fail") {
             if message.is_empty() {
@@ -608,5 +624,25 @@ impl Client {
         )
         .await?;
         Ok(())
+    }
+}
+
+/// A one-line summary of a failed response for the log.
+fn describe_failure(json: &Value, text: &str, url: &reqwest::Url) -> String {
+    if json.is_object() {
+        let out = json.to_string();
+        if out.chars().count() > 400 {
+            return out.chars().take(400).chain(std::iter::once('…')).collect();
+        }
+        return out;
+    }
+    let title = text
+        .split_once("<title>")
+        .and_then(|(_, rest)| rest.split_once("</title>"))
+        .map(|(t, _)| t.split_whitespace().collect::<Vec<_>>().join(" "));
+    match title {
+        Some(t) => format!("HTML page \"{t}\" at {}{}", url.host_str().unwrap_or_default(), url.path()),
+        None if text.is_empty() => format!("empty body at {}{}", url.host_str().unwrap_or_default(), url.path()),
+        None => format!("{} bytes of non-JSON at {}{}", text.len(), url.host_str().unwrap_or_default(), url.path()),
     }
 }
