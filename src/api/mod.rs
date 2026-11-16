@@ -3,7 +3,10 @@
 //! cookies of a normal instagram.com login, sent the way the website sends
 //! them, with the user agent of the browser that signed in.
 
+mod dm;
+mod lightspeed;
 pub mod models;
+mod mqtt;
 pub mod session;
 
 use std::collections::{HashMap, HashSet};
@@ -152,6 +155,8 @@ struct Inner {
     fallback: bool,
     /// Route families ("direct_v2", "feed", ...) found to be served only by the API host.
     api_host_routes: RwLock<HashSet<String>>,
+    /// Direct messages: instagram.com's web inbox and chat connection.
+    dm: tokio::sync::Mutex<dm::DmState>,
 }
 
 /// "direct_v2/threads/123/" -> "direct_v2". Related routes live on the same host.
@@ -162,12 +167,6 @@ fn route_key(path: &str) -> String {
 /// Media ids look like "<media pk>_<owner pk>"; the web endpoints want the pk.
 fn media_pk(media_id: &str) -> &str {
     media_id.split('_').next().unwrap_or(media_id)
-}
-
-fn random_token() -> String {
-    // Instagram's clients use a 19 digit random number as mutation token.
-    let n = uuid::Uuid::new_v4().as_u128() % 88_888_888_888_888_888;
-    (6_800_011_111_111_111_111u64 + n as u64).to_string()
 }
 
 impl Client {
@@ -190,6 +189,7 @@ impl Client {
                 api_host: custom_host.unwrap_or_else(|| API_HOST.to_string()),
                 base: custom.unwrap_or_else(|| WEB_API.to_string()),
                 api_host_routes: RwLock::new(HashSet::new()),
+                dm: Default::default(),
             }),
         }
     }
@@ -200,6 +200,24 @@ impl Client {
 
     pub fn user_id(&self) -> String {
         self.inner.session.read().unwrap().user_id()
+    }
+
+    fn user_agent(&self) -> String {
+        let s = self.inner.session.read().unwrap();
+        if s.user_agent.is_empty() { DEFAULT_USER_AGENT.to_string() } else { s.user_agent.clone() }
+    }
+
+    fn cookie_header(&self) -> String {
+        self.inner
+            .session
+            .read()
+            .unwrap()
+            .cookies
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     /// The headers instagram.com sends with its own API calls.
@@ -647,109 +665,6 @@ impl Client {
             }
         }
         Ok(out)
-    }
-
-    // ----- Direct messages -----------------------------------------------
-
-    pub async fn inbox(&self, cursor: Option<String>) -> Result<InboxPage> {
-        let mut q = vec![
-            ("visual_message_return_type", "unseen".to_string()),
-            ("persistentBadging", "true".into()),
-            ("thread_message_limit", "5".into()),
-            ("limit", "25".into()),
-        ];
-        if let Some(c) = cursor {
-            q.push(("cursor", c));
-            q.push(("direction", "older".into()));
-        }
-        let v = self.get("direct_v2/inbox/", &q).await?;
-        let inbox = &v["inbox"];
-        Ok(InboxPage {
-            threads: parse(&inbox["threads"]).unwrap_or_default(),
-            oldest_cursor: inbox["oldest_cursor"].as_str().map(str::to_string),
-            has_older: inbox["has_older"].as_bool().unwrap_or(false),
-        })
-    }
-
-    pub async fn thread(&self, thread_id: &str, cursor: Option<String>) -> Result<Thread> {
-        let mut q = vec![
-            ("visual_message_return_type", "unseen".to_string()),
-            ("limit", "20".into()),
-        ];
-        if let Some(c) = cursor {
-            q.push(("cursor", c));
-            q.push(("direction", "older".into()));
-        }
-        let v = self.get(&format!("direct_v2/threads/{thread_id}/"), &q).await?;
-        parse(&v["thread"]).ok_or_else(|| anyhow!("Could not read conversation"))
-    }
-
-    /// The existing 1:1 thread with `user_pk`, if there is one.
-    pub async fn thread_with_user(&self, user_pk: &str) -> Result<Option<Thread>> {
-        let v = self
-            .get(
-                "direct_v2/threads/get_by_participants/",
-                &[("recipient_users", format!("[{user_pk}]")), ("limit", "20".into())],
-            )
-            .await?;
-        Ok(parse::<Thread>(&v["thread"]).filter(|t| !t.thread_id.is_empty()))
-    }
-
-    /// Sends a text message and returns the id of the thread it landed in.
-    pub async fn send_text(&self, to: &Recipient, text: &str) -> Result<Option<String>> {
-        let token = random_token();
-        let mut form: Vec<(&str, String)> = vec![
-            ("action", "send_item".into()),
-            ("client_context", token.clone()),
-            ("mutation_token", token.clone()),
-            ("offline_threading_id", token),
-        ];
-        match to {
-            Recipient::Thread(id) => form.push(("thread_ids", format!("[{id}]"))),
-            Recipient::User(pk) => form.push(("recipient_users", format!("[[{pk}]]"))),
-        }
-        let link_re = regex::Regex::new(r"https?://\S+").unwrap();
-        let links: Vec<&str> = link_re.find_iter(text).map(|m| m.as_str()).collect();
-        let method = if links.is_empty() {
-            form.push(("text", text.to_string()));
-            "text"
-        } else {
-            form.push(("link_text", text.to_string()));
-            form.push(("link_urls", serde_json::to_string(&links)?));
-            "link"
-        };
-        let v = self
-            .post(&format!("direct_v2/threads/broadcast/{method}/"), &form)
-            .await?;
-        let payload = if v["payload"].is_object() { &v["payload"] } else { &v["payload"][0] };
-        Ok(payload["thread_id"].as_str().map(str::to_string))
-    }
-
-    pub async fn mark_seen(&self, thread_id: &str, item_id: &str) -> Result<()> {
-        self.post(
-            &format!("direct_v2/threads/{thread_id}/items/{item_id}/seen/"),
-            &[
-                ("action", "mark_seen".into()),
-                ("thread_id", thread_id.into()),
-                ("item_id", item_id.into()),
-                ("use_unified_inbox", "true".into()),
-            ],
-        )
-        .await?;
-        Ok(())
-    }
-
-    /// Tell Instagram a disappearing photo or video was opened (or replayed).
-    /// The sender sees this, and Instagram stops serving the media once the
-    /// allowed views are used up.
-    pub async fn mark_visual_seen(&self, thread_id: &str, item_id: &str, replay: bool) -> Result<()> {
-        let action = if replay { "item_replayed" } else { "item_seen" };
-        self.post(
-            &format!("direct_v2/visual_threads/{thread_id}/{action}/"),
-            &[("item_ids", format!("[{item_id}]"))],
-        )
-        .await?;
-        Ok(())
     }
 
     pub async fn logout(&self) -> Result<()> {

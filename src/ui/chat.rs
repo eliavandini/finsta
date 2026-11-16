@@ -443,7 +443,8 @@ impl Chat {
         let mut list = self.items.borrow_mut();
         let mut ids = self.ids.borrow_mut();
         for item in items {
-            if item.item_id.is_empty() {
+            // "snippet:" items are inbox previews, not real messages.
+            if item.item_id.is_empty() || item.item_id.starts_with("snippet:") {
                 continue;
             }
             if ids.insert(item.item_id.clone()) {

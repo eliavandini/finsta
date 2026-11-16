@@ -21,11 +21,6 @@ There are no reels, no explore page, no suggested posts and no ads.
   older conversations load only when you press a button.
 - **Shared reels in chats open in your browser**, so a conversation can't
   turn into a reel feed.
-- **Disappearing photos and videos follow the sender's choice.** They show as
-  "Tap to view". Finsta tells Instagram when you open one, so the sender sees
-  "Opened", and shows it only after Instagram confirms. "View once" can't be
-  opened again; "Allow replay" allows one replay. Nothing is cached, and
-  videos play once without a scrubber.
 
 ## Layout
 
@@ -83,23 +78,30 @@ iPhone app, which Instagram now rejects.) That means:
 - It can break whenever Instagram changes its API.
 - Using unofficial clients is against Instagram's terms and could get an
   account flagged. Use it at your own risk.
-- New messages are fetched by polling (every 15 seconds in an open
-  conversation, every minute for the conversation list), not pushed. When
-  Instagram rate limits, Finsta pauses all requests until it says to retry.
-- Sending photos, videos (including disappearing ones) and voice notes is not
-  supported yet.
-- Instagram can't tell when you screenshot a disappearing photo in Finsta, so
-  the sender won't get a screenshot alert.
+- Messages use the same system as instagram.com's own inbox: the inbox page
+  carries your conversations, and a chat connection (MQTT over a WebSocket,
+  in the "Lightspeed" format) fetches, sends and marks messages read. This
+  part is new and still being matched against real data; it logs what it
+  can't read (structure only, never names or message text) with a `dm:`
+  prefix, visible with `journalctl --user | grep finsta:`.
+- Not supported yet in messages: starting a new conversation, disappearing
+  photos, voice messages, sending anything but text. They show a note to use
+  instagram.com instead.
+- Open conversations refresh every 15 seconds and the conversation list
+  every minute. When Instagram rate limits an endpoint, Finsta pauses that
+  endpoint until Instagram says to retry.
 - Instagram itself dropped end-to-end encrypted chats on 8 May 2026, so all
-  remaining conversations work through the normal message API.
+  remaining conversations work through the normal message system.
 
 ## Development
 
-`dev/mock_api.py` is a fake Instagram API with sample data, for working on
-the UI without a real account:
+`dev/mock_api.py` is a fake Instagram with sample data, for working on the
+UI without a real account. It also serves an inbox page and a chat
+connection in the same formats as instagram.com:
 
 ```sh
 python3 dev/mock_api.py 8765
-FINSTA_API_BASE=http://127.0.0.1:8765/api/v1/ XDG_CONFIG_HOME=/tmp/finsta-dev cargo run
+FINSTA_API_BASE=http://127.0.0.1:8765/api/v1/ FINSTA_WEB_BASE=http://127.0.0.1:8765/ \
+FINSTA_CHAT_URL=ws://127.0.0.1:8765/chat XDG_CONFIG_HOME=/tmp/finsta-dev cargo run
 # then sign in with the session cookie 1000%3Aabc%3A1
 ```

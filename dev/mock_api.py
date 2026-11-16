@@ -3,21 +3,26 @@
     python3 dev/mock_api.py 8765 [request-log-file]
     FINSTA_API_BASE=http://127.0.0.1:8765/api/v1/ XDG_CONFIG_HOME=/tmp/finsta-dev cargo run
 
-To mimic how instagram.com behaved for web sessions in November 2026, run a
-second instance with "www" as the main host (it answers direct_v2 routes with
-an HTML 404 page and users/{id}/info/ with 429) and point FINSTA_API_HOST at
-the first one:
+Direct messages work like on instagram.com: /direct/inbox/ is a page that
+embeds a Lightspeed payload, and /chat is the MQTT-over-WebSocket chat
+connection. Point Finsta at them too:
 
-    python3 dev/mock_api.py 8766 /dev/null www
-    FINSTA_API_BASE=http://127.0.0.1:8766/api/v1/ FINSTA_API_HOST=http://127.0.0.1:8765/api/v1/ cargo run
+    FINSTA_WEB_BASE=http://127.0.0.1:8765/ FINSTA_CHAT_URL=ws://127.0.0.1:8765/chat
+
+With "www" as the third argument, users/{id}/info/ answers 429, as
+instagram.com did for web sessions in November 2026.
 
 Sign in with the session cookie "1000%3Aabc%3A1". Needs Pillow for the
 generated placeholder images.
 """
+import base64
+import hashlib
 import io
 import json
 import re
+import struct
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -104,53 +109,121 @@ def reel(pk, seen=False):
     return {"id": int(pk), "user": USERS[pk], "latest_reel_media": latest, "seen": latest if seen else 0}
 
 
-def dm(item_id, uid, ago, itype, **kw):
-    return {"item_id": item_id, "user_id": int(uid), "timestamp": str((NOW - ago) * 1_000_000), "item_type": itype, **kw}
+# ----- Direct messages: instagram.com's web inbox (Lightspeed over MQTT) -----
+
+ME_CHAT = 17840000000000000  # "you" in the chat system, which isn't your profile id
+LS_VERSION = "9876543210123456"
+CHAT_USERS = {20000 + int(pk) - 1000: pk for pk in ["1001", "1002", "1003", "1004", "1005"]}
+CONVOS = {  # thread key -> [name, type (1 = 1:1, 2 = group), members, read watermark ms]
+    30001: ["", 1, [20001], (NOW - 9000) * 1000],
+    30002: ["Weekend trip 🚐", 2, [20002, 20004, 20005], (NOW - 4000) * 1000],
+    30003: ["", 1, [20003], (NOW - 100) * 1000],
+}
+OLDER_CONVOS = {30004: ["", 1, [20005], (NOW - 864000) * 1000]}
 
 
-THREADS = {
-    "340282366841710300949128100000000001": {
-        "thread_id": "340282366841710300949128100000000001", "thread_title": "", "is_group": False,
-        "users": [USERS["1001"]], "last_activity_at": (NOW - 300) * 1_000_000,
-        "last_seen_at": {ME: {"item_id": "m0", "timestamp": str((NOW - 9000) * 1_000_000)}},
-        "items": [
-            dm("r3", "1001", 240, "raven_media", visual_media={"view_mode": "once", "seen_user_ids": [], "seen_count": 0, "media": {"media_type": 1, "original_width": 1080, "original_height": 1920, "image_versions2": {"candidates": [{"url": img("viewonce", 1080, 1920), "width": 1080, "height": 1920}]}}}),
-            dm("r2", "1001", 260, "raven_media", visual_media={"view_mode": "replayable", "seen_user_ids": [], "seen_count": 0, "media": {"media_type": 1, "original_width": 1080, "original_height": 1920, "image_versions2": {"candidates": [{"url": img("replayable", 1080, 1920), "width": 1080, "height": 1920}]}}}),
-            dm("r1", ME, 280, "raven_media", visual_media={"view_mode": "once", "seen_user_ids": ["1001"], "seen_count": 1, "media": {"media_type": 1}, "expiring_media_action_summary": {"type": "raven_opened", "count": 1}}),
-            dm("m9", "1001", 300, "text", text="Are you coming tonight? 🍕"),
-            dm("r0", "1001", 310, "raven_media", visual_media={"view_mode": "once", "seen_user_ids": [ME], "seen_count": 1, "media": {"media_type": 2}}),
-            dm("m8", "1001", 320, "media_share", media_share=media("503", "1005", "Golden hour in Bologna", 3600 * 9, w=1080, h=720)),
-            dm("m7", ME, 3000, "like", like="❤️"),
-            dm("m6", "1001", 3100, "media", media={"media_type": 1, "original_width": 1080, "original_height": 1350, "image_versions2": {"candidates": [{"url": img("dmphoto", 1080, 1350), "width": 1080, "height": 1350}]}}),
-            dm("m5", ME, 3200, "text", text="Haha that's great. Check this out: https://gnome.org", reactions={"emojis": [{"emoji": "😂", "sender_id": 1001}]}),
-            dm("m4", "1001", 3300, "clip", clip={"clip": {**media("777", "2002", "a reel someone shared", 5000), "product_type": "clips"}}),
-            dm("m3", "1001", 3400, "text", text="Morning! Did you see the photos from Saturday?"),
-            dm("m2", ME, 90000, "text", text="Talk tomorrow!"),
-            dm("m1", "1001", 90500, "action_log", action_log={"description": "Marta liked a message"}),
-        ],
-        "has_older": True, "oldest_cursor": "cur1",
-    },
-    "340282366841710300949128100000000002": {
-        "thread_id": "340282366841710300949128100000000002", "thread_title": "Weekend trip 🚐", "is_group": True,
-        "users": [USERS["1002"], USERS["1004"], USERS["1005"]], "last_activity_at": (NOW - 4000) * 1_000_000,
-        "last_seen_at": {ME: {"item_id": "g3", "timestamp": str((NOW - 4000) * 1_000_000)}},
-        "items": [
-            dm("g3", "1004", 4000, "text", text="I'll bring the tent"),
-            dm("g2", "1002", 4200, "text", text="Who has a car?"),
-            dm("g1", ME, 4300, "text", text="Saturday works for me"),
-        ],
-        "has_older": False,
-    },
-    "340282366841710300949128100000000003": {
-        "thread_id": "340282366841710300949128100000000003", "thread_title": "", "is_group": False,
-        "users": [USERS["1003"]], "last_activity_at": (NOW - 200000) * 1_000_000,
-        "last_seen_at": {ME: {"item_id": "x1", "timestamp": str((NOW - 200000) * 1_000_000)}},
-        "items": [dm("x1", ME, 200000, "text", text="Thanks for the tip!")],
-        "has_older": False,
-    },
+def msg(mid, sender, ago, text="", attach=None):
+    return {"mid": f"mid.$mock{mid}", "sender": sender, "ts": (NOW - ago) * 1000, "text": text, "attach": attach}
+
+
+MESSAGES = {
+    30001: [msg(f"f{i}", 20001 if i % 2 else ME_CHAT, 200000 + 600 * (40 - i), f"Older message {i}") for i in range(40)] + [
+        msg("a1", 20001, 90500, "Did you see the photos from Saturday?"),
+        msg("a2", ME_CHAT, 90000, "Not yet, send them!"),
+        msg("a3", 20001, 3100, attach=("blob", img("dmphoto", 1080, 1350))),
+        msg("a4", ME_CHAT, 3000, "Wow 😍"),
+        msg("a5", 20001, 320, attach=("xma", "https://www.instagram.com/p/MOCK123/", "Golden hour in Bologna")),
+        msg("a6", 20001, 300, "Are you coming tonight? 🍕"),
+    ],
+    30002: [msg("g1", ME_CHAT, 4300, "Saturday works for me"), msg("g2", 20002, 4200, "Who has a car?"),
+            msg("g3", 20004, 4000, "I'll bring the tent")],
+    30003: [msg("h1", ME_CHAT, 172800, "Thanks for the tip!")],
+    30004: [msg("o1", 20005, 864000, "Long time no see!")],
 }
 
-SENT = []
+
+def ls_value(v):
+    if v is None:
+        return [9]
+    if isinstance(v, int) and not isinstance(v, bool) and abs(v) > 2**31:
+        return [19, str(v)]
+    return v
+
+
+def ls_program(calls):
+    """A Lightspeed payload calling each (procedure, {position: value})."""
+    steps = []
+    for name, fields in calls:
+        args = [fields.get(i) for i in range(max(fields) + 3)]
+        steps.append([5, name] + [ls_value(a) for a in args])
+    # Wrapped in a conditional, like real payloads.
+    return json.dumps({"name": None, "step": [1, [23, [2, 0], [1] + steps]]})
+
+
+def contact_calls(cids):
+    out = []
+    for cid in cids:
+        u = USERS[CHAT_USERS[cid]] if cid in CHAT_USERS else USERS[ME]
+        out.append(("verifyContactRowExists", {0: cid, 1: 0, 2: u["profile_pic_url"], 3: u["full_name"], 4: 1, 20: u["username"]}))
+    return out
+
+
+def message_calls(key, msgs):
+    out = []
+    for m in msgs:
+        out.append(("insertMessage", {0: m["text"], 3: key, 5: m["ts"], 8: m["mid"], 9: str(m["ts"] << 22), 10: m["sender"]}))
+        a = m["attach"]
+        if a and a[0] == "blob":
+            out.append(("insertBlobAttachment", {3: a[1], 5: 1080, 6: 1350, 27: key, 30: m["mid"]}))
+        elif a:
+            out.append(("insertXmaAttachment", {2: a[1], 4: img("xmapreview", 640, 640), 8: a[2], 27: key, 30: m["mid"]}))
+    return out
+
+
+def convo_calls(convos, last=5):
+    out = []
+    for key, (name, kind, members, read) in convos.items():
+        msgs = MESSAGES[key]
+        newest = msgs[-1]
+        snippet = newest["text"] or "Sent an attachment"
+        out.append(("deleteThenInsertThread", {0: newest["ts"], 1: read, 2: snippet, 3: name, 4: "", 7: key, 8: 0, 9: kind, 18: newest["sender"]}))
+        for cid in [ME_CHAT] + members:
+            out.append(("addParticipantIdToGroupThread", {0: key, 1: cid, 2: read if cid == ME_CHAT else newest["ts"]}))
+        out += contact_calls([ME_CHAT] + members)
+        out += message_calls(key, msgs[-last:])
+    return out
+
+
+def inbox_page():
+    defines = [
+        ["MqttWebConfig", [], {"fbid": ME, "appID": 936619743392459, "endpoint": f"ws://127.0.0.1:{PORT}/chat", "subscribedTopics": []}, 1],
+        ["MqttWebDeviceID", [], {"clientID": "6f1d2c3b-0000-4000-8000-123456789abc"}, 2],
+        ["CurrentUserInitialData", [], {"USER_ID": ME, "ACCOUNT_ID": ME, "IG_USER_EIMU": str(ME_CHAT), "NAME": "Your Name"}, 3],
+    ]
+    calls = convo_calls(CONVOS) + [("upsertSyncGroupThreadsRange", {0: 1, 1: 1, 2: True})]
+    data = {"require": [["ScheduledServerJS", "handle", None, [{"__bbox": {"define": defines, "require": [
+        ["RelayPrefetchedStreamCache", "next", [], ["adp_inbox", {"__bbox": {"complete": True, "result": {"data": {"viewer": {
+            "lightspeed_web_request_for_igd": {"payload": ls_program(calls), "dependencies": []}}}}}}]]]}}]]]}
+    return (f'<!DOCTYPE html><html><head><title>Inbox • Direct</title></head><body>'
+            f'<script type="application/json" data-sjs>{json.dumps(data)}</script>'
+            f'<script>__d("LSVersion",[],(function(a,b,c,d,e,f){{a="{LS_VERSION}";f["default"]=a}}),66);</script>'
+            f'</body></html>')
+
+
+def mqtt_string(b, i):
+    n = struct.unpack(">H", b[i:i + 2])[0]
+    return b[i + 2:i + 2 + n].decode(), i + 2 + n
+
+
+def mqtt_packet(header, body):
+    n, length = len(body), b""
+    while True:
+        byte = n % 128
+        n //= 128
+        length += bytes([byte | (0x80 if n else 0)])
+        if not n:
+            break
+    return bytes([header]) + length + body
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -165,6 +238,125 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Set-Cookie", "csrftoken=mockcsrf; Path=/")
         self.end_headers()
         self.wfile.write(body)
+
+    def chat_log(self, line):
+        with open(sys.argv[2] if len(sys.argv) > 2 else "/dev/null", "a") as f:
+            f.write(f"CHAT {line}\n")
+
+    def ws_send(self, data):
+        n = len(data)
+        head = bytes([0x82, n]) if n < 126 else bytes([0x82, 126]) + struct.pack(">H", n) if n < 65536 else bytes([0x82, 127]) + struct.pack(">Q", n)
+        with self.ws_lock:
+            self.wfile.write(head + data)
+            self.wfile.flush()
+
+    def ws_read(self):
+        head = self.rfile.read(2)
+        if len(head) < 2:
+            return None
+        opcode, n = head[0] & 0x0F, head[1] & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", self.rfile.read(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", self.rfile.read(8))[0]
+        mask = self.rfile.read(4) if head[1] & 0x80 else b"\0\0\0\0"
+        data = bytes(b ^ mask[i % 4] for i, b in enumerate(self.rfile.read(n)))
+        return opcode, data
+
+    def publish(self, topic, payload):
+        t = topic.encode()
+        self.ws_send(mqtt_packet(0x30, struct.pack(">H", len(t)) + t + payload.encode()))
+
+    def chat(self):
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        self.protocol_version = "HTTP/1.1"  # WebSocket upgrades need 1.1
+        self.send_response(101)
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.ws_lock = threading.Lock()
+        self.chat_log(f"open {self.path} origin={self.headers.get('Origin')} cookie={'sessionid=' in (self.headers.get('Cookie') or '')} ua={self.headers.get('User-Agent')}")
+        buf = b""
+        while (frame := self.ws_read()) is not None:
+            opcode, data = frame
+            if opcode == 8:
+                break
+            buf += data
+            while len(buf) >= 2:
+                n, mult, i = 0, 1, 1
+                while True:
+                    n += (buf[i] & 0x7F) * mult
+                    mult *= 128
+                    i += 1
+                    if not buf[i - 1] & 0x80:
+                        break
+                if len(buf) < i + n:
+                    break
+                kind, flags, body, buf = buf[0] >> 4, buf[0] & 0x0F, buf[i:i + n], buf[i + n:]
+                self.mqtt(kind, flags, body)
+        self.chat_log("closed")
+
+    def mqtt(self, kind, flags, body):
+        if kind == 1:  # CONNECT
+            proto, i = mqtt_string(body, 0)
+            level, conn_flags, keepalive = body[i], body[i + 1], struct.unpack(">H", body[i + 2:i + 4])[0]
+            client, i = mqtt_string(body, i + 4)
+            username, i = mqtt_string(body, i)
+            u = json.loads(username)
+            self.chat_log(f"CONNECT {proto} level={level} flags={conn_flags:#x} keepalive={keepalive} client={client} user={u.get('u')} aid={u.get('aid')} d={u.get('d')} keys={sorted(u)}")
+            self.ws_send(bytes([0x20, 0x02, 0x00, 0x00]))
+        elif kind == 8:  # SUBSCRIBE
+            pid, topics, i = body[:2], [], 2
+            while i < len(body):
+                t, i = mqtt_string(body, i)
+                topics.append(t)
+                i += 1
+            self.chat_log(f"SUBSCRIBE {topics}")
+            self.ws_send(mqtt_packet(0x90, pid + bytes(len(topics))))
+        elif kind == 3:  # PUBLISH
+            topic, i = mqtt_string(body, 0)
+            if (flags >> 1) & 3:
+                self.ws_send(bytes([0x40, 0x02]) + body[i:i + 2])
+                i += 2
+            payload = body[i:].decode()
+            if topic == "/ls_req":
+                self.ls_request(json.loads(payload))
+            else:
+                self.chat_log(f"PUBLISH {topic} {payload}")
+        elif kind == 12:  # PINGREQ
+            self.ws_send(bytes([0xD0, 0x00]))
+
+    def ls_request(self, req):
+        inner = json.loads(req["payload"])
+        calls = []
+        for t in inner["tasks"]:
+            p = json.loads(t["payload"])
+            self.chat_log(f"task {t['label']} queue={t['queue_name']} version={inner.get('version_id')} type={req.get('type')} app={req.get('app_id')} payload={p}")
+            if t["label"] == "228":
+                key, ref = p["thread_key"], p["reference_timestamp_ms"]
+                older = [m for m in MESSAGES.get(key, []) if m["ts"] < ref]
+                calls += message_calls(key, older[-20:])
+            elif t["label"] == "145":
+                ref = p["reference_activity_timestamp"]
+                if ref > NOW * 1000:
+                    calls += convo_calls(CONVOS)
+                else:
+                    calls += convo_calls(OLDER_CONVOS) + [("upsertSyncGroupThreadsRange", {0: 1, 1: 1, 2: False})]
+            elif t["label"] == "46":
+                key = p["thread_id"]
+                sent = msg(f"s{time.time_ns()}", ME_CHAT, 0, p["text"])
+                MESSAGES[key].append(sent)
+                calls += message_calls(key, [sent])
+                if key == 30001:
+                    threading.Timer(2.0, self.push_reply, args=(key,)).start()
+        self.publish("/ls_resp", json.dumps({"request_id": req["request_id"], "payload": ls_program(calls), "sp": sorted({c[0] for c in calls})}))
+
+    def push_reply(self, key):
+        reply = msg(f"r{time.time_ns()}", 20001, 0, "Sounds good!")
+        MESSAGES[key].append(reply)
+        self.publish("/ls_resp", json.dumps({"request_id": None, "payload": ls_program(message_calls(key, [reply])), "sp": ["insertMessage"]}))
 
     def serve_image(self, name):
         m = re.match(r"(.+)_(\d+)x(\d+)\.jpg", name)
@@ -198,20 +390,26 @@ class Handler(BaseHTTPRequestHandler):
             f.write(f"{method} :{PORT}{path} q={dict(q)} body={body} cookie={self.headers.get('Cookie')} csrf={self.headers.get('X-CSRFToken')} app={self.headers.get('X-IG-App-ID')} xhr={self.headers.get('X-Requested-With')} origin={self.headers.get('Origin')} ua={self.headers.get('User-Agent')}\n")
         if path.startswith("/img/"):
             return self.serve_image(path[5:])
+        if path == "/chat":
+            return self.chat()
+        if path == "/direct/inbox/":
+            if "sessionid=" not in (self.headers.get("Cookie") or ""):
+                self.send_response(302)
+                self.send_header("Location", "/accounts/login/?next=/direct/inbox/")
+                self.end_headers()
+                return
+            page = inbox_page().encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+            return
         p = path.replace("/api/v1/", "")
         if WWW and re.match(r"users/\d+/info/", p):
             self.send_response(429)
             self.send_header("Content-Length", "0")
             self.end_headers()
-            return
-        if WWW and p.startswith("direct_v2/"):
-            # Like instagram.com if it stopped serving a route: an HTML 404 page.
-            body = b"<!DOCTYPE html><html><head><title>Page Not Found \xe2\x80\xa2 Instagram</title></head></html>"
-            self.send_response(404)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
             return
         if p == "accounts/edit/web_form_data/":
             me = USERS[ME]
@@ -243,42 +441,6 @@ class Handler(BaseHTTPRequestHandler):
         if p == "feed/reels_media/":
             ids = q.get("reel_ids", [])
             return self.send_json({"reels": {i: {**reel(i), "items": story_items(i, 3)} for i in ids}, "status": "ok"})
-        if p == "direct_v2/inbox/":
-            threads = []
-            for t in THREADS.values():
-                tt = dict(t)
-                tt["items"] = t["items"][:5]
-                threads.append(tt)
-            return self.send_json({"inbox": {"threads": threads, "has_older": False}, "viewer": USERS[ME], "status": "ok"})
-        if m := re.match(r"direct_v2/visual_threads/(\d+)/(item_seen|item_replayed)/", p):
-            ids = body.get("item_ids", ["[]"])[0].strip("[]").split(",")
-            for item in THREADS[m.group(1)]["items"]:
-                if item["item_id"] in ids and "visual_media" in item:
-                    v = item["visual_media"]
-                    if ME not in v["seen_user_ids"]:
-                        v["seen_user_ids"].append(ME)
-                    v["seen_count"] += 1
-                    if v["view_mode"] == "once" or m.group(2) == "item_replayed":
-                        v["media"] = {"media_type": v["media"]["media_type"]}
-            return self.send_json({"status": "ok"})
-        if m := re.match(r"direct_v2/threads/(\d+)/items/.+/seen/", p):
-            return self.send_json({"status": "ok"})
-        if m := re.match(r"direct_v2/threads/(\d+)/$", p):
-            t = dict(THREADS[m.group(1)])
-            items = SENT + t["items"] if m.group(1).endswith("1") else t["items"]
-            if q.get("cursor"):
-                t["items"] = [dm("old1", "1001", 400000, "text", text="(older message)")]
-                t["has_older"] = False
-                t["oldest_cursor"] = None
-            else:
-                t["items"] = items
-            return self.send_json({"thread": t, "status": "ok"})
-        if p.startswith("direct_v2/threads/broadcast/"):
-            text = body.get("text", body.get("link_text", [""]))[0]
-            SENT.insert(0, dm(f"sent{len(SENT)}", ME, 0, "text", text=text))
-            return self.send_json({"action": "item_ack", "status_code": "200", "payload": {"thread_id": "340282366841710300949128100000000001", "item_id": "x"}, "status": "ok"})
-        if p == "direct_v2/threads/get_by_participants/":
-            return self.send_json({"status": "ok"})
         if m := re.match(r"friendships/show/(\d+)/", p):
             return self.send_json({"following": m.group(1) in USERS and m.group(1) < "2000", "followed_by": True, "status": "ok"})
         if m := re.match(r"feed/user/(\d+)/", p):
