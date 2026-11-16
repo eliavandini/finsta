@@ -83,8 +83,9 @@ iPhone app, which Instagram now rejects.) That means:
 - It can break whenever Instagram changes its API.
 - Using unofficial clients is against Instagram's terms and could get an
   account flagged. Use it at your own risk.
-- New messages are fetched by polling (every 8 seconds in an open
-  conversation, every 30 seconds for the conversation list), not pushed.
+- New messages are fetched by polling (every 15 seconds in an open
+  conversation, every minute for the conversation list), not pushed. When
+  Instagram rate limits, Finsta pauses all requests until it says to retry.
 - Sending photos, videos (including disappearing ones) and voice notes is not
   supported yet.
 - Instagram can't tell when you screenshot a disappearing photo in Finsta, so

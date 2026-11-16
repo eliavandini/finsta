@@ -8,8 +8,8 @@ pub mod session;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use reqwest::Method;
@@ -44,6 +44,41 @@ impl std::error::Error for LoginRequired {}
 
 pub fn is_login_required(err: &anyhow::Error) -> bool {
     err.downcast_ref::<LoginRequired>().is_some()
+}
+
+/// Returned when Instagram is throttling requests. Until the cooldown ends,
+/// requests fail right away instead of being sent, so Finsta doesn't keep
+/// knocking while Instagram has asked it to stop.
+#[derive(Debug)]
+pub struct RateLimited;
+
+impl fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Instagram is limiting requests right now. Try again in a few minutes.")
+    }
+}
+
+impl std::error::Error for RateLimited {}
+
+pub fn is_rate_limited(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RateLimited>().is_some()
+}
+
+/// Shared by every client: the limit applies to the account and connection.
+static COOLDOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long requests stay paused after Instagram throttled them.
+pub fn cooldown_remaining() -> Option<Duration> {
+    let until = (*COOLDOWN_UNTIL.lock().unwrap())?;
+    until.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
+}
+
+fn start_cooldown(retry_after: Option<Duration>) {
+    let wait = retry_after
+        .unwrap_or(Duration::from_secs(120))
+        .clamp(Duration::from_secs(30), Duration::from_secs(900));
+    eprintln!("finsta: pausing requests for {}s", wait.as_secs());
+    *COOLDOWN_UNTIL.lock().unwrap() = Some(Instant::now() + wait);
 }
 
 #[derive(Debug, Default, Clone)]
@@ -214,6 +249,9 @@ impl Client {
         query: &[(&str, String)],
         form: Option<&[(&str, String)]>,
     ) -> Result<Value> {
+        if cooldown_remaining().is_some() {
+            return Err(RateLimited.into());
+        }
         let path = path.trim_start_matches('/');
         let route = route_key(path);
         let mut api_host = self.inner.fallback && self.inner.api_host_routes.read().unwrap().contains(&route);
@@ -244,6 +282,12 @@ impl Client {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or_default()
                 .to_string();
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
             self.absorb_headers(resp.headers());
             let text = resp.text().await?;
             let json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -254,7 +298,13 @@ impl Client {
                 api_host = true;
                 continue;
             }
-            return check_response(&what, status, &location, &json, &text);
+            let result = check_response(&what, status, &location, &json, &text);
+            if let Err(e) = &result
+                && is_rate_limited(e)
+            {
+                start_cooldown(retry_after);
+            }
+            return result;
         }
     }
 
@@ -637,7 +687,7 @@ fn check_response(
     // Checked before the 401 test: Instagram also answers 401 with
     // "Please wait a few minutes" when it throttles a valid session.
     if status.as_u16() == 429 || message.contains("wait a few minutes") {
-        bail!("Instagram is rate limiting requests. Try again in a few minutes.");
+        return Err(RateLimited.into());
     }
     if message == "checkpoint_required" || message == "challenge_required" || json["challenge"].is_object() {
         bail!(VERIFY);

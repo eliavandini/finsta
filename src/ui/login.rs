@@ -66,6 +66,17 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
                         }
                         on_success(session);
                     }
+                    // The login itself may well be fine; Instagram just isn't
+                    // answering right now. Signing in again would only add
+                    // another fresh session, so keep this one.
+                    Err(e) if crate::api::is_rate_limited(&e) || e.downcast_ref::<reqwest::Error>().is_some() => {
+                        eprintln!("finsta: couldn't check the new session ({e:#}); keeping it");
+                        let session = client.session();
+                        if let Err(e) = session.save() {
+                            eprintln!("finsta: could not save session: {e:#}");
+                        }
+                        on_success(session);
+                    }
                     Err(e) => {
                         eprintln!("finsta: sign-in check failed: {e:#}");
                         let msg = if crate::api::is_login_required(&e) {

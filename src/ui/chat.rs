@@ -298,7 +298,7 @@ impl Chat {
 
     fn start_polling(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        glib::timeout_add_seconds_local(8, move || {
+        glib::timeout_add_seconds_local(15, move || {
             let Some(c) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };

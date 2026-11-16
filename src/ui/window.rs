@@ -29,6 +29,8 @@ pub struct Main {
     pub search: OnceCell<Rc<search::SearchPage>>,
     suppress_search: Cell<bool>,
     logged_out: Cell<bool>,
+    /// When the "Instagram is limiting requests" toast was last shown.
+    limit_toast: Cell<Option<std::time::Instant>>,
 }
 
 pub fn build(app: &adw::Application) {
@@ -147,6 +149,7 @@ impl Main {
             search: OnceCell::new(),
             suppress_search: Cell::new(false),
             logged_out: Cell::new(false),
+            limit_toast: Cell::new(None),
         });
 
         let sidebar = sidebar::Sidebar::new(&main);
@@ -230,6 +233,32 @@ impl Main {
     }
 
     fn start(self: &Rc<Self>) {
+        if api::cooldown_remaining().is_some() {
+            self.limit_toast.set(Some(std::time::Instant::now()));
+            self.toast("Signed in. Instagram is limiting requests right now, so things will load in a few minutes.");
+        }
+        self.load_me();
+        if let Some(home) = self.home.get() {
+            home.refresh();
+        }
+        if let Some(sidebar) = self.sidebar.get() {
+            sidebar.start();
+        }
+    }
+
+    /// Load the signed-in account's profile, waiting out a rate limit first.
+    fn load_me(self: &Rc<Self>) {
+        if let Some(wait) = api::cooldown_remaining() {
+            let weak = Rc::downgrade(self);
+            glib::timeout_add_local_once(wait + std::time::Duration::from_secs(2), move || {
+                if let Some(main) = weak.upgrade()
+                    && !main.logged_out.get()
+                {
+                    main.load_me();
+                }
+            });
+            return;
+        }
         let weak = Rc::downgrade(self);
         let client = self.client.clone();
         let uid = client.user_id();
@@ -243,15 +272,10 @@ impl Main {
                     }
                     main.me.replace(Some(user));
                 }
+                Err(e) if api::is_rate_limited(&e) => main.load_me(),
                 Err(e) => main.handle_error(&e),
             }
         });
-        if let Some(home) = self.home.get() {
-            home.refresh();
-        }
-        if let Some(sidebar) = self.sidebar.get() {
-            sidebar.start();
-        }
     }
 
     // ----- Navigation ----------------------------------------------------
@@ -463,6 +487,14 @@ impl Main {
             return;
         }
         eprintln!("finsta: {err:#}");
+        if api::is_rate_limited(err) {
+            // Several pages fail at once when this happens; say it once.
+            let recent = self.limit_toast.get().is_some_and(|t| t.elapsed().as_secs() < 60);
+            if recent {
+                return;
+            }
+            self.limit_toast.set(Some(std::time::Instant::now()));
+        }
         self.toast(&format!("{err}"));
     }
 

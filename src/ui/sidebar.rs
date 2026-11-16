@@ -242,7 +242,7 @@ impl Sidebar {
         self.refresh(false);
         // Keep unread state fresh without a push connection.
         let weak = Rc::downgrade(self);
-        glib::timeout_add_seconds_local(30, move || match weak.upgrade() {
+        glib::timeout_add_seconds_local(60, move || match weak.upgrade() {
             Some(s) => {
                 s.refresh(true);
                 glib::ControlFlow::Continue
