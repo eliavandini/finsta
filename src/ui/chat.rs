@@ -18,6 +18,10 @@ use crate::ui::media_viewer::{self, Ephemeral};
 use crate::ui::images;
 use crate::ui::video;
 
+fn api_login_required(e: &anyhow::Error) -> bool {
+    crate::api::is_login_required(e)
+}
+
 pub enum ChatTarget {
     Thread(Thread),
     /// Someone you may not have a conversation with yet.
@@ -688,6 +692,43 @@ impl Chat {
         });
     }
 
+    fn react(self: &Rc<Self>, item_id: &str, emoji: Option<&'static str>) {
+        let before = {
+            let mut items = self.items.borrow_mut();
+            let Some(item) = items.iter_mut().find(|i| i.item_id == item_id) else { return };
+            let before = item.reaction_by(&self.viewer_id);
+            item.set_reaction(&self.viewer_id, emoji);
+            before
+        };
+        // Keep focus out of the list, or redrawing it scrolls to the focus.
+        self.entry.grab_focus();
+        self.render();
+        let Some(main) = self.main.upgrade() else { return };
+        let thread_id = self.thread.borrow().thread_id.clone();
+        let client = main.client.clone();
+        let item_id = item_id.to_string();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let id = item_id.clone();
+            let res = rt::bg(async move { client.react(&thread_id, &id, emoji).await }).await;
+            let Some(chat) = weak.upgrade() else { return };
+            if let Err(e) = res {
+                eprintln!("finsta: reaction failed: {e}");
+                if let Some(item) = chat.items.borrow_mut().iter_mut().find(|i| i.item_id == item_id) {
+                    item.set_reaction(&chat.viewer_id, before.as_deref());
+                }
+                chat.render();
+                if let Some(main) = chat.main.upgrade() {
+                    if api_login_required(&e) {
+                        main.handle_error(&e);
+                    } else {
+                        main.toast("Couldn't send your reaction");
+                    }
+                }
+            }
+        });
+    }
+
     fn render(self: &Rc<Self>) {
         // Rebuilding the list must not move the view if you've scrolled up.
         if !self.stick_to_bottom.get() && self.keep_distance_from_bottom.get().is_none() {
@@ -747,6 +788,96 @@ impl Chat {
     }
 }
 
+const REACTIONS: [&str; 6] = ["❤️", "😂", "😮", "😢", "😡", "👍"];
+
+/// Right-click or long-press a message to react to it.
+fn react_on_press(chat: &Rc<Chat>, bubble: &gtk::Widget, item: &DmItem) {
+    let item_id = item.item_id.clone();
+    if item_id.is_empty() || item_id.starts_with("snippet:") {
+        return;
+    }
+    let mine = item.reaction_by(&chat.viewer_id);
+    let text = match item.content() {
+        DmContent::Text(t) | DmContent::Link { text: t } if !t.is_empty() => Some(t),
+        _ => None,
+    };
+    let weak = Rc::downgrade(chat);
+    let open = Rc::new(move |widget: &gtk::Widget| {
+        let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
+        let row = gtk::Box::builder().spacing(2).build();
+        column.append(&row);
+        let popover = gtk::Popover::builder().child(&column).build();
+        if let Some(text) = text.clone() {
+            let copy = gtk::Button::builder().label("Copy Text").css_classes(["flat"]).build();
+            let p = popover.downgrade();
+            copy.connect_clicked(move |b| {
+                b.clipboard().set_text(&text);
+                if let Some(p) = p.upgrade() {
+                    p.popdown();
+                }
+            });
+            column.append(&copy);
+        }
+        for emoji in REACTIONS {
+            let b = gtk::Button::builder().label(emoji).css_classes(["flat", "reaction-choice"]).build();
+            if mine.as_deref() == Some(emoji) {
+                b.add_css_class("suggested-action");
+                b.set_tooltip_text(Some("Remove your reaction"));
+            }
+            let weak = weak.clone();
+            let item_id = item_id.clone();
+            let remove = mine.as_deref() == Some(emoji);
+            let popover = popover.downgrade();
+            b.connect_clicked(move |_| {
+                if let Some(p) = popover.upgrade() {
+                    p.popdown();
+                }
+                // Once the menu is gone (redrawing the list removes the
+                // message it points at).
+                let weak = weak.clone();
+                let item_id = item_id.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(chat) = weak.upgrade() {
+                        chat.react(&item_id, if remove { None } else { Some(emoji) });
+                    }
+                });
+            });
+            row.append(&b);
+        }
+        popover.set_parent(widget);
+        popover.connect_closed(|p| {
+            let p = p.clone();
+            glib::idle_add_local_once(move || p.unparent());
+        });
+        popover.popup();
+    });
+    // Before the text inside gets the click (it has its own menu).
+    let right = gtk::GestureClick::builder()
+        .button(3)
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
+    let f = open.clone();
+    right.connect_pressed(move |g, _, _, _| {
+        g.set_state(gtk::EventSequenceState::Claimed);
+        if let Some(w) = g.widget() {
+            f(&w);
+        }
+    });
+    bubble.add_controller(right);
+    let long = gtk::GestureLongPress::builder().touch_only(true).build();
+    long.connect_pressed(move |g, _, _| {
+        g.set_state(gtk::EventSequenceState::Claimed);
+        if let Some(w) = g.widget() {
+            open(&w);
+        }
+    });
+    bubble.add_controller(long);
+    bubble.set_tooltip_text(Some(&format!(
+        "{} · right-click to react",
+        bubble.tooltip_text().map(|t| t.to_string()).unwrap_or_else(|| util::full_time(item.timestamp_secs()))
+    )));
+}
+
 fn clickable(widget: &impl IsA<gtk::Widget>, f: impl Fn() + 'static) {
     let click = gtk::GestureClick::new();
     click.connect_released(move |gesture, _, _, _| {
@@ -796,15 +927,19 @@ fn shared_card(
     subtitle: &str,
     preview: Option<String>,
     url: Option<String>,
+    aspect: f64,
 ) -> gtk::Widget {
+    let in_app = url.as_deref().and_then(crate::api::web::link_code).is_some();
+    let is_reel = url.as_deref().is_some_and(|u| u.contains("/reel"));
+    let width = if aspect > 1.1 { 200 } else { 240 };
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .css_classes(["bubble-card"])
         .overflow(gtk::Overflow::Hidden)
-        .width_request(240)
+        .width_request(width)
         .build();
     if preview.is_some() {
-        card.append(&media_thumb(preview, 1.0, 240, false));
+        card.append(&media_thumb(preview, aspect, width, is_reel));
     }
     let text = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -836,20 +971,20 @@ fn shared_card(
         );
     }
     if let Some(url) = url {
-        // Shared reels and posts open in the browser instead of an in-app
-        // player, so a chat can't turn into a reel feed.
-        text.append(
-            &gtk::Label::builder()
-                .label("Opens in your browser")
-                .xalign(0.0)
-                .css_classes(["caption", "dim-label"])
-                .build(),
-        );
+        // Posts and reels open as a single post, never as a reel feed.
+        if !in_app {
+            text.append(
+                &gtk::Label::builder()
+                    .label("Opens in your browser")
+                    .xalign(0.0)
+                    .css_classes(["caption", "dim-label"])
+                    .build(),
+            );
+        }
         let weak = Rc::downgrade(main);
-        let card_weak = card.downgrade();
         clickable(&card, move || {
-            if let (Some(_), Some(card)) = (weak.upgrade(), card_weak.upgrade()) {
-                util::open_uri(&card, &url);
+            if let Some(main) = weak.upgrade() {
+                main.open_link(&url);
             }
         });
     }
@@ -1078,8 +1213,8 @@ fn message_widget(
             thumb
         }
         DmContent::Post(media) => post_card(main, &media),
-        DmContent::Shared { title, subtitle, preview, url } => {
-            shared_card(main, &title, &subtitle, preview, url)
+        DmContent::Shared { title, subtitle, preview, url, aspect } => {
+            shared_card(main, &title, &subtitle, preview, url, aspect)
         }
         DmContent::Voice { url, duration_ms } => {
             let b = gtk::Box::builder()
@@ -1116,6 +1251,9 @@ fn message_widget(
         bubble.set_tooltip_text(Some("Sending…"));
     }
     column.append(&bubble);
+    if !pending {
+        react_on_press(chat, &bubble, item);
+    }
 
     let reactions = item.reactions();
     if !reactions.is_empty() {

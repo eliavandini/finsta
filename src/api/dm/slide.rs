@@ -29,6 +29,7 @@ const MESSAGES: &str = "IGDMessageListOffMsysQuery";
 const SEND_TEXT: &str = "IGDirectTextSendMutation";
 const MARK_READ: &str = "useIGDMarkThreadAsReadMutation";
 const STORY_REPLY: &str = "IGDirectStoryShareReplyMutation";
+const REACT: &str = "IGDirectReactionSendMutation";
 
 /// Values the website computes on its side ("provided variables").
 const MAX_UNREAD: i64 = 20;
@@ -166,6 +167,18 @@ impl SlideState {
             "user_id": self.sender(t, &s(&m["sender_fbid"]), viewer_pk),
             "timestamp": n(&m["timestamp_ms"]) * 1000,
         });
+        let reactions: Vec<Value> = m["reactions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                let emoji = s(&r["reaction"]);
+                (!emoji.is_empty()).then(|| json!({"emoji": emoji, "sender_id": self.sender(t, &s(&r["sender_fbid"]), viewer_pk)}))
+            })
+            .collect();
+        if !reactions.is_empty() {
+            v["reactions"] = json!({"emojis": reactions});
+        }
         let c = &m["content"];
         if !m["tombstone_reason"].is_null() && m["tombstone_reason"] != "" {
             placeholder(&mut v, "This message is no longer available.");
@@ -227,7 +240,30 @@ impl SlideState {
                     .map(|t| s(t))
                     .filter(|t| !t.is_empty())
                     .collect();
-                if !target.is_empty() {
+                let preview = url(&x["preview_image"], &["url", "fallback_url"]);
+                let kind = share_kind(&target);
+                if kind.is_some() || (preview.is_some() && !target.is_empty()) {
+                    // A shared post, reel or story: a card with its preview.
+                    let author = s(&x["header_title_text"]);
+                    let caption = [&x["title_text"], &x["caption_body_text"], &c["xma_text_body"]]
+                        .iter()
+                        .map(|t| s(t))
+                        .find(|t| !t.is_empty() && *t != author)
+                        .unwrap_or_default();
+                    let (w, h) = (n(&x["preview_image"]["width"]), n(&x["preview_image"]["height"]));
+                    let portrait = x["__typename"] == "SlideMessagePortraitXMA" || matches!(kind, Some("reel" | "story"));
+                    // Height / width, as for posts.
+                    let aspect = if w > 0 && h > 0 { h as f64 / w as f64 } else if portrait { 16.0 / 9.0 } else { 1.0 };
+                    v["item_type"] = "xma_share".into();
+                    v["xma_share"] = json!({
+                        "kind": kind.unwrap_or("link"),
+                        "author": author,
+                        "caption": caption,
+                        "preview": preview,
+                        "url": target,
+                        "aspect": aspect,
+                    });
+                } else if !target.is_empty() {
                     let mut body = text.join("\n");
                     body = if body.is_empty() { target.clone() } else { format!("{body}\n{target}") };
                     v["item_type"] = "link".into();
@@ -508,6 +544,26 @@ impl Client {
         parse(&st.slide.thread(&id, &viewer_pk, items, false, None))
     }
 
+    pub(super) async fn slide_react(&self, st: &mut DmState, thread_id: &str, message_id: &str, emoji: Option<&str>) -> Result<()> {
+        let igid = s(&st.slide.threads.get(thread_id).cloned().unwrap_or_default()["thread_id"]);
+        if igid.is_empty() {
+            bail!("Couldn't find this conversation's id. Reopen it and try again.");
+        }
+        let input = json!({
+            "ig_thread_igid": igid,
+            "item_id": message_id,
+            "emoji": emoji.unwrap_or(""),
+            "reaction_status": if emoji.is_some() { "created" } else { "deleted" },
+            "reaction_type": "like",
+            "offline_threading_id": time_id().to_string(),
+        });
+        let data = self.slide_op(st, REACT, json!({"input": input})).await?;
+        if data["xig_direct_reaction_send_with_slide_messaging_response"]["success"] == false {
+            bail!("Instagram didn't accept the reaction");
+        }
+        Ok(())
+    }
+
     pub(super) async fn slide_story_reply(&self, st: &mut DmState, owner_pk: &str, media_id: &str, text: &str) -> Result<()> {
         let viewer_pk = self.user_id();
         let igid = st
@@ -627,6 +683,20 @@ impl Client {
     }
 }
 
+/// What an Instagram link points to: "post", "reel" or "story".
+fn share_kind(url: &str) -> Option<&'static str> {
+    let path = url.split("instagram.com/").nth(1)?;
+    if path.starts_with("p/") {
+        Some("post")
+    } else if path.starts_with("reel/") || path.starts_with("reels/") {
+        Some("reel")
+    } else if path.starts_with("stories/") {
+        Some("story")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +747,19 @@ mod tests {
         assert_eq!(v["item_type"], "placeholder");
         assert!(!v.to_string().contains("secret"));
         let share = json!({"id": "m5", "sender_fbid": "100042", "content": {"__typename": "SlideMessageXMAContent", "xma": {"__typename": "SlideMessagePortraitXMA", "target_url": "https://www.instagram.com/p/x/", "header_title_text": "natgeo"}}});
-        assert_eq!(st.item(&t, &share, "7")["item_type"], "link");
+        let v = st.item(&t, &share, "7");
+        assert_eq!(v["item_type"], "xma_share");
+        assert_eq!(v["xma_share"]["kind"], "post");
+        assert_eq!(v["xma_share"]["author"], "natgeo");
+        let reel = json!({"id": "m6", "sender_fbid": "100042", "content": {"__typename": "SlideMessageXMAContent", "xma": {"__typename": "SlideMessagePortraitXMA",
+            "target_url": "https://www.instagram.com/reel/r/", "preview_image": {"url": "u", "width": 720, "height": 1280}}}});
+        let v = st.item(&t, &reel, "7");
+        assert_eq!(v["xma_share"]["kind"], "reel");
+        assert!((v["xma_share"]["aspect"].as_f64().unwrap() - 1280.0 / 720.0).abs() < 1e-9);
+        let reacted = json!({"id": "m7", "sender_fbid": "100007", "content": {"__typename": "SlideMessageText", "text_body": "x"},
+            "reactions": [{"reaction": "😂", "sender_fbid": "100042"}]});
+        let item: crate::api::DmItem = parse(&st.item(&t, &reacted, "7")).unwrap();
+        assert_eq!(item.reactions(), vec!["😂".to_string()]);
+        assert_eq!(item.reaction_by("42").as_deref(), Some("😂"));
     }
 }

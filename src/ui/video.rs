@@ -413,7 +413,7 @@ fn poll() {
             .filter_map(|x| Some((x.id, x.picture.upgrade()?, x.url.clone())))
             .filter(|(_, _, url)| !FAILED.with(|f| f.borrow().contains(url)))
             .map(|(id, p, url)| {
-                let f = visible_fraction(&p);
+                let f = crate::ui::util::visible_fraction(&p);
                 (id, p, url, f)
             })
             .collect()
@@ -444,31 +444,6 @@ fn poll() {
 }
 
 /// How much of `p` is on screen, from 0 to 1.
-fn visible_fraction(p: &gtk::Picture) -> f32 {
-    if !p.is_mapped() || p.height() <= 0 {
-        return 0.0;
-    }
-    let Some(root) = p.root() else { return 0.0 };
-    let root = root.upcast_ref::<gtk::Widget>();
-    if root.downcast_ref::<gtk::Window>().is_some_and(|w| w.is_suspended() || !w.is_visible()) {
-        return 0.0;
-    }
-    let Some(b) = p.compute_bounds(root) else { return 0.0 };
-    let (mut top, mut bottom) = (0.0f32, root.height() as f32);
-    let mut ancestor = p.parent();
-    while let Some(w) = ancestor {
-        if w.is::<gtk::ScrolledWindow>()
-            && let Some(sb) = w.compute_bounds(root)
-        {
-            top = top.max(sb.y());
-            bottom = bottom.min(sb.y() + sb.height());
-        }
-        ancestor = w.parent();
-    }
-    let visible = (b.y() + b.height()).min(bottom) - b.y().max(top);
-    (visible / b.height()).clamp(0.0, 1.0)
-}
-
 /// The sound button on autoplaying videos (all of them share one setting).
 pub fn mute_button() -> gtk::Button {
     let button = gtk::Button::builder()

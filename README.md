@@ -21,19 +21,34 @@ There are no reels, no explore page, no suggested posts and no ads.
 - **No endless scrolling anywhere else.** Profiles show 12 posts with a "Show
   More Posts" button, search shows a short fixed list, older messages and
   older conversations load only when you press a button.
-- **Shared reels in chats open in your browser**, so a conversation can't
-  turn into a reel feed.
+- **Shared posts and reels open one at a time.** A post or reel sent in a
+  chat shows a preview; clicking it opens just that post, with its
+  comments, so a conversation can't turn into a reel feed.
 - **Videos play by themselves while they're on screen**, muted and one at a
   time, and stop when you scroll past them. The speaker button turns the
   sound on for all of them. Stories play with sound.
 
 ## Layout
 
-- **Top bar**: a search field (people and conversations; <kbd>Ctrl</kbd>+<kbd>F</kbd>).
+- **Top bar**: a search field (<kbd>Ctrl</kbd>+<kbd>F</kbd>) for
+  conversations, people you could message, accounts and posts (words,
+  #hashtags, or a pasted post or reel link).
 - **Sidebar**: Home, the list of conversations (filter by All / People /
-  Groups), and your Profile.
+  Groups), your Profile, and your Saved posts (the bookmark button).
 - **Content**: home feed with stories, conversations, profiles and posts.
   On narrow windows the sidebar folds away.
+- **Feed layout** (the grid button above the feed): 1 to 4 columns, small,
+  medium or large posts, and comments beside each post. Fewer columns, and
+  comments below posts, are used when the window is too narrow. Saved in
+  `~/.config/finsta/settings.json`.
+- **Posts** on a wide window show the photo or video on the left, and the
+  account, caption, music, comments and a comment field on the right.
+- **Stories** show their music, who a reshared story is from, a button to
+  open the post or reel it shares, links and mentions.
+- **Messages**: right-click a message (or long-press on a touchscreen) to
+  react with an emoji; reactions show under the message.
+- **Downloads**: the download button on posts, reels and stories saves
+  them, every photo of a carousel included, to `Downloads/Finsta`.
 
 ## Installing
 
@@ -99,7 +114,12 @@ iPhone app, which Instagram now rejects.) That means:
   story marks it as seen, so you appear in its viewers, and the viewer
   starts at the first story you haven't watched yet.
 - You can like stories and reply to them; replies arrive in your
-  conversation with that person.
+  conversation with that person. If Instagram turns down the story reply
+  (its format isn't fully known yet), Finsta tries the older route, and
+  then sends your reply as a message with a link to the story.
+- Message reactions, search and saved posts use requests whose exact
+  format Finsta learns from the website's scripts; until it has seen them,
+  some of these may fail and say so in the log.
 - Not supported yet in messages: disappearing photos, voice messages,
   sending anything but text. They show a note to use instagram.com
   instead.

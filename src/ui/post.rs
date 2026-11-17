@@ -1,4 +1,6 @@
-//! A post card (header, media, actions, caption) and a standalone post page.
+//! Posts: a card for the home feed (stacked, or with comments beside it) and
+//! a post page that puts the details and comments to the right of the photo
+//! or video when the window is wide.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -8,49 +10,58 @@ use gtk::glib;
 
 use crate::api::Media;
 use crate::rt;
-use crate::ui::images;
+use crate::ui::layout::SIDE_WIDTH;
 use crate::ui::ratio_bin::RatioBin;
 use crate::ui::util;
-use crate::ui::video;
 use crate::ui::window::Main;
+use crate::ui::{comments, download, images, video};
 
-const MEDIA_WIDTH: i32 = 600;
-
-pub fn page(main: &Rc<Main>, media: &Media) -> adw::NavigationPage {
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .margin_top(12)
-        .margin_bottom(24)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
-    content.append(&card(main, media));
-    let clamp = adw::Clamp::builder().maximum_size(620).child(&content).build();
-    let scroller = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&clamp)
-        .build();
-    let owner = media.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
-    adw::NavigationPage::builder()
-        .title(format!("Post by @{owner}"))
-        .child(&scroller)
-        .build()
+/// How a feed card is drawn.
+#[derive(Debug, Clone, Copy)]
+pub struct Style {
+    /// The width of the photo or video.
+    pub width: i32,
+    /// Comments in a panel to the right of the post.
+    pub side: bool,
 }
 
-pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
-    let card = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .css_classes(["card", "post"])
-        .overflow(gtk::Overflow::Hidden)
-        .build();
-    let user = media.user.clone().unwrap_or_default();
+impl Default for Style {
+    fn default() -> Self {
+        Style { width: 600, side: false }
+    }
+}
 
-    // Header
+/// The pieces of a post, placed differently by each layout.
+struct Parts {
+    header: gtk::Widget,
+    /// The photo, video or carousel, without a size of its own.
+    media: gtk::Widget,
+    aspect: f64,
+    /// The buttons and the like count.
+    actions: gtk::Widget,
+    caption: Option<gtk::Widget>,
+}
+
+type Action = Rc<dyn Fn()>;
+
+fn parts(main: &Rc<Main>, media: &Media, on_comment: Action) -> Parts {
+    Parts {
+        header: header(main, media),
+        media: media_content(media),
+        aspect: media.aspect(),
+        actions: actions(main, media, on_comment),
+        caption: caption(media),
+    }
+}
+
+fn header(main: &Rc<Main>, media: &Media) -> gtk::Widget {
+    let user = media.user.clone().unwrap_or_default();
     let header = gtk::Box::builder().spacing(10).css_classes(["post-header"]).build();
     let avatar_button = gtk::Button::builder()
         .child(&util::avatar(&user, 36))
         .css_classes(["flat", "circular"])
         .tooltip_text(format!("View @{}'s profile", user.username))
+        .valign(gtk::Align::Center)
         .build();
     let names = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -76,13 +87,18 @@ pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
     }
     names.append(&name_button);
     if let Some(loc) = media.location.as_ref().filter(|l| !l.name.is_empty()) {
-        let l = gtk::Label::builder()
-            .label(&loc.name)
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["caption", "dim-label"])
-            .build();
-        names.append(&l);
+        names.append(
+            &gtk::Label::builder()
+                .label(&loc.name)
+                .xalign(0.0)
+                .margin_start(6)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+    }
+    if let Some(music) = media.music() {
+        names.append(&music_label(&music));
     }
     let time = gtk::Label::builder()
         .label(util::relative_time(media.taken_at))
@@ -97,6 +113,7 @@ pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
             .icon_name("web-browser-symbolic")
             .tooltip_text("Open on instagram.com")
             .css_classes(["flat", "circular"])
+            .valign(gtk::Align::Center)
             .build();
         open.connect_clicked(move |b| util::open_uri(b, &url));
         header.append(&open);
@@ -110,13 +127,28 @@ pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
             }
         });
     }
-    card.append(&header);
+    header.upcast()
+}
 
-    // Media
-    card.append(&media_view(media, MEDIA_WIDTH));
+/// "♫ Song · Artist", for posts and stories with music.
+pub fn music_label(music: &str) -> gtk::Widget {
+    let b = gtk::Box::builder().spacing(4).margin_start(6).css_classes(["music"]).build();
+    b.append(&gtk::Image::builder().icon_name("audio-x-generic-symbolic").pixel_size(12).build());
+    b.append(
+        &gtk::Label::builder()
+            .label(music)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["caption"])
+            .build(),
+    );
+    b.set_tooltip_text(Some(music));
+    b.upcast()
+}
 
-    // Actions
-    let actions = gtk::Box::builder()
+fn actions(main: &Rc<Main>, media: &Media, on_comment: Action) -> gtk::Widget {
+    let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    let row = gtk::Box::builder()
         .spacing(2)
         .margin_start(6)
         .margin_end(6)
@@ -147,8 +179,7 @@ pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
             } else {
                 like_button.remove_css_class("liked");
             }
-            let n = likes.get();
-            likes_label.set_markup(&format!("<b>{}</b>", util::plural(n, "like", "likes")));
+            likes_label.set_markup(&format!("<b>{}</b>", util::plural(likes.get(), "like", "likes")));
         })
     };
     update_like();
@@ -188,70 +219,110 @@ pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
             });
         });
     }
-    actions.append(&like_button);
+    row.append(&like_button);
     if !media.comments_disabled {
         let comment_button = gtk::Button::builder()
             .icon_name("comment-symbolic")
             .tooltip_text("Comments")
             .css_classes(["flat", "circular"])
             .build();
-        let weak = Rc::downgrade(main);
-        let m = media.clone();
-        comment_button.connect_clicked(move |_| {
-            if let Some(main) = weak.upgrade() {
-                main.show_comments(&m);
-            }
-        });
-        actions.append(&comment_button);
+        comment_button.connect_clicked(move |_| on_comment());
+        row.append(&comment_button);
     }
-    card.append(&actions);
-    card.append(&likes_label);
+    row.append(&gtk::Box::builder().hexpand(true).build());
+    let owner = media.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+    row.append(&download::button(main, media, &owner));
+    column.append(&row);
+    column.append(&likes_label);
+    column.upcast()
+}
 
-    // Caption
+fn caption(media: &Media) -> Option<gtk::Widget> {
     let caption = media.caption_text();
-    if !caption.trim().is_empty() {
-        let label = gtk::Label::builder()
-            .use_markup(true)
-            .label(format!(
-                "<b>{}</b> {}",
-                glib::markup_escape_text(&user.username),
-                util::linkify(&caption)
-            ))
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .xalign(0.0)
-            .lines(3)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .build();
-        card.append(&label);
-        if caption.chars().count() > 140 || caption.lines().count() > 3 {
-            let more = gtk::Button::builder()
-                .label("more")
-                .css_classes(["flat", "dim-label"])
-                .halign(gtk::Align::Start)
-                .margin_start(4)
-                .build();
-            more.connect_clicked(glib::clone!(
-                #[weak]
-                label,
-                move |b| {
-                    let expanded = label.lines() < 0;
-                    label.set_lines(if expanded { 3 } else { -1 });
-                    label.set_ellipsize(if expanded {
-                        gtk::pango::EllipsizeMode::End
-                    } else {
-                        gtk::pango::EllipsizeMode::None
-                    });
-                    b.set_label(if expanded { "more" } else { "less" });
-                }
-            ));
-            card.append(&more);
-        }
+    if caption.trim().is_empty() {
+        return None;
     }
+    let user = media.user.clone().unwrap_or_default();
+    let b = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    let label = gtk::Label::builder()
+        .use_markup(true)
+        .label(format!(
+            "<b>{}</b> {}",
+            glib::markup_escape_text(&user.username),
+            util::linkify(&caption)
+        ))
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .xalign(0.0)
+        .lines(3)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .build();
+    b.append(&label);
+    if caption.chars().count() > 140 || caption.lines().count() > 3 {
+        let more = gtk::Button::builder()
+            .label("more")
+            .css_classes(["flat", "dim-label"])
+            .halign(gtk::Align::Start)
+            .margin_start(4)
+            .build();
+        more.connect_clicked(glib::clone!(
+            #[weak]
+            label,
+            move |b| {
+                let expanded = label.lines() < 0;
+                label.set_lines(if expanded { 3 } else { -1 });
+                label.set_ellipsize(if expanded {
+                    gtk::pango::EllipsizeMode::End
+                } else {
+                    gtk::pango::EllipsizeMode::None
+                });
+                b.set_label(if expanded { "more" } else { "less" });
+            }
+        ));
+        b.append(&more);
+    }
+    Some(b.upcast())
+}
 
+fn open_comments(main: &Rc<Main>, media: &Media) -> Action {
+    let weak = Rc::downgrade(main);
+    let media = media.clone();
+    Rc::new(move || {
+        if let Some(main) = weak.upgrade() {
+            main.show_comments(&media);
+        }
+    })
+}
+
+fn focus_entry(panel: &Rc<comments::Panel>) -> Action {
+    let entry = panel.entry.downgrade();
+    Rc::new(move || {
+        if let Some(e) = entry.upgrade() {
+            e.grab_focus();
+        }
+    })
+}
+
+/// A post for the home feed.
+pub fn card(main: &Rc<Main>, media: &Media, style: Style) -> gtk::Widget {
+    if style.side {
+        return side_card(main, media, style.width);
+    }
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["card", "post"])
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    let p = parts(main, media, open_comments(main, media));
+    card.append(&p.header);
+    card.append(&RatioBin::new(p.aspect, style.width, &p.media));
+    card.append(&p.actions);
+    if let Some(c) = &p.caption {
+        card.append(c);
+    }
     if media.comment_count > 0 && !media.comments_disabled {
         let view = gtk::Button::builder()
             .label(if media.comment_count == 1 {
@@ -263,31 +334,259 @@ pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
             .halign(gtk::Align::Start)
             .margin_start(4)
             .build();
-        let weak = Rc::downgrade(main);
-        let m = media.clone();
-        view.connect_clicked(move |_| {
-            if let Some(main) = weak.upgrade() {
-                main.show_comments(&m);
-            }
-        });
+        let open = open_comments(main, media);
+        view.connect_clicked(move |_| open());
         card.append(&view);
+    } else {
+        card.append(&gtk::Box::builder().height_request(6).build());
     }
-
     card.upcast()
 }
 
-/// The photo, video or carousel of a post, sized to its aspect ratio.
-pub fn media_view(media: &Media, width: i32) -> gtk::Widget {
+/// A feed card with the details and comments in a panel to the right.
+fn side_card(main: &Rc<Main>, media: &Media, width: i32) -> gtk::Widget {
+    let panel = comments::panel(main, media);
+    let p = parts(main, media, focus_entry(&panel));
+    // The card is as tall as the photo or video (or the panel's minimum):
+    // the media column sets the size, keeping room on its right where the
+    // panel is laid over it.
+    let card = gtk::Overlay::builder()
+        .css_classes(["card", "post", "side-post"])
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    let ratio = RatioBin::new(p.aspect, width, &p.media);
+    ratio.set_valign(gtk::Align::Center);
+    ratio.set_vexpand(true);
+    let pane = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_end(SIDE_WIDTH)
+        .height_request(290)
+        .css_classes(["post-media-pane"])
+        .build();
+    pane.append(&ratio);
+    card.set_child(Some(&pane));
+
+    let side = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    side.append(&p.header);
+    side.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_bottom(10)
+        .build();
+    if let Some(c) = &p.caption {
+        body.append(c);
+    }
+    panel.list.set_margin_start(12);
+    panel.list.set_margin_end(12);
+    panel.list.set_margin_top(6);
+    body.append(&panel.list);
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .min_content_height(100)
+        .child(&body)
+        .build();
+    side.append(&scroller);
+    side.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    side.append(&p.actions);
+    panel.composer.add_css_class("side-composer");
+    side.append(&panel.composer);
+    let clamp = adw::Clamp::builder()
+        .maximum_size(SIDE_WIDTH)
+        .tightening_threshold(SIDE_WIDTH)
+        .width_request(SIDE_WIDTH)
+        .child(&side)
+        .build();
+    clamp.set_halign(gtk::Align::End);
+    card.add_overlay(&clamp);
+
+    // Comments load once the post scrolls into view.
+    let weak = Rc::downgrade(&panel);
+    util::when_visible(&card, move || {
+        if let Some(p) = weak.upgrade() {
+            p.load();
+        }
+    });
+    card.upcast()
+}
+
+/// Remove `w` from the box or frame it's in.
+fn detach(w: &gtk::Widget) {
+    let Some(parent) = w.parent() else { return };
+    if let Some(b) = parent.downcast_ref::<gtk::Box>() {
+        b.remove(w);
+    } else if let Some(f) = parent.downcast_ref::<gtk::AspectFrame>() {
+        f.set_child(None::<&gtk::Widget>);
+    }
+}
+
+/// A single post with its comments: stacked when the window is narrow, the
+/// details and comments to the right of the media when it's wide.
+pub fn page(main: &Rc<Main>, media: &Media) -> adw::NavigationPage {
+    let panel = comments::panel(main, media);
+    let p = parts(main, media, focus_entry(&panel));
+    let comments_title = gtk::Label::builder()
+        .label("Comments")
+        .xalign(0.0)
+        .margin_start(12)
+        .margin_top(12)
+        .css_classes(["heading"])
+        .visible(!media.comments_disabled)
+        .build();
+
+    // Narrow: one scrolling column.
+    let holder = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    let ratio = RatioBin::new(p.aspect, 600, &holder);
+    let narrow_card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(0)
+        .css_classes(["card", "post"])
+        .overflow(gtk::Overflow::Hidden)
+        .build();
+    let narrow_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(12)
+        .margin_bottom(24)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    narrow_content.append(&narrow_card);
+    let narrow = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&adw::Clamp::builder().maximum_size(620).child(&narrow_content).build())
+        .build();
+
+    // Wide: the media on the left, everything else on the right.
+    let frame = gtk::AspectFrame::new(0.5, 0.5, (1.0 / p.aspect) as f32, false);
+    let pane = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .vexpand(true)
+        .css_classes(["post-media-pane"])
+        .build();
+    frame.set_vexpand(true);
+    pane.append(&frame);
+    let side_top = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    let side_body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_bottom(12)
+        .build();
+    let side_bottom = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
+    let side = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(400)
+        .css_classes(["post-side"])
+        .build();
+    side.append(&side_top);
+    side.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    side.append(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .child(&side_body)
+            .build(),
+    );
+    side.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    side.append(&side_bottom);
+    let wide = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    wide.append(&pane);
+    wide.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    wide.append(&side);
+
+    panel.list.set_margin_start(12);
+    panel.list.set_margin_end(12);
+    panel.list.set_margin_bottom(12);
+    let bin = adw::BreakpointBin::builder().width_request(360).height_request(300).build();
+    let arrange = {
+        let bin = bin.downgrade();
+        let pieces: Vec<gtk::Widget> = [
+            Some(p.header.clone()),
+            Some(p.media.clone()),
+            Some(ratio.clone().upcast()),
+            Some(p.actions.clone()),
+            p.caption.clone(),
+            Some(comments_title.clone().upcast()),
+            Some(panel.list.clone().upcast()),
+            Some(panel.composer.clone().upcast()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let caption = p.caption.clone();
+        let (header, media_w, actions) = (p.header.clone(), p.media.clone(), p.actions.clone());
+        let list: gtk::Widget = panel.list.clone().upcast();
+        let composer: gtk::Widget = panel.composer.clone().upcast();
+        let title: gtk::Widget = comments_title.clone().upcast();
+        let ratio: gtk::Widget = ratio.clone().upcast();
+        Rc::new(move |is_wide: bool| {
+            let Some(bin) = bin.upgrade() else { return };
+            for w in &pieces {
+                detach(w);
+            }
+            if is_wide {
+                frame.set_child(Some(&media_w));
+                side_top.append(&header);
+                if let Some(c) = &caption {
+                    side_body.append(c);
+                }
+                side_body.append(&title);
+                side_body.append(&list);
+                side_bottom.append(&actions);
+                side_bottom.append(&composer);
+                if bin.child().as_ref() != Some(wide.upcast_ref()) {
+                    bin.set_child(Some(&wide));
+                }
+            } else {
+                holder.append(&media_w);
+                narrow_card.append(&header);
+                narrow_card.append(&ratio);
+                narrow_card.append(&actions);
+                if let Some(c) = &caption {
+                    narrow_card.append(c);
+                }
+                narrow_card.append(&title);
+                narrow_card.append(&list);
+                narrow_card.append(&composer);
+                if bin.child().as_ref() != Some(narrow.upcast_ref()) {
+                    bin.set_child(Some(&narrow));
+                }
+            }
+        })
+    };
+    arrange(false);
+    let breakpoint = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MinWidth,
+        760.0,
+        adw::LengthUnit::Sp,
+    ));
+    let a = arrange.clone();
+    breakpoint.connect_apply(move |_| a(true));
+    breakpoint.connect_unapply(move |_| arrange(false));
+    bin.add_breakpoint(breakpoint);
+    panel.load();
+
+    let owner = media.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+    adw::NavigationPage::builder()
+        .title(format!("Post by @{owner}"))
+        .child(&bin)
+        .build()
+}
+
+/// The photo, video or carousel of a post, filling whatever size it's given.
+fn media_content(media: &Media) -> gtk::Widget {
     let items = media.carousel_media.clone().unwrap_or_default();
     if items.is_empty() {
-        return single_media(media, media.aspect(), width).upcast();
+        return single_media(media);
     }
 
-    let aspect = media.aspect();
     let items = Rc::new(items);
     let index = Rc::new(Cell::new(0usize));
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::SlideLeftRight)
+        .hhomogeneous(true)
+        .vhomogeneous(true)
         .build();
     let overlay = gtk::Overlay::builder().child(&stack).build();
     let prev = gtk::Button::builder()
@@ -328,8 +627,7 @@ pub fn media_view(media: &Media, width: i32) -> gtk::Widget {
         Rc::new(move |i: usize| {
             let name = i.to_string();
             if stack.child_by_name(&name).is_none() {
-                let w = single_media(&items[i], aspect, width);
-                stack.add_named(&w, Some(&name));
+                stack.add_named(&single_media(&items[i]), Some(&name));
             }
             stack.set_visible_child_name(&name);
             index.set(i);
@@ -348,25 +646,26 @@ pub fn media_view(media: &Media, width: i32) -> gtk::Widget {
         let len = items.len();
         next.connect_clicked(move |_| show((index.get() + 1).min(len - 1)));
     }
-
-    RatioBin::new(aspect, width, &overlay).upcast()
+    overlay.upcast()
 }
 
-fn single_media(media: &Media, aspect: f64, width: i32) -> RatioBin {
+fn single_media(media: &Media) -> gtk::Widget {
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Cover)
         .can_shrink(true)
+        .hexpand(true)
+        .vexpand(true)
         .css_classes(["post-media"])
         .build();
     images::load_picture(&picture, media.image_url(750));
 
     let Some(video_url) = media.video_url().filter(|_| media.is_video()) else {
-        return RatioBin::new(aspect, width, &picture);
+        return picture.upcast();
     };
 
     // Plays (muted, looping) while it's the most visible video on screen.
     let overlay = gtk::Overlay::builder().child(&picture).build();
     overlay.add_overlay(&video::mute_button());
     video::autoplay(&picture, video_url);
-    RatioBin::new(aspect, width, &overlay)
+    overlay.upcast()
 }

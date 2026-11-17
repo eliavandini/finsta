@@ -462,7 +462,7 @@ impl Profile {
     }
 }
 
-fn thumbnail(media: &Media) -> gtk::FlowBoxChild {
+pub fn thumbnail(media: &Media) -> gtk::FlowBoxChild {
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Cover)
         .can_shrink(true)

@@ -10,8 +10,9 @@ use std::rc::{Rc, Weak};
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::api::Reel;
+use crate::api::{Media, Reel};
 use crate::rt;
+use crate::ui::layout::{self, FeedLayout, GAP, PostSize, SIDE_WIDTH};
 use crate::ui::{post, util};
 use crate::ui::window::Main;
 
@@ -21,7 +22,16 @@ pub struct HomePage {
     scroller: gtk::ScrolledWindow,
     stories_scroller: gtk::ScrolledWindow,
     stories_box: gtk::Box,
-    posts_box: gtk::Box,
+    /// The posts, in columns (one column unless the layout asks for more).
+    columns_box: gtk::Box,
+    columns: RefCell<Vec<gtk::Box>>,
+    heights: RefCell<Vec<f64>>,
+    cards: RefCell<Vec<(Media, gtk::Widget)>>,
+    clamp: adw::Clamp,
+    layout: Cell<FeedLayout>,
+    active_columns: Cell<u32>,
+    /// Comments beside posts: chosen, and there's room for them.
+    side_active: Cell<bool>,
     footer: gtk::Box,
     reels: RefCell<Vec<Reel>>,
     next_max_id: RefCell<Option<String>>,
@@ -58,7 +68,13 @@ impl HomePage {
             .tooltip_text("Refresh Feed")
             .css_classes(["flat", "circular"])
             .build();
+        let layout_button = gtk::MenuButton::builder()
+            .icon_name("view-grid-symbolic")
+            .tooltip_text("Feed Layout")
+            .css_classes(["flat", "circular"])
+            .build();
         top.append(&title);
+        top.append(&layout_button);
         top.append(&refresh);
         content.append(&top);
 
@@ -71,13 +87,14 @@ impl HomePage {
             .build();
         content.append(&stories_scroller);
 
-        let posts_box = gtk::Box::new(gtk::Orientation::Vertical, 18);
-        content.append(&posts_box);
+        let columns_box = gtk::Box::builder().spacing(GAP).homogeneous(true).build();
+        content.append(&columns_box);
         let footer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         content.append(&footer);
 
+        let layout = layout::feed();
         let clamp = adw::Clamp::builder()
-            .maximum_size(620)
+            .maximum_size(layout.column_width() + 24)
             .tightening_threshold(480)
             .child(&content)
             .build();
@@ -98,7 +115,14 @@ impl HomePage {
             scroller,
             stories_scroller,
             stories_box,
-            posts_box,
+            columns_box,
+            columns: RefCell::new(Vec::new()),
+            heights: RefCell::new(Vec::new()),
+            cards: RefCell::new(Vec::new()),
+            clamp,
+            layout: Cell::new(layout),
+            active_columns: Cell::new(0),
+            side_active: Cell::new(layout.side_comments),
             footer,
             reels: RefCell::new(Vec::new()),
             next_max_id: RefCell::new(None),
@@ -112,7 +136,20 @@ impl HomePage {
             shown: Cell::new(0),
         });
 
+        home.set_columns(1);
+        layout_button.set_popover(Some(&home.layout_popover()));
         let weak = Rc::downgrade(&home);
+        // Fewer columns when the window is too narrow for the chosen number.
+        home.scroller.hadjustment().connect_page_size_notify(glib::clone!(
+            #[strong]
+            weak,
+            move |adj| {
+                if let Some(h) = weak.upgrade() {
+                    let width = adj.page_size() as i32 - 24;
+                    glib::idle_add_local_once(move || h.fit(width, false));
+                }
+            }
+        ));
         refresh.connect_clicked(glib::clone!(
             #[strong]
             weak,
@@ -139,7 +176,8 @@ impl HomePage {
 
     pub fn refresh(self: &Rc<Self>) {
         self.generation.set(self.generation.get() + 1);
-        util::clear_box(&self.posts_box);
+        self.cards.borrow_mut().clear();
+        self.set_columns(self.active_columns.get().max(1));
         self.seen.borrow_mut().clear();
         self.next_max_id.replace(None);
         self.more.set(true);
@@ -150,6 +188,191 @@ impl HomePage {
         self.shown.set(0);
         self.scroller.vadjustment().set_value(0.0);
         self.load_more();
+    }
+
+    fn style(&self) -> post::Style {
+        let l = self.layout.get();
+        post::Style { width: l.size.width(), side: self.side_active.get() }
+    }
+
+    /// Fit the posts to `width` pixels: fewer columns, and comments below
+    /// the posts instead of beside them, when there isn't room.
+    fn fit(&self, width: i32, rebuild: bool) {
+        if width <= 0 {
+            return;
+        }
+        let l = self.layout.get();
+        let n = l.columns_for(width);
+        let side = l.side_comments && width >= l.min_column_width();
+        if side != self.side_active.replace(side) || rebuild {
+            self.rebuild_cards();
+            self.set_columns(n);
+        } else if n != self.active_columns.get() {
+            self.set_columns(n);
+        }
+    }
+
+    fn rebuild_cards(&self) {
+        let Some(main) = self.main.upgrade() else { return };
+        let style = self.style();
+        let rebuilt: Vec<(Media, gtk::Widget)> = self
+            .cards
+            .take()
+            .into_iter()
+            .map(|(m, _)| {
+                let card = post::card(&main, &m, style);
+                (m, card)
+            })
+            .collect();
+        self.cards.replace(rebuilt);
+    }
+
+    /// Roughly how tall a post's card is, to keep the columns even.
+    fn estimate(&self, media: &Media) -> f64 {
+        let l = self.layout.get();
+        let media_height = l.size.width() as f64 * media.aspect();
+        if self.side_active.get() { media_height.max(300.0) } else { media_height + 170.0 }
+    }
+
+    fn place(&self, media: &Media, card: &gtk::Widget) {
+        let columns = self.columns.borrow();
+        let mut heights = self.heights.borrow_mut();
+        let Some(i) = (0..columns.len()).min_by(|a, b| heights[*a].total_cmp(&heights[*b])) else { return };
+        columns[i].append(card);
+        heights[i] += self.estimate(media) + GAP as f64;
+    }
+
+    fn add_post(&self, main: &Rc<Main>, media: Media) {
+        let card = post::card(main, &media, self.style());
+        self.place(&media, &card);
+        self.cards.borrow_mut().push((media, card));
+    }
+
+    /// Lay the posts out in `n` columns.
+    fn set_columns(&self, n: u32) {
+        let n = n.max(1);
+        for c in self.columns.borrow().iter() {
+            while let Some(child) = c.first_child() {
+                c.remove(&child);
+            }
+            self.columns_box.remove(c);
+        }
+        let columns: Vec<gtk::Box> = (0..n)
+            .map(|_| {
+                let c = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(GAP)
+                    .hexpand(true)
+                    .valign(gtk::Align::Start)
+                    .build();
+                self.columns_box.append(&c);
+                c
+            })
+            .collect();
+        self.columns.replace(columns);
+        self.heights.replace(vec![0.0; n as usize]);
+        self.active_columns.set(n);
+        let l = self.layout.get();
+        let column = l.size.width() + if self.side_active.get() { SIDE_WIDTH } else { 0 };
+        self.clamp.set_maximum_size(n as i32 * column + (n as i32 - 1) * GAP + 24);
+        for (media, card) in self.cards.borrow().iter() {
+            self.place(media, card);
+        }
+    }
+
+    /// Switch to a new layout, redrawing the posts already shown.
+    fn apply_layout(&self, l: FeedLayout) {
+        if l == self.layout.get() {
+            return;
+        }
+        layout::set_feed(l);
+        self.layout.set(l);
+        let width = self.scroller.hadjustment().page_size() as i32 - 24;
+        if width > 0 {
+            self.fit(width, true);
+        } else {
+            self.side_active.set(l.side_comments);
+            self.rebuild_cards();
+            self.set_columns(1);
+        }
+    }
+
+    fn layout_popover(self: &Rc<Self>) -> gtk::Popover {
+        let current = self.layout.get();
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .margin_top(6)
+            .margin_bottom(6)
+            .margin_start(6)
+            .margin_end(6)
+            .build();
+        let heading = |text: &str| {
+            gtk::Label::builder().label(text).xalign(0.0).css_classes(["heading"]).build()
+        };
+        let toggles = |labels: &[&str], active: usize| -> (gtk::Box, Vec<gtk::ToggleButton>) {
+            let row = gtk::Box::builder().css_classes(["linked"]).homogeneous(true).build();
+            let mut buttons: Vec<gtk::ToggleButton> = Vec::new();
+            for (i, label) in labels.iter().enumerate() {
+                let b = gtk::ToggleButton::builder().label(*label).active(i == active).build();
+                if let Some(first) = buttons.first() {
+                    b.set_group(Some(first));
+                }
+                row.append(&b);
+                buttons.push(b);
+            }
+            (row, buttons)
+        };
+        content.append(&heading("Columns"));
+        let (columns_row, column_buttons) = toggles(&["1", "2", "3", "4"], current.columns.clamp(1, 4) as usize - 1);
+        content.append(&columns_row);
+        content.append(&heading("Post Size"));
+        let sizes: Vec<&str> = PostSize::ALL.iter().map(|s| s.label()).collect();
+        let size_index = PostSize::ALL.iter().position(|s| *s == current.size).unwrap_or(2);
+        let (size_row, size_buttons) = toggles(&sizes, size_index);
+        content.append(&size_row);
+        let side_row = gtk::Box::builder().spacing(12).margin_top(4).build();
+        side_row.append(&gtk::Label::builder().label("Comments beside posts").xalign(0.0).hexpand(true).build());
+        let side_switch = gtk::Switch::builder().active(current.side_comments).valign(gtk::Align::Center).build();
+        side_row.append(&side_switch);
+        content.append(&side_row);
+        content.append(
+            &gtk::Label::builder()
+                .label("Fewer columns are shown when the window is too narrow.")
+                .wrap(true)
+                .max_width_chars(28)
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label"])
+                .build(),
+        );
+
+        for (i, b) in column_buttons.iter().enumerate() {
+            let weak = Rc::downgrade(self);
+            b.connect_toggled(move |b| {
+                if b.is_active()
+                    && let Some(h) = weak.upgrade()
+                {
+                    h.apply_layout(FeedLayout { columns: i as u32 + 1, ..h.layout.get() });
+                }
+            });
+        }
+        for (i, b) in size_buttons.iter().enumerate() {
+            let weak = Rc::downgrade(self);
+            b.connect_toggled(move |b| {
+                if b.is_active()
+                    && let Some(h) = weak.upgrade()
+                {
+                    h.apply_layout(FeedLayout { size: PostSize::ALL[i], ..h.layout.get() });
+                }
+            });
+        }
+        let weak = Rc::downgrade(self);
+        side_switch.connect_active_notify(move |s| {
+            if let Some(h) = weak.upgrade() {
+                h.apply_layout(FeedLayout { side_comments: s.is_active(), ..h.layout.get() });
+            }
+        });
+        gtk::Popover::builder().child(&content).build()
     }
 
     fn set_footer(&self, widget: Option<&gtk::Widget>) {
@@ -273,7 +496,7 @@ impl HomePage {
                             repeated += 1;
                             continue;
                         }
-                        home.posts_box.append(&post::card(&main, &media));
+                        home.add_post(&main, media);
                         added += 1;
                     }
                     home.shown.set(home.shown.get() + added);

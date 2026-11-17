@@ -1,4 +1,4 @@
-//! Search results for the top bar: matching conversations and people.
+//! Search results for the top bar: conversations, people and posts.
 //! A short, fixed list of results — no explore page, no endless results.
 
 use std::cell::{Cell, RefCell};
@@ -7,10 +7,18 @@ use std::rc::{Rc, Weak};
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::api::{Thread, User};
+use crate::api::{self, Media, Thread, User};
 use crate::rt;
+use crate::ui::profile::thumbnail;
 use crate::ui::util;
 use crate::ui::window::Main;
+
+/// A conversation result: one already loaded, or someone to message.
+#[derive(Clone)]
+enum Chat {
+    Thread(Thread),
+    Contact(User),
+}
 
 pub struct SearchPage {
     main: Weak<Main>,
@@ -19,8 +27,12 @@ pub struct SearchPage {
     chats_list: gtk::ListBox,
     people_list: gtk::ListBox,
     people_status: gtk::Stack,
-    chats: RefCell<Vec<Thread>>,
+    posts_title: gtk::Label,
+    posts_grid: gtk::FlowBox,
+    posts_status: gtk::Stack,
+    chats: RefCell<Vec<Chat>>,
     people: RefCell<Vec<User>>,
+    posts: RefCell<Vec<Media>>,
     generation: Cell<u64>,
 }
 
@@ -31,6 +43,41 @@ fn section_title(text: &str) -> gtk::Label {
         .css_classes(["heading"])
         .margin_top(6)
         .build()
+}
+
+fn status_stack(results: &impl IsA<gtk::Widget>, empty: &str) -> gtk::Stack {
+    let stack = gtk::Stack::builder().vhomogeneous(false).build();
+    stack.add_named(results, Some("results"));
+    stack.add_named(&util::spinner_box(), Some("loading"));
+    stack.add_named(
+        &gtk::Label::builder()
+            .label(empty)
+            .css_classes(["dim-label"])
+            .margin_top(12)
+            .build(),
+        Some("empty"),
+    );
+    stack
+}
+
+fn person_row(main: &Main, u: &User) -> adw::ActionRow {
+    let mut subtitle = format!("@{}", u.username);
+    if main.is_followed(u) && u.pk != main.client.user_id() {
+        subtitle.push_str(" · Following");
+    }
+    let row = adw::ActionRow::builder()
+        .title(u.display_name())
+        .subtitle(subtitle)
+        .title_lines(1)
+        .use_markup(false)
+        .activatable(true)
+        .build();
+    row.add_prefix(&util::avatar(u, 36));
+    if u.is_verified {
+        row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
+    }
+    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    row
 }
 
 impl SearchPage {
@@ -56,18 +103,23 @@ impl SearchPage {
             .css_classes(["boxed-list"])
             .selection_mode(gtk::SelectionMode::None)
             .build();
-        let people_status = gtk::Stack::new();
-        people_status.add_named(&people_list, Some("results"));
-        people_status.add_named(&util::spinner_box(), Some("loading"));
-        let empty = gtk::Label::builder()
-            .label("No people found")
-            .css_classes(["dim-label"])
-            .margin_top(12)
-            .build();
-        people_status.add_named(&empty, Some("empty"));
+        let people_status = status_stack(&people_list, "No people found");
         content.append(&people_status);
 
-        let clamp = adw::Clamp::builder().maximum_size(620).child(&content).build();
+        let posts_title = section_title("Posts");
+        let posts_grid = gtk::FlowBox::builder()
+            .min_children_per_line(3)
+            .max_children_per_line(4)
+            .homogeneous(true)
+            .column_spacing(4)
+            .row_spacing(4)
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        let posts_status = status_stack(&posts_grid, "No posts found");
+        content.append(&posts_title);
+        content.append(&posts_status);
+
+        let clamp = adw::Clamp::builder().maximum_size(720).child(&content).build();
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .child(&clamp)
@@ -85,8 +137,12 @@ impl SearchPage {
             chats_list,
             people_list,
             people_status,
+            posts_title,
+            posts_grid,
+            posts_status,
             chats: RefCell::new(Vec::new()),
             people: RefCell::new(Vec::new()),
+            posts: RefCell::new(Vec::new()),
             generation: Cell::new(0),
         });
 
@@ -96,9 +152,12 @@ impl SearchPage {
             weak,
             move |_, row| {
                 let Some(s) = weak.upgrade() else { return };
-                let thread = s.chats.borrow().get(row.index() as usize).cloned();
-                if let (Some(thread), Some(main)) = (thread, s.main.upgrade()) {
-                    main.open_thread(thread, false);
+                let chat = s.chats.borrow().get(row.index() as usize).cloned();
+                let Some(main) = s.main.upgrade() else { return };
+                match chat {
+                    Some(Chat::Thread(thread)) => main.open_thread(thread, false),
+                    Some(Chat::Contact(user)) => main.open_chat_with_user(user),
+                    None => {}
                 }
             }
         ));
@@ -113,6 +172,13 @@ impl SearchPage {
                 }
             }
         ));
+        search.posts_grid.connect_child_activated(move |_, child| {
+            let Some(s) = weak.upgrade() else { return };
+            let media = s.posts.borrow().get(child.index() as usize).cloned();
+            if let (Some(media), Some(main)) = (media, s.main.upgrade()) {
+                main.open_post(media);
+            }
+        });
         search
     }
 
@@ -124,7 +190,40 @@ impl SearchPage {
             .or_else(|| self.people_list.row_at_index(0));
         if let Some(row) = first {
             row.emit_activate();
+        } else if let Some(child) = self.posts_grid.child_at_index(0) {
+            child.emit_activate();
         }
+    }
+
+    fn render_chats(&self) {
+        self.chats_list.remove_all();
+        let chats = self.chats.borrow();
+        for chat in chats.iter() {
+            let row = adw::ActionRow::builder().title_lines(1).use_markup(false).activatable(true).build();
+            match chat {
+                Chat::Thread(t) => {
+                    row.set_title(&t.title());
+                    if t.is_group_chat() {
+                        row.set_subtitle(&format!("Group · {} members", t.users.len() + 1));
+                        let a = adw::Avatar::new(36, Some(&t.title()), false);
+                        a.set_icon_name(Some("system-users-symbolic"));
+                        row.add_prefix(&a);
+                    } else if let Some(u) = t.users.first() {
+                        row.set_subtitle(&format!("@{}", u.username));
+                        row.add_prefix(&util::avatar(u, 36));
+                    }
+                }
+                Chat::Contact(u) => {
+                    row.set_title(&u.display_name());
+                    row.set_subtitle(&format!("@{} · Message", u.username));
+                    row.add_prefix(&util::avatar(u, 36));
+                }
+            }
+            row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+            self.chats_list.append(&row);
+        }
+        self.chats_title.set_visible(!chats.is_empty());
+        self.chats_list.set_visible(!chats.is_empty());
     }
 
     pub fn set_query(self: &Rc<Self>, query: &str) {
@@ -132,9 +231,8 @@ impl SearchPage {
         let Some(main) = self.main.upgrade() else { return };
         let q = query.trim().to_lowercase();
 
-        // Conversations: filter what's already loaded in the sidebar.
-        self.chats_list.remove_all();
-        let matches: Vec<Thread> = if q.is_empty() {
+        // Conversations: what's already loaded in the sidebar first.
+        let matches: Vec<Chat> = if q.is_empty() {
             Vec::new()
         } else {
             main.sidebar
@@ -149,80 +247,129 @@ impl SearchPage {
                         })
                 })
                 .take(6)
+                .map(Chat::Thread)
                 .collect()
         };
-        for t in &matches {
-            let row = adw::ActionRow::builder()
-                .title(t.title())
-                .title_lines(1)
-                .use_markup(false)
-                .activatable(true)
-                .build();
-            if t.is_group_chat() {
-                row.set_subtitle(&format!("Group · {} members", t.users.len() + 1));
-                let a = adw::Avatar::new(36, Some(&t.title()), false);
-                a.set_icon_name(Some("system-users-symbolic"));
-                row.add_prefix(&a);
-            } else if let Some(u) = t.users.first() {
-                row.set_subtitle(&format!("@{}", u.username));
-                row.add_prefix(&util::avatar(u, 36));
-            }
-            row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-            self.chats_list.append(&row);
-        }
-        self.chats_title.set_visible(!matches.is_empty());
-        self.chats_list.set_visible(!matches.is_empty());
         self.chats.replace(matches);
+        self.render_chats();
 
-        // People: ask Instagram.
         self.people_list.remove_all();
         self.people.borrow_mut().clear();
+        self.posts_grid.remove_all();
+        self.posts.borrow_mut().clear();
+        self.posts_title.set_visible(!q.is_empty());
+        self.posts_status.set_visible(!q.is_empty());
         if q.is_empty() {
             return;
         }
         self.people_status.set_visible_child_name("loading");
+        self.posts_status.set_visible_child_name("loading");
         let generation = self.generation.get();
-        let client = main.client.clone();
         let query = query.trim().to_string();
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            let res = rt::bg(async move { client.search_users(&query).await }).await;
-            let Some(s) = weak.upgrade() else { return };
-            if s.generation.get() != generation {
-                return;
-            }
-            let Some(main) = s.main.upgrade() else { return };
-            match res {
-                Ok(users) => {
-                    let users: Vec<User> = users.into_iter().take(20).collect();
-                    for u in &users {
-                        let mut subtitle = format!("@{}", u.username);
-                        if main.is_followed(u) && u.pk != main.client.user_id() {
-                            subtitle.push_str(" · Following");
+        let username_like = !query.contains(' ') && !query.starts_with('#');
+
+        // People.
+        {
+            let client = main.client.clone();
+            let query = query.clone();
+            let weak = Rc::downgrade(self);
+            glib::spawn_future_local(async move {
+                let res = rt::bg(async move { client.search_people(&query).await }).await;
+                let Some(s) = weak.upgrade() else { return };
+                if s.generation.get() != generation {
+                    return;
+                }
+                let Some(main) = s.main.upgrade() else { return };
+                match res {
+                    Ok(users) => {
+                        let users: Vec<User> = users.into_iter().take(20).collect();
+                        for u in &users {
+                            s.people_list.append(&person_row(&main, u));
                         }
-                        let row = adw::ActionRow::builder()
-                            .title(u.display_name())
-                            .subtitle(subtitle)
-                            .title_lines(1)
-                            .use_markup(false)
-                            .activatable(true)
-                            .build();
-                        row.add_prefix(&util::avatar(u, 36));
-                        if u.is_verified {
-                            row.add_suffix(&gtk::Image::from_icon_name("object-select-symbolic"));
-                        }
-                        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-                        s.people_list.append(&row);
+                        s.people_status
+                            .set_visible_child_name(if users.is_empty() { "empty" } else { "results" });
+                        s.people.replace(users);
                     }
-                    s.people_status
-                        .set_visible_child_name(if users.is_empty() { "empty" } else { "results" });
-                    s.people.replace(users);
+                    Err(e) => {
+                        s.people_status.set_visible_child_name("empty");
+                        if api::is_login_required(&e) {
+                            main.handle_error(&e);
+                        } else {
+                            eprintln!("finsta: people search failed: {e}");
+                        }
+                    }
                 }
-                Err(e) => {
-                    s.people_status.set_visible_child_name("empty");
-                    main.handle_error(&e);
+            });
+        }
+
+        // Conversations not loaded yet: people you can message.
+        if username_like {
+            let client = main.client.clone();
+            let query = query.clone();
+            let weak = Rc::downgrade(self);
+            glib::spawn_future_local(async move {
+                let res = rt::bg(async move { client.search_contacts(&query).await }).await;
+                let Some(s) = weak.upgrade() else { return };
+                if s.generation.get() != generation {
+                    return;
                 }
-            }
-        });
+                match res {
+                    Ok(users) => {
+                        let mut chats = s.chats.borrow_mut();
+                        for u in users {
+                            let known = chats.iter().any(|c| match c {
+                                Chat::Thread(t) => !t.is_group_chat() && t.users.iter().any(|x| x.pk == u.pk),
+                                Chat::Contact(x) => x.pk == u.pk,
+                            });
+                            if !known && chats.len() < 10 {
+                                chats.push(Chat::Contact(u));
+                            }
+                        }
+                        drop(chats);
+                        s.render_chats();
+                    }
+                    Err(e) => eprintln!("finsta: conversation search failed: {e}"),
+                }
+            });
+        }
+
+        // Posts (words or #hashtags), or the post a pasted link points to.
+        {
+            let client = main.client.clone();
+            let weak = Rc::downgrade(self);
+            glib::spawn_future_local(async move {
+                let res = rt::bg(async move {
+                    match api::web::link_code(&query) {
+                        Some(code) => client.media_by_code(&code).await.map(|m| vec![m]),
+                        None => client.search_posts(&query).await,
+                    }
+                })
+                .await;
+                let Some(s) = weak.upgrade() else { return };
+                if s.generation.get() != generation {
+                    return;
+                }
+                match res {
+                    Ok(posts) => {
+                        for m in &posts {
+                            s.posts_grid.append(&thumbnail(m));
+                        }
+                        s.posts_status
+                            .set_visible_child_name(if posts.is_empty() { "empty" } else { "results" });
+                        s.posts.replace(posts);
+                    }
+                    Err(e) => {
+                        s.posts_status.set_visible_child_name("empty");
+                        if api::is_login_required(&e)
+                            && let Some(main) = s.main.upgrade()
+                        {
+                            main.handle_error(&e);
+                        } else {
+                            eprintln!("finsta: post search failed: {e}");
+                        }
+                    }
+                }
+            });
+        }
     }
 }

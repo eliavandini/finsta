@@ -127,3 +127,70 @@ pub fn attach<T: 'static>(obj: &impl IsA<glib::Object>, state: Rc<T>) {
         obj.as_ref().set_data::<Rc<T>>("finsta-state", state);
     }
 }
+
+/// How much of `widget` (0 to 1) is on screen, inside its scrolled views.
+pub fn visible_fraction(widget: &impl IsA<gtk::Widget>) -> f32 {
+    let p = widget.as_ref();
+    if !p.is_mapped() || p.height() <= 0 {
+        return 0.0;
+    }
+    let Some(root) = p.root() else { return 0.0 };
+    let root = root.upcast_ref::<gtk::Widget>();
+    if root.downcast_ref::<gtk::Window>().is_some_and(|w| w.is_suspended() || !w.is_visible()) {
+        return 0.0;
+    }
+    let Some(b) = p.compute_bounds(root) else { return 0.0 };
+    let (mut top, mut bottom) = (0.0f32, root.height() as f32);
+    let mut ancestor = p.parent();
+    while let Some(w) = ancestor {
+        if w.is::<gtk::ScrolledWindow>()
+            && let Some(sb) = w.compute_bounds(root)
+        {
+            top = top.max(sb.y());
+            bottom = bottom.min(sb.y() + sb.height());
+        }
+        ancestor = w.parent();
+    }
+    let visible = (b.y() + b.height()).min(bottom) - b.y().max(top);
+    (visible / b.height()).clamp(0.0, 1.0)
+}
+
+type Waiting = (glib::WeakRef<gtk::Widget>, Box<dyn FnOnce()>);
+
+thread_local! {
+    static WAITING: std::cell::RefCell<Vec<Waiting>> = const { std::cell::RefCell::new(Vec::new()) };
+    static WATCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` once, the first time `widget` scrolls into view (for loading
+/// things only when they're looked at).
+pub fn when_visible(widget: &impl IsA<gtk::Widget>, f: impl FnOnce() + 'static) {
+    WAITING.with(|w| w.borrow_mut().push((widget.as_ref().downgrade(), Box::new(f))));
+    if WATCHING.replace(true) {
+        return;
+    }
+    glib::timeout_add_local(std::time::Duration::from_millis(400), || {
+        let ready: Vec<Box<dyn FnOnce()>> = WAITING.with(|w| {
+            let mut w = w.borrow_mut();
+            w.retain(|(widget, _)| widget.upgrade().is_some());
+            let mut ready = Vec::new();
+            let mut i = 0;
+            while i < w.len() {
+                if w[i].0.upgrade().is_some_and(|x| visible_fraction(&x) > 0.15) {
+                    ready.push(w.remove(i).1);
+                } else {
+                    i += 1;
+                }
+            }
+            ready
+        });
+        for f in ready {
+            f();
+        }
+        let more = WAITING.with(|w| !w.borrow().is_empty());
+        if !more {
+            WATCHING.set(false);
+        }
+        glib::ControlFlow::from(more)
+    });
+}

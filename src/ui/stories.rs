@@ -7,11 +7,11 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{gdk, glib};
 
-use crate::api::{Media, Reel};
+use crate::api::{Media, Reel, StoryReply, User};
 use crate::rt;
 use crate::ui::video::{self, Opts, Player};
 use crate::ui::window::Main;
-use crate::ui::{images, util};
+use crate::ui::{download, images, post, util};
 
 const PHOTO_SECONDS: f64 = 6.0;
 const TICK_MS: u64 = 50;
@@ -46,6 +46,11 @@ struct Viewer {
     pause_button: gtk::Button,
     mute_button: gtk::Button,
     bottom: gtk::Box,
+    /// Music, "Reshared from", mentions (under the name).
+    details: gtk::Box,
+    /// Buttons for a shared post or a link (above the reply field).
+    extras: gtk::Box,
+    download_button: gtk::Button,
     reply: gtk::Entry,
     like_button: gtk::Button,
     notice: gtk::Label,
@@ -113,15 +118,29 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
         .tooltip_text("Close")
         .css_classes(["flat", "circular"])
         .build();
+    let download_button = gtk::Button::builder()
+        .icon_name("folder-download-symbolic")
+        .tooltip_text("Download")
+        .css_classes(["flat", "circular"])
+        .build();
     info.append(&avatar_slot);
     info.append(&name);
     info.append(&time);
     info.append(&gtk::Box::builder().hexpand(true).build());
+    info.append(&download_button);
     info.append(&mute_button);
     info.append(&pause_button);
     info.append(&close);
+    let details = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .margin_start(40)
+        .css_classes(["story-details"])
+        .visible(false)
+        .build();
     top.append(&progress);
     top.append(&info);
+    top.append(&details);
 
     let prev = gtk::Button::builder()
         .icon_name("go-previous-symbolic")
@@ -156,8 +175,15 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
         .css_classes(["osd", "media-counter"])
         .halign(gtk::Align::Center)
         .valign(gtk::Align::End)
-        .margin_bottom(72)
+        .margin_bottom(128)
         .wrap(true)
+        .visible(false)
+        .build();
+    let extras = gtk::Box::builder()
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::End)
+        .margin_bottom(72)
         .visible(false)
         .build();
 
@@ -166,6 +192,7 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     overlay.add_overlay(&prev);
     overlay.add_overlay(&next);
     overlay.add_overlay(&bottom);
+    overlay.add_overlay(&extras);
     overlay.add_overlay(&notice);
 
     let dialog = adw::Dialog::builder()
@@ -196,6 +223,9 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
         pause_button,
         mute_button,
         bottom,
+        details,
+        extras,
+        download_button,
         reply,
         like_button,
         notice,
@@ -234,6 +264,8 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     viewer.mute_button.connect_clicked(move |_| f());
     let f = with(|v| v.toggle_like());
     viewer.like_button.connect_clicked(move |_| f());
+    let f = with(|v| v.download());
+    viewer.download_button.connect_clicked(move |_| f());
     let f = with(|v| v.send_reply());
     viewer.reply.connect_activate(move |_| f());
 
@@ -251,7 +283,10 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     focus.connect_leave(move |_| f());
     viewer.reply.add_controller(focus);
 
-    let keys = gtk::EventControllerKey::new();
+    // Before the focused button sees the key (Space would press it).
+    let keys = gtk::EventControllerKey::builder()
+        .propagation_phase(gtk::PropagationPhase::Capture)
+        .build();
     let weak = Rc::downgrade(&viewer);
     keys.connect_key_pressed(move |_, key, _, _| {
         let Some(v) = weak.upgrade() else { return glib::Propagation::Proceed };
@@ -350,6 +385,10 @@ impl Viewer {
             return;
         };
         util::clear_box(&self.avatar_slot);
+        util::clear_box(&self.details);
+        util::clear_box(&self.extras);
+        self.details.set_visible(false);
+        self.extras.set_visible(false);
         self.avatar_slot.append(&util::avatar(&reel.user, 32));
         self.name.set_label(&reel.user.username);
         self.bottom.set_visible(reel.user.pk != self.me);
@@ -406,6 +445,7 @@ impl Viewer {
         let item = &reel.items[item_index];
         self.time.set_label(&util::relative_time(item.taken_at));
         show_liked(&self.like_button, item.has_liked);
+        self.render_details(item);
         self.mark_seen(reel_index, item_index);
 
         let video = item.video_url().filter(|_| item.is_video());
@@ -533,13 +573,16 @@ impl Viewer {
         let client = main.client.clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let res = rt::bg(async move { client.story_reply(&reel.user.pk, &item.id, &text).await }).await;
+            let res = rt::bg(async move { client.story_reply(&reel.user, &item.id, &text).await }).await;
             let Some(v) = weak.upgrade() else { return };
             v.reply.set_sensitive(true);
             match res {
-                Ok(()) => {
+                Ok(how) => {
                     v.reply.set_text("");
-                    v.show_notice("Reply sent");
+                    v.show_notice(match how {
+                        StoryReply::Reply => "Reply sent",
+                        StoryReply::Message => "Sent as a message with a link to the story",
+                    });
                     // Leave the reply box and play on.
                     v.done_typing();
                     v.pause_button.grab_focus();
@@ -552,6 +595,107 @@ impl Viewer {
                     {
                         main.handle_error(&e);
                     }
+                }
+            }
+        });
+    }
+
+    /// Music, who the story was reshared from, mentions, and buttons for a
+    /// shared post or a link.
+    fn render_details(self: &Rc<Self>, item: &Media) {
+        util::clear_box(&self.details);
+        util::clear_box(&self.extras);
+        if let Some(music) = item.music() {
+            self.details.append(&post::music_label(&music));
+        }
+        let open_profile = |label: String, user: User| {
+            let b = gtk::Button::builder()
+                .label(label)
+                .css_classes(["flat", "story-link"])
+                .halign(gtk::Align::Start)
+                .build();
+            let weak = Rc::downgrade(self);
+            b.connect_clicked(move |_| {
+                if let Some(v) = weak.upgrade()
+                    && let Some(main) = v.main.upgrade()
+                {
+                    v.close();
+                    main.open_profile(user.clone());
+                }
+            });
+            b
+        };
+        if let Some(author) = item.reshared_from() {
+            self.details.append(&open_profile(format!("Reshared from @{}", author.username), author));
+        }
+        let mentions = item.mentions();
+        if !mentions.is_empty() {
+            let row = gtk::Box::builder().spacing(2).build();
+            row.append(&gtk::Label::builder().label("Mentions").margin_start(6).css_classes(["caption"]).build());
+            for name in mentions.into_iter().take(4) {
+                let user = User { username: name.clone(), ..Default::default() };
+                row.append(&open_profile(format!("@{name}"), user));
+            }
+            self.details.append(&row);
+        }
+        if let Some(code) = item.shared_post_code() {
+            let (label, path) = if item.shared_post_is_reel() { ("View Reel", "reel") } else { ("View Post", "p") };
+            let url = format!("https://www.instagram.com/{path}/{code}/");
+            let b = gtk::Button::builder().label(label).css_classes(["pill", "osd"]).build();
+            let weak = Rc::downgrade(self);
+            b.connect_clicked(move |_| {
+                if let Some(v) = weak.upgrade()
+                    && let Some(main) = v.main.upgrade()
+                {
+                    v.close();
+                    main.open_link(&url);
+                }
+            });
+            self.extras.append(&b);
+        }
+        if let Some(link) = item.story_link() {
+            let host = link
+                .split("://")
+                .nth(1)
+                .and_then(|r| r.split('/').next())
+                .unwrap_or("link")
+                .trim_start_matches("www.")
+                .to_string();
+            let b = gtk::Button::builder()
+                .label(format!("Open {host}"))
+                .tooltip_text(&link)
+                .css_classes(["pill", "osd"])
+                .build();
+            let weak = Rc::downgrade(self);
+            b.connect_clicked(move |b| {
+                if let Some(v) = weak.upgrade()
+                    && !v.paused.get()
+                {
+                    v.toggle_pause();
+                }
+                util::open_uri(b, &link);
+            });
+            self.extras.append(&b);
+        }
+        self.details.set_visible(self.details.first_child().is_some());
+        self.extras.set_visible(self.extras.first_child().is_some());
+    }
+
+    fn download(self: &Rc<Self>) {
+        let Some((reel, item)) = self.current() else { return };
+        let Some(main) = self.main.upgrade() else { return };
+        self.download_button.set_sensitive(false);
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let res = download::fetch(&main, &item, &reel.user.username).await;
+            let Some(v) = weak.upgrade() else { return };
+            v.download_button.set_sensitive(true);
+            match res {
+                Ok(saved) if saved.len() == 1 => v.show_notice("Saved to Downloads/Finsta"),
+                Ok(saved) => v.show_notice(&format!("Saved {} files to Downloads/Finsta", saved.len())),
+                Err(e) => {
+                    eprintln!("finsta: story download failed: {e}");
+                    v.show_notice("Couldn't download this story");
                 }
             }
         });

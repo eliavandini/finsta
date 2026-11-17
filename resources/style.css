@@ -52,6 +52,34 @@
   padding-bottom: 6px;
 }
 
+.post.side-post {
+  padding-bottom: 0;
+}
+
+/* The dark area around a photo or video beside its comments. */
+.post-media-pane {
+  background-color: black;
+}
+
+.post-side {
+  background-color: @view_bg_color;
+}
+
+.post .composer.side-composer,
+.post-side .composer {
+  padding: 6px 8px 8px 8px;
+}
+
+.music {
+  opacity: 0.85;
+}
+
+.reaction-choice {
+  font-size: 1.4em;
+  padding: 2px 6px;
+  min-width: 0;
+}
+
 .post-media {
   background-color: black;
 }
@@ -236,4 +264,16 @@ button.disappearing.openable image {
   color: white;
   margin: 6px;
   -gtk-icon-shadow: 0 1px 2px alpha(black, 0.6);
+}
+
+.story-viewer .story-details {
+  color: white;
+}
+
+.story-viewer .story-link {
+  color: white;
+  padding: 0 6px;
+  min-height: 0;
+  font-size: smaller;
+  font-weight: bold;
 }

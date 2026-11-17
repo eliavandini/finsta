@@ -25,7 +25,7 @@ mod slide;
 use super::lightspeed::{self, AttachmentKind, LsAttachment, LsContact, LsMessage, LsThread, Tables};
 use super::mqtt::Conn;
 use super::{
-    Client, InboxPage, LoginRequired, RateLimited, Recipient, Thread, VERIFY, WEB_API, cooldown_remaining, parse,
+    Client, InboxPage, User, LoginRequired, RateLimited, Recipient, Thread, VERIFY, WEB_API, cooldown_remaining, parse,
     start_cooldown,
 };
 
@@ -671,7 +671,16 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 7;
+const META_SCANNER: u64 = 8;
+
+/// How a story reply was delivered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoryReply {
+    /// As a reply to the story.
+    Reply,
+    /// As a message with a link to the story (when replies didn't work).
+    Message,
+}
 
 /// Website code that calls the operations Finsta uses: saved (to
 /// webcode/callers/) to work out the inputs the website passes them.
@@ -692,6 +701,14 @@ const CALLER_NEEDLES: &[&str] = &[
     "IGDThreadListOffMsysPaginationQuery",
     "PolarisDirectIrisSubscription",
     "IGDSlideDeltaProcessorQuery",
+    // How the website builds story replies and reactions.
+    "story_share_reply",
+    "IGDirectReactionSendMutation",
+    "xig_direct_reaction_send",
+    // Search, saved posts and single posts.
+    "PolarisSearchBoxRefetchableQuery",
+    "PolarisPostRootQuery",
+    "IGDOmniPickerSearchResultsListQuery",
 ];
 
 /// Places in the website's own code worth quoting in the log while working
@@ -824,7 +841,7 @@ fn interesting_op(name: &str) -> bool {
     [
         "IGD", "useIGD", "IGDirect", "PolarisDirect", "PolarisProfile", "PolarisStor", "PolarisFeed", "PolarisPost",
         "PolarisUser", "PolarisMedia", "PolarisTimeline", "usePolarisLikeMedia", "usePolarisStor", "usePolarisReel",
-        "PolarisAPI", "PolarisReel",
+        "PolarisAPI", "PolarisReel", "PolarisSearch", "usePolarisSave", "PolarisSaved", "usePolarisComment",
     ]
     .iter()
     .any(|p| name.starts_with(p))
@@ -1872,16 +1889,62 @@ impl Client {
         self.dm_tasks(&mut st, "mark read", vec![task("21", read, key.to_string())]).await
     }
 
-    /// Reply to someone's story; the reply arrives in your conversation with them.
-    pub async fn story_reply(&self, owner_pk: &str, media_id: &str, text: &str) -> Result<()> {
+    /// React to a message with an emoji (None removes your reaction).
+    pub async fn react(&self, thread_id: &str, item_id: &str, emoji: Option<&str>) -> Result<()> {
         let mut st = self.inner.dm.lock().await;
         if st.config.is_none() {
             self.dm_load_page(&mut st).await?;
         }
         if !Self::slide_mode(&st) {
-            bail!("Replying to stories isn't available for this account in Finsta yet.");
+            bail!("Reactions aren't available for this account in Finsta yet.");
         }
-        self.slide_story_reply(&mut st, owner_pk, media_id, text).await
+        self.slide_react(&mut st, thread_id, item_id, emoji).await
+    }
+
+    /// Reply to someone's story; the reply arrives in your conversation with them.
+    ///
+    /// Tries Instagram's story reply, then the older reply route; if neither
+    /// works, sends the reply as a message with a link to the story.
+    pub async fn story_reply(&self, owner: &User, media_id: &str, text: &str) -> Result<StoryReply> {
+        let native = {
+            let mut st = self.inner.dm.lock().await;
+            if st.config.is_none() {
+                self.dm_load_page(&mut st).await?;
+            }
+            if Self::slide_mode(&st) {
+                self.slide_story_reply(&mut st, &owner.pk, media_id, text).await
+            } else {
+                Err(anyhow!("not available"))
+            }
+        };
+        match native {
+            Ok(()) => return Ok(StoryReply::Reply),
+            Err(e) if super::is_login_required(&e) => return Err(e),
+            Err(e) => eprintln!("finsta: story reply: native route failed ({e})"),
+        }
+        let pk = super::media_pk(media_id).to_string();
+        let form = [
+            ("media_id", format!("{pk}_{}", owner.pk)),
+            ("reel_id", owner.pk.clone()),
+            ("text", text.to_string()),
+            ("entry", "reel".to_string()),
+            ("action", "send_item".to_string()),
+            ("recipient_users", format!("[[{}]]", owner.pk)),
+            ("client_context", uuid::Uuid::new_v4().to_string()),
+        ];
+        match self.post("direct_v2/threads/broadcast/reel_share/", &form).await {
+            Ok(v) if v["status"] == "ok" => {
+                eprintln!("finsta: story reply: older route worked");
+                return Ok(StoryReply::Reply);
+            }
+            Ok(_) => eprintln!("finsta: story reply: older route didn't confirm"),
+            Err(e) if super::is_login_required(&e) => return Err(e),
+            Err(e) => eprintln!("finsta: story reply: older route failed ({e})"),
+        }
+        let link = format!("https://www.instagram.com/stories/{}/{pk}/", owner.username);
+        self.send_text(&Recipient::User(owner.pk.clone()), &format!("{text}\n{link}")).await?;
+        eprintln!("finsta: story reply: sent as a message with a link");
+        Ok(StoryReply::Message)
     }
 
     /// Opening disappearing photos goes through a part of the chat protocol

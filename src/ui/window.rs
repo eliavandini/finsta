@@ -107,7 +107,7 @@ impl Main {
         header.pack_start(&back_button);
 
         let search_entry = gtk::SearchEntry::builder()
-            .placeholder_text("Search people and conversations")
+            .placeholder_text("Search conversations, people and posts")
             .search_delay(350)
             .hexpand(true)
             .build();
@@ -420,6 +420,13 @@ impl Main {
         self.after_sidebar_choice();
     }
 
+    pub fn open_saved(self: &Rc<Self>) {
+        let page = crate::ui::saved::page(self);
+        self.clear_search();
+        self.nav.replace(&[page]);
+        self.after_sidebar_choice();
+    }
+
     pub fn open_post(self: &Rc<Self>, media: Media) {
         let tag = format!("post:{}", media.id);
         if self.in_stack(&tag) {
@@ -429,6 +436,31 @@ impl Main {
         let page = post::page(self, &media);
         page.set_tag(Some(&tag));
         self.nav.push(&page);
+    }
+
+    /// Open an instagram.com link to a post or reel as a post page; anything
+    /// else (or a post that can't be loaded) opens in the browser.
+    pub fn open_link(self: &Rc<Self>, url: &str) {
+        let Some(code) = api::web::link_code(url) else {
+            crate::ui::util::open_uri(&self.window, url);
+            return;
+        };
+        let weak = Rc::downgrade(self);
+        let client = self.client.clone();
+        let url = url.to_string();
+        glib::spawn_future_local(async move {
+            let res = rt::bg(async move { client.media_by_code(&code).await }).await;
+            let Some(main) = weak.upgrade() else { return };
+            match res {
+                Ok(media) => main.open_post(media),
+                Err(e) if api::is_login_required(&e) => main.handle_error(&e),
+                Err(e) => {
+                    eprintln!("finsta: couldn't load a linked post: {e}");
+                    main.toast("Couldn't load this post here, so it opens in your browser");
+                    crate::ui::util::open_uri(&main.window, &url);
+                }
+            }
+        });
     }
 
     pub fn open_stories(self: &Rc<Self>, reels: Vec<Reel>, start: usize) {

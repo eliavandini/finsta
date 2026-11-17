@@ -197,6 +197,23 @@ pub struct Media {
     /// Sent back with likes, as the website does.
     #[serde(default, deserialize_with = "de_opt_string")]
     pub organic_tracking_token: Option<String>,
+    /// Reels: the song or sound they use.
+    #[serde(default)]
+    pub clips_metadata: Option<Value>,
+    #[serde(default)]
+    pub music_metadata: Option<Value>,
+    /// Stories: stickers for a song, a shared post, a link and mentions.
+    #[serde(default)]
+    pub story_music_stickers: Option<Value>,
+    #[serde(default)]
+    pub story_feed_media: Option<Value>,
+    #[serde(default)]
+    pub story_link_stickers: Option<Value>,
+    #[serde(default)]
+    pub story_bloks_stickers: Option<Value>,
+    /// Stories that reshare someone else's story.
+    #[serde(default)]
+    pub reshared_story_media_author: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -205,7 +222,97 @@ pub struct Location {
     pub name: String,
 }
 
+fn music_text(info: &Value) -> Option<String> {
+    let title = info["title"].as_str().unwrap_or("").trim();
+    let artist = info["display_artist"].as_str().unwrap_or("").trim();
+    match (title.is_empty(), artist.is_empty()) {
+        (false, false) => Some(format!("{title} · {artist}")),
+        (false, true) => Some(title.to_string()),
+        (true, false) => Some(artist.to_string()),
+        (true, true) => None,
+    }
+}
+
 impl Media {
+    /// The song or sound a reel or story uses, as "Title · Artist".
+    pub fn music(&self) -> Option<String> {
+        let null = Value::Null;
+        let sticker = self.story_music_stickers.as_ref().and_then(|v| v.get(0)).unwrap_or(&null);
+        if let Some(m) = music_text(&sticker["music_asset_info"]) {
+            return Some(m);
+        }
+        for meta in [&self.clips_metadata, &self.music_metadata].into_iter().flatten() {
+            if let Some(m) = music_text(&meta["music_info"]["music_asset_info"]) {
+                return Some(m);
+            }
+            let sound = &meta["original_sound_info"];
+            let title = sound["original_audio_title"].as_str().unwrap_or("").trim();
+            let artist = sound["ig_artist"]["username"].as_str().unwrap_or("").trim();
+            if !title.is_empty() || !artist.is_empty() {
+                let title = if title.is_empty() { "Original audio" } else { title };
+                return Some(if artist.is_empty() { title.to_string() } else { format!("{title} · {artist}") });
+            }
+        }
+        None
+    }
+
+    /// The code of the post or reel a story shares.
+    pub fn shared_post_code(&self) -> Option<String> {
+        self.story_feed_media
+            .as_ref()?
+            .as_array()?
+            .iter()
+            .filter_map(|m| m["media_code"].as_str())
+            .find(|c| !c.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Whether the shared post is a reel.
+    pub fn shared_post_is_reel(&self) -> bool {
+        self.story_feed_media
+            .as_ref()
+            .and_then(|v| v.get(0))
+            .and_then(|m| m["product_type"].as_str())
+            .is_some_and(|t| t == "clips")
+    }
+
+    /// Who posted the story this one reshares.
+    pub fn reshared_from(&self) -> Option<User> {
+        let v = self.reshared_story_media_author.as_ref()?;
+        let user = User {
+            pk: v["id"].as_str().or(v["pk"].as_str()).unwrap_or("").to_string(),
+            username: v["username"].as_str().unwrap_or("").to_string(),
+            profile_pic_url: v["profile_pic_url"].as_str().unwrap_or("").to_string(),
+            ..Default::default()
+        };
+        (!user.username.is_empty()).then_some(user)
+    }
+
+    /// The address a story's link sticker points to.
+    pub fn story_link(&self) -> Option<String> {
+        self.story_link_stickers
+            .as_ref()?
+            .as_array()?
+            .iter()
+            .filter_map(|l| l["story_link"]["url"].as_str())
+            .find(|u| u.starts_with("http"))
+            .map(str::to_string)
+    }
+
+    /// Accounts mentioned in a story.
+    pub fn mentions(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for st in self.story_bloks_stickers.as_ref().and_then(Value::as_array).into_iter().flatten() {
+            if let Some(u) = st["bloks_sticker"]["sticker_data"]["ig_mention"]["username"].as_str()
+                && !u.is_empty()
+                && !out.iter().any(|o| o == u)
+            {
+                out.push(u.to_string());
+            }
+        }
+        out
+    }
+
     pub fn is_video(&self) -> bool {
         self.media_type == 2
     }
@@ -451,6 +558,8 @@ pub enum DmContent {
         subtitle: String,
         preview: Option<String>,
         url: Option<String>,
+        /// Height / width of the preview.
+        aspect: f64,
     },
     Voice {
         url: Option<String>,
@@ -497,6 +606,30 @@ impl DmItem {
             t if t > 100_000_000_000 => t / 1_000,
             t => t,
         }
+    }
+
+    /// The emoji `user` reacted with, if any.
+    pub fn reaction_by(&self, user: &str) -> Option<String> {
+        self.get("reactions")["emojis"]
+            .as_array()?
+            .iter()
+            .find(|e| e["sender_id"].as_str() == Some(user))
+            .and_then(|e| e["emoji"].as_str().map(str::to_string))
+    }
+
+    /// Set (or with None, remove) `user`'s reaction, as shown here.
+    pub fn set_reaction(&mut self, user: &str, emoji: Option<&str>) {
+        let mut list: Vec<Value> = self.get("reactions")["emojis"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e["sender_id"].as_str() != Some(user))
+            .collect();
+        if let Some(emoji) = emoji {
+            list.push(serde_json::json!({"emoji": emoji, "sender_id": user}));
+        }
+        self.extra.insert("reactions".into(), serde_json::json!({"emojis": list}));
     }
 
     pub fn reactions(&self) -> Vec<String> {
@@ -623,9 +756,28 @@ impl DmItem {
                             subtitle: truncate(&m.caption_text(), 120),
                             preview: m.image_url(320),
                             url: m.web_url().or_else(|| Some(format!("https://www.instagram.com/reel/{}/", m.code))),
+                            aspect: 16.0 / 9.0,
                         }
                     }
                     None => DmContent::Info("Shared reel unavailable".into()),
+                }
+            }
+            "xma_share" => {
+                let x = self.get("xma_share");
+                let kind = str_at(x, &["kind"]);
+                let author = str_at(x, &["author"]);
+                let what = match kind.as_str() {
+                    "post" => "Post",
+                    "reel" => "Reel",
+                    "story" => "Story",
+                    _ => "Shared",
+                };
+                DmContent::Shared {
+                    title: if author.is_empty() { what.to_string() } else { format!("{what} by {author}") },
+                    subtitle: truncate(&str_at(x, &["caption"]), 160),
+                    preview: non_empty(str_at(x, &["preview"])),
+                    url: non_empty(str_at(x, &["url"])),
+                    aspect: x["aspect"].as_f64().filter(|a| *a > 0.2 && *a < 5.0).unwrap_or(1.0).min(16.0 / 9.0),
                 }
             }
             "story_share" => {
@@ -638,6 +790,7 @@ impl DmItem {
                             subtitle: str_at(share, &["text"]),
                             preview: m.image_url(320),
                             url: None,
+                            aspect: 16.0 / 9.0,
                         }
                     }
                     _ => DmContent::Info(
@@ -659,6 +812,7 @@ impl DmItem {
                     subtitle: str_at(share, &["text"]),
                     preview: media.and_then(|m| m.image_url(320)),
                     url: None,
+                    aspect: 16.0 / 9.0,
                 }
             }
             "voice_media" => {
@@ -689,6 +843,7 @@ impl DmItem {
                     subtitle: u.full_name.clone(),
                     preview: non_empty(u.profile_pic_url.clone()),
                     url: Some(format!("https://www.instagram.com/{}/", u.username)),
+                    aspect: 1.0,
                 },
                 None => DmContent::Info("Shared profile".into()),
             },
@@ -710,6 +865,7 @@ impl DmItem {
                     subtitle: truncate(&title, 120),
                     preview: non_empty(str_at(x, &["preview_url"]))
                         .or_else(|| non_empty(str_at(x, &["preview_url_info", "url"]))),
+                    aspect: 1.0,
                     url: non_empty(str_at(x, &["target_url"])),
                 }
             }

@@ -8,6 +8,7 @@ mod lightspeed;
 pub mod models;
 mod mqtt;
 pub mod session;
+pub mod web;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -21,6 +22,7 @@ use serde_json::{Value, json};
 
 pub use models::*;
 pub use session::Session;
+pub use dm::StoryReply;
 
 const WEB_API: &str = "https://www.instagram.com/api/v1/";
 /// The page instagram.com's own GraphQL requests come from.
@@ -388,6 +390,8 @@ impl Client {
             let resp = match self.inner.http.execute(req).await {
                 Ok(r) => r,
                 Err(e) => {
+                    // Without the address: it can hold what was searched for.
+                    let e = e.without_url();
                     eprintln!("finsta: {what} failed: {e}");
                     return Err(e.into());
                 }

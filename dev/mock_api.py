@@ -122,6 +122,14 @@ def story_items(pk, n):
         if VIDEOS and i % 3 != 2:  # two videos, then a photo
             it["media_type"] = 2
             it["video_versions"] = [{"type": 101, "url": f"{BASE}/vid/{VIDEOS[(int(pk) + i) % len(VIDEOS)]}", "width": 720, "height": 1280}]
+        if i == 2:
+            it["story_music_stickers"] = [{"music_asset_info": {"title": "Summer Song", "display_artist": "The Mockers"}, "id": "m1"}]
+        if i == 3:
+            it["story_feed_media"] = [{"media_code": "C503xyz", "id": "503_1005", "product_type": "feed", "x": 0.5, "y": 0.5}]
+            it["reshared_story_media_author"] = {"username": "natgeo_fan", "id": "1003", "profile_pic_url": USERS["1003"]["profile_pic_url"]}
+        if i == 4:
+            it["story_link_stickers"] = [{"story_link": {"url": "https://example.com/article"}, "id": "l1"}]
+            it["story_bloks_stickers"] = [{"bloks_sticker": {"sticker_data": {"ig_mention": {"username": "luca_b", "full_name": "Luca"}}, "id": "b1"}, "id": "b1"}]
         items.append(it)
     return items
 
@@ -152,8 +160,9 @@ MESSAGES = {
         msg("a1", 20001, 90500, "Did you see the photos from Saturday?"),
         msg("a2", ME_CHAT, 90000, "Not yet, send them!"),
         msg("a3", 20001, 3100, attach=("blob", img("dmphoto", 1080, 1350))),
-        msg("a4", ME_CHAT, 3000, "Wow 😍"),
-        msg("a5", 20001, 320, attach=("xma", "https://www.instagram.com/p/MOCK123/", "Golden hour in Bologna")),
+        {**msg("a4", ME_CHAT, 3000, "Wow 😍"), "reactions": [("❤️", 20001)]},
+        msg("a5", 20001, 320, attach=("xma", "https://www.instagram.com/p/C503xyz/", "Golden hour in Bologna")),
+        msg("a5r", 20001, 315, attach=("xma", "https://www.instagram.com/reel/C777xyz/", "A reel about mountains")),
         msg("a5b", 20001, 310, attach=("raven",)),
         msg("a5c", 20001, 305, attach=("audio",)),
         msg("a6", 20001, 300, "Are you coming tonight? 🍕"),
@@ -226,7 +235,9 @@ MARK_DOC = "24000000000000005"
 WEB_DOCS = {"25000000000000006": "PolarisFeedTimelineRootV2Query", "25000000000000001": "PolarisProfilePageContentQuery", "25000000000000002": "PolarisProfilePostsQuery",
             "25000000000000003": "PolarisStoriesV3ReelPageStandaloneQuery", "25000000000000004": "usePolarisLikeMediaXIGLikeMutation",
             "25000000000000005": "usePolarisLikeMediaXIGUnlikeMutation", "25000000000000007": "PolarisAPIReelSeenMutation",
-            "25000000000000008": "usePolarisStoryLikesLikeMutation", "25000000000000009": "usePolarisStoryLikesUnlikeMutation"}
+            "25000000000000008": "usePolarisStoryLikesLikeMutation", "25000000000000009": "usePolarisStoryLikesUnlikeMutation",
+            "25000000000000010": "PolarisPostRootQuery", "25000000000000011": "PolarisSearchBoxRefetchableQuery",
+            "25000000000000012": "IGDOmniPickerSearchResultsListQuery"}
 # Saved-style definitions: what the app reads to fill in and fit inputs.
 WEB_MODULES = (
     '__d("PolarisFeedTimelineRootV2Query.graphql",["PolarisFeedTimelineRootV2Query_instagramRelayOperation"],(function(t,n,r,o,a,i){var e=(function(){'
@@ -255,7 +266,10 @@ WEB_MODULES = (
       '{defaultValue:null,kind:"LocalArgument",name:"viewSeenAt"}]}}}),null);'
 )
 REPLY_DOC = "24000000000000006"
-SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read", REPLY_DOC: "story reply"}
+REACT_DOC = "24000000000000007"
+SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read", REPLY_DOC: "story reply",
+              REACT_DOC: "react"}
+REPLY_FAILS = "--reply-fails" in sys.argv  # story replies fail natively (as on instagram.com in November 2026)
 OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
 EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
 
@@ -304,6 +318,7 @@ def script(name):
                 '__d("IGDirectTextSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + SEND_DOC + '"}),null);'
                 '__d("useIGDMarkThreadAsReadMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MARK_DOC + '"}),null);'
                 '__d("IGDirectStoryShareReplyMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + REPLY_DOC + '"}),null);'
+                '__d("IGDirectReactionSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + REACT_DOC + '"}),null);'
                 + "".join(f'__d("{n}_instagramRelayOperation",[],(function(a,b,c,d,e,f){{e.exports="{d}"}}),null);' for d, n in WEB_DOCS.items())
                 + WEB_MODULES +
                 '__d("IGDMaxUnreadMessagesCount.relayprovider",[],(function(t,n,r,o,a,i,l){l.get=function(){return 20}}),null);'
@@ -343,14 +358,18 @@ def slide_content(m):
         return {"__typename": "SlideMessageRavenImageContent", "attachment": {"__typename": "XFBSlideAttachment", "preview_cdn_url": img("secret", 100, 100)}}
     if a[0] == "audio":
         return {"__typename": "SlideMessageAudiosContent", "audio_attachments": [{"attachment_cdn_url": f"{BASE}/vid/{VIDEOS[0]}" if VIDEOS else "x", "playable_duration_ms": 4000}]}
+    reel_link = "/reel/" in a[1]
+    w, h = (720, 1280) if reel_link else (640, 640)
     return {"__typename": "SlideMessageXMAContent", "xma_text_body": None,
-            "xma": {"__typename": "SlideMessagePortraitXMA", "target_url": a[1], "header_title_text": "natgeo_fan", "title_text": a[2],
-                    "preview_image": {"url": img("xmapreview", 640, 640)}}}
+            "xma": {"__typename": "SlideMessagePortraitXMA" if reel_link else "SlideMessageStandardXMA", "target_url": a[1],
+                    "header_title_text": "natgeo_fan", "title_text": a[2],
+                    "preview_image": {"url": img("xmapreview" + ("reel" if reel_link else ""), w, h), "width": w, "height": h}}}
 
 
 def slide_message(m):
     return {"id": "node" + m["mid"], "message_id": m["mid"], "sender_fbid": str(m["sender"]), "timestamp_ms": str(m["ts"]), "__typename": "SlideMessage",
-            "is_reported": False, "tombstone_reason": None, "content": slide_content(m), "igd_snippet": m["text"] or "sent an attachment"}
+            "is_reported": False, "tombstone_reason": None, "content": slide_content(m), "igd_snippet": m["text"] or "sent an attachment",
+            "reactions": [{"reaction": e, "sender_fbid": str(s), "reaction_timestamp_ms": str(m["ts"] + 1000)} for e, s in m.get("reactions", [])]}
 
 
 def slide_thread(key, convos):
@@ -395,7 +414,19 @@ def slide_answer(op, v):
                 "edges": [{"node": slide_message(m), "cursor": m["mid"]} for m in page],
                 "page_info": {"end_cursor": str(start + v["first"]) if more else None, "has_next_page": more,
                               "has_previous_page": start > 0, "start_cursor": str(start)}}}}}}
+    if op == "react":
+        i = v.get("input") or {}
+        key = next((k for k in MESSAGES if f"34028236684171030{k}" == i.get("ig_thread_igid")), None)
+        m = next((m for m in MESSAGES.get(key, []) if m["mid"] == i.get("item_id")), None)
+        if set(v) != {"input"} or m is None or i.get("reaction_status") not in ("created", "deleted"):
+            return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        m["reactions"] = [r for r in m.get("reactions", []) if r[1] != ME_CHAT]
+        if i["reaction_status"] == "created":
+            m["reactions"].append((i.get("emoji") or "❤️", ME_CHAT))
+        return {"data": {"xig_direct_reaction_send_with_slide_messaging_response": {"success": True}}}
     if op == "story reply":
+        if REPLY_FAILS:
+            return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
         d, sd = v.get("data") or {}, v.get("send_data") or {}
         if not str(d.get("media_id", "")).isdigit() or not d.get("text") or not sd.get("offline_threading_id") \
                 or not (sd.get("ig_thread_igid") or sd.get("recipient_igids")):
@@ -444,8 +475,32 @@ def following_feed():
     return edges
 
 
+def media_by_code(code):
+    mid = re.sub(r"\D", "", code) or "777"
+    m = nulls(media(mid, "1003", f"the post behind {code}", 7200, w=1080, h=1350))
+    m["code"] = code
+    if code.startswith("C777") and VIDEOS:
+        m["media_type"] = 2
+        m["product_type"] = "clips"
+        m["video_versions"] = [{"type": 101, "url": f"{BASE}/vid/{VIDEOS[0]}", "width": 720, "height": 1280}]
+        m["clips_metadata"] = {"music_info": {"music_asset_info": {"title": "Mountain Theme", "display_artist": "Alpine Band"}}}
+    return m
+
+
 def web_answer(name, v):
     pv = {k: x for k, x in v.items() if k.startswith("__relay_internal__pv__")}
+    if name == "PolarisPostRootQuery":
+        if not v.get("shortcode"):
+            return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        return {"data": {"xdt_api__v1__media__shortcode__web_info": {"items": [media_by_code(v["shortcode"])]}}}
+    if name == "PolarisSearchBoxRefetchableQuery":
+        q = ((v.get("data") or {}).get("query") or "").lower()
+        hits = [u for u in USERS.values() if q in u["username"] or q in u["full_name"].lower()]
+        return {"data": {"xdt_api__v1__fbsearch__topsearch_connection": {"users": [{"user": {**u, "pk": str(u["pk"]), "id": str(u["pk"])}} for u in hits], "hashtags": []}}}
+    if name == "IGDOmniPickerSearchResultsListQuery":
+        q = (v.get("search_text") or "").lower()
+        hits = [slide_user(c) for c in CHAT_USERS if q in USERS[CHAT_USERS[c]]["username"]]
+        return {"data": {"xfb_combinedIGSearchQuery": {"search_messenger_contact_v2": [{**h, "pk": h["id"]} for h in hits]}}}
     bad = {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675030}], "data": None}
     if name == "PolarisAPIReelSeenMutation":
         reel_id, item = str(v.get("reelId")), str(v.get("reelMediaId"))
@@ -825,6 +880,23 @@ class Handler(BaseHTTPRequestHandler):
             start = 0 if not q.get("max_id") else 12
             items = [media(str(600 + start + i), pk, f"post {start + i}", 86400 * (i + 1), w=1080, h=1080, carousel=3 if i % 5 == 1 else None) for i in range(12 if start == 0 else 3)]
             return self.send_json({"items": items, "more_available": start == 0, "next_max_id": "m2" if start == 0 else None, "status": "ok"})
+        if p == "feed/saved/posts/":
+            start = 0 if not q.get("max_id") else 9
+            items = [{"media": media(str(800 + start + i), ["1001", "1003", "1005"][i % 3], f"saved post {start + i}", 86400 * (i + 2), w=1080, h=1080)}
+                     for i in range(9 if start == 0 else 4)]
+            return self.send_json({"items": items, "more_available": start == 0, "next_max_id": "s2" if start == 0 else None, "status": "ok"})
+        if p == "fbsearch/web/top_serp/":
+            word = q.get("query", [""])[0]
+            medias = [{"media": media(str(850 + i), ["1002", "1004"][i % 2], f"a post about {word} #{i}", 86400 * (i + 1), w=1080, h=1080)} for i in range(7)]
+            return self.send_json({"media_grid": {"sections": [{"layout_type": "media_grid", "layout_content": {"medias": medias[:3]}},
+                                                               {"layout_type": "media_grid", "layout_content": {"medias": medias[3:]}}]}, "status": "ok"})
+        if p == "direct_v2/threads/broadcast/reel_share/":
+            ok = body.get("media_id") and body.get("text") and body.get("reel_id")
+            if REPLY_FAILS and "--v1-reply-fails" in sys.argv:
+                ok = False
+            return self.send_json({"status": "ok" if ok else "fail", "message": None if ok else "mock: bad reply"}, 200 if ok else 400)
+        if m := re.match(r"media/(\d+)/info/", p):
+            return self.send_json({"items": [media_by_code(f"C{m.group(1)}xyz")], "status": "ok"})
         if p == "web/search/topsearch/":
             return self.send_json({"users": [{"position": i, "user": USERS[k]} for i, k in enumerate(["1001", "1005", "2002"])], "places": [], "hashtags": [], "status": "ok"})
         if m := re.match(r"friendships/(create|destroy)/(\d+)/", p):

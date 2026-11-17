@@ -143,7 +143,18 @@ impl Sidebar {
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
         profile_list.append(&nav_row(profile_avatar_slot.upcast_ref(), &profile_label));
-        widget.append(&profile_list);
+        profile_list.set_hexpand(true);
+        let saved_button = gtk::Button::builder()
+            .icon_name("user-bookmarks-symbolic")
+            .tooltip_text("Saved Posts")
+            .css_classes(["flat", "circular"])
+            .valign(gtk::Align::Center)
+            .margin_end(8)
+            .build();
+        let footer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        footer.append(&profile_list);
+        footer.append(&saved_button);
+        widget.append(&footer);
 
         let sidebar = Rc::new(Sidebar {
             main: Rc::downgrade(main),
@@ -178,6 +189,14 @@ impl Sidebar {
                 }
             }
         ));
+        let w = weak.clone();
+        saved_button.connect_clicked(move |_| {
+            if let Some(s) = w.upgrade()
+                && let Some(main) = s.main.upgrade()
+            {
+                main.open_saved();
+            }
+        });
         sidebar.profile_list.connect_row_activated(glib::clone!(
             #[strong]
             weak,
