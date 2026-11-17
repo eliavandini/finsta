@@ -153,15 +153,10 @@ struct Inner {
     api_host: String,
     /// Retry on the API host when instagram.com doesn't serve a route.
     fallback: bool,
-    /// Route families ("direct_v2", "feed", ...) found to be served only by the API host.
+    /// Routes ("feed/user/*/", ...) found to be served only by the API host.
     api_host_routes: RwLock<HashSet<String>>,
     /// Direct messages: instagram.com's web inbox and chat connection.
     dm: tokio::sync::Mutex<dm::DmState>,
-}
-
-/// "direct_v2/threads/123/" -> "direct_v2". Related routes live on the same host.
-fn route_key(path: &str) -> String {
-    path.split('/').next().unwrap_or_default().to_string()
 }
 
 /// Media ids look like "<media pk>_<owner pk>"; the web endpoints want the pk.
@@ -298,7 +293,9 @@ impl Client {
         if cooldown_remaining(path).is_some() {
             return Err(RateLimited.into());
         }
-        let route = route_key(path);
+        // Remembered per route, not per family: instagram.com serves
+        // feed/timeline/ but not feed/user/{id}/.
+        let route = pause_key.clone();
         let mut api_host = self.inner.fallback && self.inner.api_host_routes.read().unwrap().contains(&route);
         loop {
             let base = if api_host { &self.inner.api_host } else { &self.inner.base };
@@ -510,12 +507,30 @@ impl Client {
         Ok(ids)
     }
 
-    pub async fn user_feed(&self, pk: &str, max_id: Option<String>) -> Result<Page<Media>> {
+    /// A profile's posts. instagram.com looks them up by username; the
+    /// route by id is only a fallback.
+    pub async fn user_feed(&self, user: &User, max_id: Option<String>) -> Result<Page<Media>> {
         let mut q = vec![("count", "12".to_string())];
         if let Some(m) = max_id {
             q.push(("max_id", m));
         }
-        let v = self.get(&format!("feed/user/{pk}/"), &q).await?;
+        let by_name = user
+            .username
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+            && !user.username.is_empty();
+        let v = if by_name {
+            match self.get(&format!("feed/user/{}/username/", user.username), &q).await {
+                Ok(v) => v,
+                Err(e) if is_rate_limited(&e) || e.is::<LoginRequired>() => return Err(e),
+                Err(e) => {
+                    eprintln!("finsta: posts by username failed ({e}); trying by id");
+                    self.get(&format!("feed/user/{}/", user.pk), &q).await?
+                }
+            }
+        } else {
+            self.get(&format!("feed/user/{}/", user.pk), &q).await?
+        };
         Ok(Page {
             items: parse(&v["items"]).unwrap_or_default(),
             next_max_id: parse::<Value>(&v["next_max_id"]).map(|v| match v {

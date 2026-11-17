@@ -294,7 +294,7 @@ impl Profile {
                 let friendship = async {
                     if is_me { None } else { Some(client.friendship(&pk).await) }
                 };
-                tokio::join!(client.profile(&known), friendship, client.user_feed(&pk, None))
+                tokio::join!(client.profile(&known), friendship, client.user_feed(&known, None))
             })
             .await;
             let Some(p) = weak.upgrade() else { return };
@@ -366,10 +366,10 @@ impl Profile {
         let Some(main) = self.main.upgrade() else { return };
         self.more_button.set_sensitive(false);
         let client = main.client.clone();
-        let pk = self.user.borrow().pk.clone();
+        let user = self.user.borrow().clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let res = rt::bg(async move { client.user_feed(&pk, Some(max_id)).await }).await;
+            let res = rt::bg(async move { client.user_feed(&user, Some(max_id)).await }).await;
             let Some(p) = weak.upgrade() else { return };
             p.loading_posts.set(false);
             p.more_button.set_sensitive(true);

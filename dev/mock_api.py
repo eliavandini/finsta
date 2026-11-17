@@ -517,7 +517,10 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"reels": {i: {**reel(i), "items": story_items(i, 3)} for i in ids}, "status": "ok"})
         if m := re.match(r"friendships/show/(\d+)/", p):
             return self.send_json({"following": m.group(1) in USERS and m.group(1) < "2000", "followed_by": True, "status": "ok"})
-        if m := re.match(r"feed/user/(\d+)/", p):
+        if m := re.match(r"feed/user/([^/]+)/username/", p):
+            pk = next((k for k, u in USERS.items() if u["username"] == m.group(1)), "1001")
+            m = re.match(r"(.*)", pk)
+        if m := (m if p.endswith("/username/") else re.match(r"feed/user/(\d+)/", p)):
             pk = m.group(1) if m.group(1) in USERS else "1001"
             start = 0 if not q.get("max_id") else 12
             items = [media(str(600 + start + i), pk, f"post {start + i}", 86400 * (i + 1), w=1080, h=1080, carousel=3 if i % 5 == 1 else None) for i in range(12 if start == 0 else 3)]
