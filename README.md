@@ -78,15 +78,16 @@ iPhone app, which Instagram now rejects.) That means:
 - It can break whenever Instagram changes its API.
 - Using unofficial clients is against Instagram's terms and could get an
   account flagged. Use it at your own risk.
-- Messages use the same system as instagram.com's own inbox: the inbox page
-  carries your conversations, and a chat connection (MQTT over a WebSocket,
-  in the "Lightspeed" format) fetches, sends and marks messages read. This
-  part is new and still being matched against real data; it logs what it
-  can't read (structure only, never names or message text) with a `dm:`
-  prefix, visible with `journalctl --user | grep finsta:`.
-- Not supported yet in messages: starting a new conversation, disappearing
-  photos, voice messages, sending anything but text. They show a note to use
-  instagram.com instead.
+- Messages use the same GraphQL requests as instagram.com's own inbox
+  (which no longer runs on the older "Lightspeed" chat protocol). Finsta
+  finds their current ids in the website's scripts once a day, and keeps
+  the website's public code for them in `~/.cache/finsta/webcode/`. This
+  part is new; it logs the structure of what it can't read (never names or
+  message text) with a `dm:` prefix, visible with
+  `journalctl --user | grep finsta:`.
+- Not supported yet in messages: marking conversations as read on
+  Instagram, disappearing photos, voice messages, sending anything but
+  text. They show a note to use instagram.com instead.
 - Open conversations refresh every 15 seconds and the conversation list
   every minute. When Instagram rate limits an endpoint, Finsta pauses that
   endpoint until Instagram says to retry.
@@ -96,11 +97,11 @@ iPhone app, which Instagram now rejects.) That means:
 ## Development
 
 `dev/mock_api.py` is a fake Instagram with sample data, for working on the
-UI without a real account. It also serves an inbox page and a chat
-connection in the same formats as instagram.com:
+UI without a real account. With `--offmsys` its inbox works like
+instagram.com's current one; without it, like the older Lightspeed one:
 
 ```sh
-python3 dev/mock_api.py 8765
+python3 dev/mock_api.py 8765 /dev/null --offmsys
 FINSTA_API_BASE=http://127.0.0.1:8765/api/v1/ FINSTA_WEB_BASE=http://127.0.0.1:8765/ \
 FINSTA_CHAT_URL=ws://127.0.0.1:8765/chat XDG_CONFIG_HOME=/tmp/finsta-dev cargo run
 # then sign in with the session cookie 1000%3Aabc%3A1

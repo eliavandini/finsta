@@ -19,6 +19,8 @@ use reqwest::Method;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
+mod slide;
+
 use super::lightspeed::{self, AttachmentKind, LsAttachment, LsContact, LsMessage, LsThread, Tables};
 use super::mqtt::Conn;
 use super::{
@@ -58,8 +60,8 @@ pub(super) struct DmState {
     /// Whether the conversations have been loaded at least once.
     inbox_loaded: bool,
     last_sync_attempt: Option<Instant>,
-    /// Whether the new GraphQL inbox has been tried this run.
-    probed: bool,
+    /// instagram.com's current inbox (GraphQL).
+    slide: slide::SlideState,
     /// Which payload kinds have had their shapes logged already.
     logged: HashSet<String>,
 }
@@ -90,6 +92,8 @@ struct PageConfig {
     mqtt_params: Value,
     /// The website's GraphQL operations: name -> id.
     ops: BTreeMap<String, String>,
+    /// The device id the inbox query subscribes to updates with.
+    iris_device_id: String,
 }
 
 #[derive(Default)]
@@ -666,7 +670,20 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 4;
+const META_SCANNER: u64 = 5;
+
+/// Website code that calls the message operations: saved (to
+/// webcode/callers/) to work out the inputs the website passes them.
+const CALLER_NEEDLES: [&str; 8] = [
+    "IGDirectTextSendMutation",
+    "useIGDMarkThreadAsReadMutation",
+    "device_id_for_iris_subscription",
+    "PolarisDirectInboxQuery",
+    "IGDMessageListOffMsysQuery",
+    "IGDThreadListOffMsysPaginationQuery",
+    "PolarisDirectIrisSubscription",
+    "IGDSlideDeltaProcessorQuery",
+];
 
 /// Places in the website's own code worth quoting in the log while working
 /// out how its messaging works now. Only ever matched against public scripts.
@@ -802,21 +819,6 @@ fn interesting_op(name: &str) -> bool {
     .any(|p| name.starts_with(p))
 }
 
-/// An operation's arguments from its saved `.graphql` module: (name, has a default).
-fn saved_arguments(op: &str) -> Vec<(String, bool)> {
-    let Some(text) = webcode_dir().and_then(|d| std::fs::read_to_string(d.join(format!("{op}.graphql.js"))).ok()) else {
-        return Vec::new();
-    };
-    let re = regex::Regex::new(r#"\{defaultValue:([^{}]*?),kind:"LocalArgument",name:"([A-Za-z0-9_]+)"\}"#).unwrap();
-    let mut out: Vec<(String, bool)> = Vec::new();
-    for c in re.captures_iter(&text) {
-        if !out.iter().any(|(n, _)| *n == c[2]) {
-            out.push((c[2].to_string(), &c[1] != "null"));
-        }
-    }
-    out
-}
-
 fn found<T>(x: &Option<T>) -> &'static str {
     if x.is_some() { "found" } else { "unknown" }
 }
@@ -938,7 +940,9 @@ impl Client {
             r#"__d\("([A-Za-z0-9]+(?:Query|Mutation|Subscription))_[a-z][A-Za-z]*RelayOperation"[\s\S]{0,80}?"(\d{8,25})""#,
         )
         .unwrap();
-        let module = regex::Regex::new(r#"__d\("([A-Za-z0-9_]+)(\.graphql|\$Parameters)","#).unwrap();
+        let module = regex::Regex::new(r#"__d\("([A-Za-z0-9_]+)(\.graphql|\$Parameters|\.relayprovider)","#).unwrap();
+        let any_module = regex::Regex::new(r#"__d\("([A-Za-z0-9_$.\-]+)","#).unwrap();
+        let mut saved_callers = 0usize;
         let code_dir = webcode_dir();
         if let Some(dir) = &code_dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -1025,9 +1029,36 @@ impl Client {
                         while !text.is_char_boundary(start + len) {
                             len -= 1;
                         }
-                        let file = dir.join(format!("{}{}.js", &c[1], if &c[2] == ".graphql" { ".graphql" } else { ".parameters" }));
+                        let suffix = match &c[2] {
+                            ".graphql" => ".graphql",
+                            "$Parameters" => ".parameters",
+                            _ => ".relayprovider",
+                        };
+                        let file = dir.join(format!("{}{suffix}.js", &c[1]));
                         if std::fs::write(file, &text[start..start + len]).is_ok() {
                             saved_modules += 1;
+                        }
+                    }
+                    if CALLER_NEEDLES.iter().any(|n| text.contains(n)) {
+                        let callers = dir.join("callers");
+                        let _ = std::fs::create_dir_all(&callers);
+                        let starts: Vec<(usize, String)> =
+                            any_module.captures_iter(&text).map(|c| (c.get(0).unwrap().start(), c[1].to_string())).collect();
+                        for (i, (start, name)) in starts.iter().enumerate() {
+                            let end = starts.get(i + 1).map(|(e, _)| *e).unwrap_or(text.len());
+                            let body = &text[*start..end];
+                            if saved_callers >= 400
+                                || body.len() > 400_000
+                                || name.ends_with(".graphql")
+                                || name.ends_with("$Parameters")
+                                || name.ends_with("RelayOperation")
+                                || !CALLER_NEEDLES.iter().any(|n| body.contains(n))
+                            {
+                                continue;
+                            }
+                            if std::fs::write(callers.join(format!("{name}.js")), body).is_ok() {
+                                saved_callers += 1;
+                            }
                         }
                     }
                 }
@@ -1060,7 +1091,7 @@ impl Client {
         }
         let message_ops: Vec<&String> = meta.ops.keys().filter(|n| interesting_op(n) && DM_WORDS.iter().any(|w| n.contains(w))).collect();
         eprintln!(
-            "finsta: dm: {} operations with ids in the scripts, {} about messages; saved {saved_modules} code modules",
+            "finsta: dm: {} operations with ids in the scripts, {} about messages; saved {saved_modules} code modules and {saved_callers} modules that use them",
             meta.ops.len(),
             message_ops.len()
         );
@@ -1251,6 +1282,10 @@ impl Client {
             host_override,
             mqtt_params,
             ops: meta.ops,
+            iris_device_id: [("IGDMqttWebDeviceID", "clientId"), ("IGDMqttWebDeviceID", "clientID"), ("MqttWebDeviceID", "clientID")]
+                .iter()
+                .find_map(|(n, k)| def(n)[*k].as_str().filter(|v| !v.is_empty()).map(str::to_string))
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         }
     }
 
@@ -1353,10 +1388,6 @@ impl Client {
     /// Fetch the conversations the way the website does once its inbox page
     /// has loaded: with a GraphQL query, or else over the chat connection.
     async fn dm_initial_sync(&self, st: &mut DmState) -> Result<()> {
-        if st.config.as_ref().is_some_and(|c| c.doc.is_none()) && !st.probed {
-            st.probed = true;
-            self.dm_probe_offmsys(st).await;
-        }
         match self.dm_graphql_sync(st).await {
             Ok(true) => {
                 st.inbox_loaded = true;
@@ -1490,47 +1521,6 @@ impl Client {
             ok |= self.dm_apply_payload(st, payload, &format!("inbox query {key}"));
         }
         Ok(ok)
-    }
-
-    /// instagram.com now runs its inbox on plain GraphQL operations (named
-    /// "...OffMsys..."). Until their inputs and answers are worked out, try
-    /// the ones that list conversations and log the structure of the answers.
-    async fn dm_probe_offmsys(&self, st: &mut DmState) {
-        let Some(cfg) = st.config.clone() else { return };
-        for name in ["PolarisDirectInboxQuery", "IGDThreadListOffMsysPaginationQuery"] {
-            let Some(id) = cfg.ops.get(name).cloned() else {
-                eprintln!("finsta: dm: probe {name}: its id wasn't found");
-                continue;
-            };
-            let args = saved_arguments(name);
-            let mut vars = serde_json::Map::new();
-            let mut left_out = Vec::new();
-            for (arg, has_default) in &args {
-                if *has_default {
-                    continue;
-                }
-                let lower = arg.to_ascii_lowercase();
-                if ["after", "before", "cursor"].iter().any(|w| lower.contains(w)) {
-                    vars.insert(arg.clone(), Value::Null);
-                } else if ["first", "count", "limit", "last"].iter().any(|w| lower == *w || lower.ends_with(w)) {
-                    vars.insert(arg.clone(), 20.into());
-                } else {
-                    left_out.push(arg.clone());
-                }
-            }
-            let described: Vec<String> =
-                args.iter().map(|(a, d)| if *d { format!("{a} (has default)") } else { a.clone() }).collect();
-            eprintln!("finsta: dm: probe {name}: arguments {described:?}, left out {left_out:?}");
-            match self.web_graphql(&cfg, name, &id, &Value::Object(vars)).await {
-                Ok(answer) => answer.log(&format!("probe {name}")),
-                Err(e) => {
-                    eprintln!("finsta: dm: probe {name} failed: {e:#}");
-                    if e.is::<RateLimited>() || e.is::<LoginRequired>() {
-                        break;
-                    }
-                }
-            }
-        }
     }
 
     /// Ask for a whole database over the chat connection (a "sync" request).
@@ -1698,6 +1688,12 @@ impl Client {
     pub async fn inbox(&self, cursor: Option<String>) -> Result<InboxPage> {
         let mut st = self.inner.dm.lock().await;
         let first = st.config.is_none();
+        if first {
+            self.dm_load_page(&mut st).await?;
+        }
+        if Self::slide_mode(&st) {
+            return self.slide_inbox(&mut st, cursor).await;
+        }
         self.dm_ensure(&mut st).await?;
         let viewer_pk = self.user_id();
         let connected = st.conn.as_ref().is_some_and(|c| c.is_alive());
@@ -1752,8 +1748,14 @@ impl Client {
     }
 
     pub async fn thread(&self, thread_id: &str, cursor: Option<String>) -> Result<Thread> {
-        let key: i64 = thread_id.parse().map_err(|_| anyhow!("Unknown conversation"))?;
         let mut st = self.inner.dm.lock().await;
+        if st.config.is_none() {
+            self.dm_load_page(&mut st).await?;
+        }
+        if Self::slide_mode(&st) {
+            return self.slide_thread(&mut st, thread_id, cursor).await;
+        }
+        let key: i64 = thread_id.parse().map_err(|_| anyhow!("Unknown conversation"))?;
         self.dm_ensure(&mut st).await?;
         let (ref_ts, ref_mid) = match &cursor {
             Some(c) => {
@@ -1780,8 +1782,19 @@ impl Client {
 
     /// The existing 1:1 conversation with `user_pk`, if there is one.
     pub async fn thread_with_user(&self, user_pk: &str) -> Result<Option<Thread>> {
-        let Ok(id) = user_pk.parse::<i64>() else { return Ok(None) };
         let mut st = self.inner.dm.lock().await;
+        if st.config.is_none() {
+            self.dm_load_page(&mut st).await?;
+        }
+        if Self::slide_mode(&st) {
+            if st.slide.threads.is_empty() {
+                drop(st);
+                self.inbox(None).await?;
+                st = self.inner.dm.lock().await;
+            }
+            return Ok(self.slide_thread_with_user(&st, user_pk));
+        }
+        let Ok(id) = user_pk.parse::<i64>() else { return Ok(None) };
         self.dm_ensure(&mut st).await?;
         let key = st.store.sorted_keys().into_iter().find(|k| st.store.others(*k) == vec![id]);
         Ok(key.and_then(|k| parse(&st.store.thread_value(k, &self.user_id(), PAGE_SIZE, None))))
@@ -1789,6 +1802,15 @@ impl Client {
 
     /// Sends a text message and returns the id of the conversation it went to.
     pub async fn send_text(&self, to: &Recipient, text: &str) -> Result<Option<String>> {
+        {
+            let mut st = self.inner.dm.lock().await;
+            if st.config.is_none() {
+                self.dm_load_page(&mut st).await?;
+            }
+            if Self::slide_mode(&st) {
+                return self.slide_send(&mut st, to, text).await;
+            }
+        }
         let key: i64 = match to {
             Recipient::Thread(id) => id.parse().map_err(|_| anyhow!("Unknown conversation"))?,
             Recipient::User(pk) => match self.thread_with_user(pk).await? {
@@ -1818,8 +1840,12 @@ impl Client {
     }
 
     pub async fn mark_seen(&self, thread_id: &str, item_id: &str) -> Result<()> {
-        let Ok(key) = thread_id.parse::<i64>() else { return Ok(()) };
         let mut st = self.inner.dm.lock().await;
+        if Self::slide_mode(&st) {
+            self.slide_mark_seen(&mut st);
+            return Ok(());
+        }
+        let Ok(key) = thread_id.parse::<i64>() else { return Ok(()) };
         if !st.conn.as_ref().is_some_and(|c| c.is_alive()) {
             return Ok(());
         }

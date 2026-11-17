@@ -138,6 +138,8 @@ MESSAGES = {
         msg("a3", 20001, 3100, attach=("blob", img("dmphoto", 1080, 1350))),
         msg("a4", ME_CHAT, 3000, "Wow 😍"),
         msg("a5", 20001, 320, attach=("xma", "https://www.instagram.com/p/MOCK123/", "Golden hour in Bologna")),
+        msg("a5b", 20001, 310, attach=("raven",)),
+        msg("a5c", 20001, 305, attach=("audio",)),
         msg("a6", 20001, 300, "Are you coming tonight? 🍕"),
     ],
     30002: [msg("g1", ME_CHAT, 4300, "Saturday works for me"), msg("g2", 20002, 4200, "Who has a car?"),
@@ -180,7 +182,7 @@ def message_calls(key, msgs):
         a = m["attach"]
         if a and a[0] == "blob":
             out.append(("insertBlobAttachment", {3: a[1], 5: 1080, 6: 1350, 27: key, 30: m["mid"]}))
-        elif a:
+        elif a and a[0] == "xma":
             out.append(("insertXmaAttachment", {2: a[1], 4: img("xmapreview", 640, 640), 8: a[2], 27: key, 30: m["mid"]}))
     return out
 
@@ -202,6 +204,9 @@ def convo_calls(convos, last=5):
 DOC_ID = "7357432314358409"
 INBOX_DOC = "24000000000000001"
 LIST_DOC = "24000000000000002"
+MESSAGES_DOC = "24000000000000003"
+SEND_DOC = "24000000000000004"
+SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send"}
 OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
 EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
 
@@ -217,6 +222,7 @@ def inbox_page():
         ["MqttWebConfig", [], {"fbid": "99999999999", "appID": 936619743392459, "endpoint": f"ws://127.0.0.1:{PORT}/chat",
                                "subscribedTopics": [], "capabilities": 10, "chatVisibility": True}, 1],
         ["MqttWebDeviceID", [], {"clientID": "6f1d2c3b-0000-4000-8000-123456789abc"}, 2],
+        ["IGDMqttWebDeviceID", [], {"clientId": "ab12cd34-0000-4000-8000-ffffffffffff"}, 9],
         ["CurrentUserInitialData", [], {"USER_ID": str(ME_CHAT), "ACCOUNT_ID": str(ME_CHAT), "IG_USER_EIMU": str(ME_CHAT),
                                         "NON_FACEBOOK_USER_ID": ME, "NAME": "Your Name", "APP_ID": "936619743392459"}, 3],
         ["LSPlatformMessengerSyncParams", [], {"mailbox": json.dumps({"locale": "en_US"}), "contact": json.dumps({"locale": "en_US"}), "e2ee": "{}"}, 4],
@@ -245,6 +251,10 @@ def script(name):
         # Like instagram.com in November 2026: no Lightspeed, plain GraphQL operations.
         return ('__d("PolarisDirectInboxQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + INBOX_DOC + '"}),null);'
                 '__d("IGDThreadListOffMsysPaginationQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + LIST_DOC + '"}),null);'
+                '__d("IGDMessageListOffMsysQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MESSAGES_DOC + '"}),null);'
+                '__d("IGDirectTextSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + SEND_DOC + '"}),null);'
+                '__d("IGDMaxUnreadMessagesCount.relayprovider",[],(function(t,n,r,o,a,i,l){l.get=function(){return 20}}),null);'
+                '__d("useIGDSendText",["IGDirectTextSendMutation.graphql"],(function(t,n,r,o,a,i,l){function s(e){return{ig_thread_igid:e.id,text:e.text}}l.default=s}),98);'
                 '__d("IGDThreadListOffMsysPaginationQuery.graphql",["IGDThreadListOffMsysPaginationQuery_instagramRelayOperation"],(function(t,n,r,o,a,i){"use strict";'
                 'var e=function(){var e={defaultValue:null,kind:"LocalArgument",name:"after"},t={defaultValue:20,kind:"LocalArgument",name:"first"},'
                 'n={defaultValue:null,kind:"LocalArgument",name:"folder"};return{fragment:{argumentDefinitions:[e,t,n],kind:"Fragment",name:"IGDThreadListOffMsysPaginationQuery"}}}();a.exports=e}),null);'
@@ -259,6 +269,78 @@ def script(name):
 
 def inbox_snapshot():
     return ls_program(convo_calls(CONVOS) + [("upsertSyncGroupThreadsRange", {0: 1, 1: 1, 2: True})])
+
+
+# ----- instagram.com's current inbox ("Slide", GraphQL) -----
+
+def slide_user(cid):
+    u = USERS[CHAT_USERS[cid]]
+    return {"id": u["pk_id"], "username": u["username"], "full_name": u["full_name"], "profile_pic_url": u["profile_pic_url"],
+            "is_verified": u["is_verified"], "interop_messaging_user_fbid": str(cid)}
+
+
+def slide_content(m):
+    a = m["attach"]
+    if not a:
+        return {"__typename": "SlideMessageText", "text_body": m["text"]}
+    if a[0] == "blob":
+        return {"__typename": "SlideMessageImageContent", "attachments": [{"attachment_fbid": "1", "preview_cdn_url": a[1], "attachment_cdn_url": a[1],
+                                                                             "preview_width": 1080, "preview_height": 1350}]}
+    if a[0] == "raven":
+        return {"__typename": "SlideMessageRavenImageContent", "attachment": {"__typename": "XFBSlideAttachment", "preview_cdn_url": img("secret", 100, 100)}}
+    if a[0] == "audio":
+        return {"__typename": "SlideMessageAudiosContent", "audio_attachments": [{"attachment_cdn_url": "x", "playable_duration_ms": 4000}]}
+    return {"__typename": "SlideMessageXMAContent", "xma_text_body": None,
+            "xma": {"__typename": "SlideMessagePortraitXMA", "target_url": a[1], "header_title_text": "natgeo_fan", "title_text": a[2],
+                    "preview_image": {"url": img("xmapreview", 640, 640)}}}
+
+
+def slide_message(m):
+    return {"id": m["mid"], "sender_fbid": str(m["sender"]), "timestamp_ms": str(m["ts"]), "__typename": "SlideMessage",
+            "is_reported": False, "tombstone_reason": None, "content": slide_content(m), "igd_snippet": m["text"] or "sent an attachment"}
+
+
+def slide_thread(key, convos):
+    name, kind, members, read = convos[key]
+    msgs = MESSAGES[key]
+    return {"node": {"id": f"slide{key}", "__typename": "SlideThread", "as_ig_direct_thread": {
+        "id": f"t{key}", "thread_id": f"34028236684171030{key}", "thread_key": str(key), "thread_fbid": str(key),
+        "is_group": kind == 2, "thread_title": name, "thread_image_url": None,
+        "last_activity_timestamp_ms": str(msgs[-1]["ts"]), "users": [slide_user(c) for c in members],
+        "viewer": {"id": ME, "interop_messaging_user_fbid": str(ME_CHAT), "profile_pic_url": USERS[ME]["profile_pic_url"]},
+        "marked_as_unread": False, "is_muted": False,
+        "slide_read_receipts": [{"participant_fbid": str(ME_CHAT), "watermark_timestamp_ms": str(read)}],
+        "slide_messages": {"edges": [{"node": slide_message(m), "cursor": m["mid"]} for m in reversed(msgs[-2:])],
+                           "page_info": {"end_cursor": None, "has_next_page": False}}}}, "cursor": f"c{key}"}
+
+
+def slide_answer(op, v):
+    if op == "inbox":
+        threads = [slide_thread(k, CONVOS) for k in CONVOS]
+        return {"data": {"get_slide_mailbox_for_iris_subscription": {"__typename": "SlideMailbox", "id": "mailbox1",
+                "iris_inactive_subscription_uq_seq_id": "1", "threads_by_folder": {"edges": threads,
+                "page_info": {"end_cursor": "page2", "has_next_page": True}}}}, "extensions": {"is_final": True}}
+    if op == "more threads":
+        assert v["id"] == "mailbox1" and v["cursor"] == "page2", v
+        return {"data": {"fetch__SlideMailbox": {"id": "mailbox1", "threads_by_folder": {"edges": [slide_thread(k, OLDER_CONVOS) for k in OLDER_CONVOS],
+                "page_info": {"end_cursor": None, "has_next_page": False}}}}}
+    if op == "messages":
+        key = int(v["id"].removeprefix("slide"))
+        newest_first = list(reversed(MESSAGES[key]))
+        start = int(v["after"]) if v.get("after") else 0
+        page = newest_first[start:start + v["first"]]
+        more = start + v["first"] < len(newest_first)
+        return {"data": {"fetch__SlideThread": {"id": v["id"], "as_ig_direct_thread": {"id": f"t{key}", "slide_messages": {
+                "edges": [{"node": slide_message(m), "cursor": m["mid"]} for m in page],
+                "page_info": {"end_cursor": str(start + v["first"]) if more else None, "has_next_page": more,
+                              "has_previous_page": start > 0, "start_cursor": str(start)}}}}}}
+    if op == "send":
+        key = next((k for k in MESSAGES if f"34028236684171030{k}" == v.get("ig_thread_igid")), None)
+        if key is None or not v.get("offline_threading_id") or not v.get("text"):
+            return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        sent = msg(f"s{time.time_ns()}", ME_CHAT, 0, v["text"])
+        MESSAGES[key].append(sent)
+        return {"data": {"xig_direct_text_send_with_slide_messaging_response": {"message_id": sent["mid"], "timestamp_ms": str(sent["ts"]), "id": "x"}}}
 
 
 def mqtt_string(b, i):
@@ -462,16 +544,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(js)
             return
-        if path == "/api/graphql" and body.get("doc_id", [""])[0] in (INBOX_DOC, LIST_DOC):
+        if path == "/api/graphql" and body.get("doc_id", [""])[0] in SLIDE_DOCS:
             f = {k: v[0] for k, v in body.items()}
+            op = SLIDE_DOCS[f["doc_id"]]
+            v = json.loads(f.get("variables", "{}"))
             with open(sys.argv[2] if len(sys.argv) > 2 else "/dev/null", "a") as log:
-                log.write(f"GRAPHQL {f.get('fb_api_req_friendly_name')} variables={f.get('variables')} av={f.get('av')}\n")
-            if f["doc_id"] == INBOX_DOC:
-                return self.send_json({"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL",
-                                                   "code": 1675030, "path": ["xdt_get_inbox"], "description": "thread_count"}], "data": None})
-            edges = [{"node": {"thread_key": str(k), "thread_title": "x", "users": [{"pk": "1", "username": "u"}], "last_activity_at": 1}} for k in CONVOS]
-            return self.send_json({"data": {"get_slide_mailbox": {"threads_connection": {"edges": edges, "page_info": {"end_cursor": "c", "has_next_page": True}}}},
-                                   "extensions": {"is_final": True}})
+                log.write(f"GRAPHQL {op} {f.get('fb_api_req_friendly_name')} variables={v} av={f.get('av')}\n")
+            return self.send_json(slide_answer(op, v))
         if path == "/api/graphql":
             f = {k: v[0] for k, v in body.items()}
             variables = json.loads(f.get("variables", "{}"))
