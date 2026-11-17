@@ -23,6 +23,8 @@ pub use models::*;
 pub use session::Session;
 
 const WEB_API: &str = "https://www.instagram.com/api/v1/";
+/// The page instagram.com's own GraphQL requests come from.
+const WEB_REFERER: &str = "https://www.instagram.com/";
 /// instagram.com also calls a few routes on the API host; used when the
 /// website's own host doesn't serve a route.
 const API_HOST: &str = "https://i.instagram.com/api/v1/";
@@ -360,6 +362,10 @@ impl Client {
     }
 
     // ----- Users ---------------------------------------------------------
+    //
+    // Profiles, posts, stories and likes go through instagram.com's GraphQL
+    // operations first (`web_query`), as the website itself does; the older
+    // REST routes it used before remain as fallbacks.
 
     pub async fn user_info(&self, pk: &str) -> Result<User> {
         let v = self.get(&format!("users/{pk}/info/"), &[]).await?;
@@ -373,7 +379,7 @@ impl Client {
             .await?;
         let u = &v["data"]["user"];
         if !u.is_object() {
-            bail!("Could not read @{username}'s profile");
+            bail!("Could not read this profile");
         }
         let pic = if u["profile_pic_url_hd"].is_string() { &u["profile_pic_url_hd"] } else { &u["profile_pic_url"] };
         let raw = json!({
@@ -394,12 +400,32 @@ impl Client {
                 "outgoing_request": u["requested_by_viewer"],
             },
         });
-        parse(&raw).ok_or_else(|| anyhow!("Could not read @{username}'s profile"))
+        parse(&raw).ok_or_else(|| anyhow!("Could not read this profile"))
     }
 
-    /// The full profile of `user`: by username when known (what the website
-    /// does), otherwise by id.
+    /// A profile by id, the way instagram.com's profile pages load it now.
+    async fn web_profile(&self, pk: &str) -> Result<User> {
+        let data = self
+            .web_query("PolarisProfilePageContentQuery", json!({"id": pk, "enable_integrity_filters": true}), WEB_REFERER)
+            .await?;
+        let mut user: User = parse(&data["user"]).ok_or_else(|| anyhow!("Could not read this profile"))?;
+        if user.pk.is_empty() {
+            user.pk = pk.to_string();
+        }
+        Ok(user)
+    }
+
+    /// The full profile of `user`: through instagram.com's current profile
+    /// query when the id is known, otherwise (or if that fails) the older
+    /// routes, by username first.
     pub async fn profile(&self, user: &User) -> Result<User> {
+        if !user.pk.is_empty() {
+            match self.web_profile(&user.pk).await {
+                Ok(u) => return Ok(u),
+                Err(e) if is_login_required(&e) => return Err(e),
+                Err(e) => eprintln!("finsta: profile query failed ({e}); trying the older routes"),
+            }
+        }
         if user.username.is_empty() {
             return self.user_info(&user.pk).await;
         }
@@ -413,9 +439,9 @@ impl Client {
         }
     }
 
-    /// The signed-in account. Read from the same endpoint instagram.com's
-    /// settings page uses, since users/{id}/info/ is refused to the website.
-    pub async fn current_user(&self) -> Result<User> {
+    /// The signed-in account's username and first name, from the settings
+    /// form: a light check that the session works.
+    async fn account(&self) -> Result<(String, String)> {
         let v = self.get(ME_PATH, &[]).await?;
         let form = &v["form_data"];
         let username = form["username"].as_str().unwrap_or_default().to_string();
@@ -429,12 +455,24 @@ impl Client {
                 let _ = s.save();
             }
         }
-        match self.user_by_username(&username).await {
+        Ok((username, form["first_name"].as_str().unwrap_or_default().to_string()))
+    }
+
+    /// The signed-in account's username (checks that the session works).
+    pub async fn account_username(&self) -> Result<String> {
+        Ok(self.account().await?.0)
+    }
+
+    /// The signed-in account's profile; just the names if it can't be loaded.
+    pub async fn current_user(&self) -> Result<User> {
+        let (username, first_name) = self.account().await?;
+        let me = User { pk: self.user_id(), username: username.clone(), ..Default::default() };
+        match self.profile(&me).await {
             Ok(u) => Ok(u),
             Err(e) if is_login_required(&e) => Err(e),
             Err(_) => Ok(User {
                 pk: self.user_id(),
-                full_name: form["first_name"].as_str().unwrap_or_default().to_string(),
+                full_name: first_name,
                 username,
                 ..Default::default()
             }),
@@ -508,9 +546,52 @@ impl Client {
         Ok(ids)
     }
 
-    /// A profile's posts. instagram.com looks them up by username; the
-    /// route by id is only a fallback.
+    /// A profile's posts, through instagram.com's current profile query
+    /// (by username, 12 at a time). `max_id` is the previous page's cursor.
+    async fn web_user_feed(&self, username: &str, after: Option<String>) -> Result<Page<Media>> {
+        let vars = json!({
+            "data": {
+                "count": 12,
+                "include_reel_media_seen_timestamp": true,
+                "include_relationship_info": true,
+                "latest_besties_reel_media": true,
+                "latest_reel_media": true,
+            },
+            "username": username,
+            "first": 12,
+            "after": after,
+            "before": null,
+            "last": null,
+        });
+        let data = self.web_query("PolarisProfilePostsQuery", vars, WEB_REFERER).await?;
+        let conn = &data["xdt_api__v1__feed__user_timeline_graphql_connection"];
+        if !conn.is_object() {
+            bail!("Instagram didn't send this profile's posts");
+        }
+        let items: Vec<Media> = conn["edges"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| parse::<Media>(&e["node"]))
+            .collect();
+        let next = conn["page_info"]["end_cursor"].as_str().map(str::to_string);
+        Ok(Page {
+            items,
+            more_available: conn["page_info"]["has_next_page"].as_bool().unwrap_or(false) && next.is_some(),
+            next_max_id: next,
+        })
+    }
+
+    /// A profile's posts: through instagram.com's current query, else the
+    /// older routes (by username, then by id).
     pub async fn user_feed(&self, user: &User, max_id: Option<String>) -> Result<Page<Media>> {
+        if !user.username.is_empty() {
+            match self.web_user_feed(&user.username, max_id.clone()).await {
+                Ok(page) => return Ok(page),
+                Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+                Err(e) => eprintln!("finsta: posts query failed ({e}); trying the older routes"),
+            }
+        }
         let mut q = vec![("count", "12".to_string())];
         if let Some(m) = max_id {
             q.push(("max_id", m));
@@ -602,7 +683,16 @@ impl Client {
         Ok(page)
     }
 
+    /// Like or unlike a post, the way instagram.com does it now; the older
+    /// route only if the website's operation can't be used.
     pub async fn like(&self, media_id: &str, like: bool) -> Result<()> {
+        let name = if like { "usePolarisLikeMediaXIGLikeMutation" } else { "usePolarisLikeMediaXIGUnlikeMutation" };
+        let vars = json!({"media_id": media_pk(media_id), "container_module": "feed_timeline"});
+        match self.web_query(name, vars, WEB_REFERER).await {
+            Ok(_) => return Ok(()),
+            Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+            Err(e) => eprintln!("finsta: like query failed ({e}); trying the older route"),
+        }
         let action = if like { "like" } else { "unlike" };
         self.post(&format!("web/likes/{}/{action}/", media_pk(media_id)), &[]).await?;
         Ok(())
@@ -661,7 +751,29 @@ impl Client {
         Ok(parse(&v["tray"]).unwrap_or_default())
     }
 
+    /// The stories of the given reels (user ids), the way instagram.com's
+    /// story viewer loads them now; the older route if that fails.
     pub async fn reels_media(&self, reel_ids: &[String]) -> Result<HashMap<String, Reel>> {
+        let vars = json!({"reel_ids_arr": reel_ids, "media_id": null, "is_highlight": false});
+        match self.web_query("PolarisStoriesV3ReelPageStandaloneQuery", vars, WEB_REFERER).await {
+            Ok(data) => {
+                let mut out = HashMap::new();
+                let list = data["xdt_api__v1__feed__reels_media"]["reels_media"].as_array().cloned().unwrap_or_default();
+                for raw in &list {
+                    if let Some(reel) = parse::<Reel>(raw) {
+                        // Keyed like the request: by the owner's id.
+                        let key = if reel_ids.contains(&reel.id) { reel.id.clone() } else { reel.user.pk.clone() };
+                        out.insert(key, reel);
+                    }
+                }
+                if !out.is_empty() || list.is_empty() {
+                    return Ok(out);
+                }
+                eprintln!("finsta: stories query: {} reels, none readable; trying the older route", list.len());
+            }
+            Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+            Err(e) => eprintln!("finsta: stories query failed ({e}); trying the older route"),
+        }
         let mut q: Vec<(&str, String)> = reel_ids.iter().map(|id| ("reel_ids", id.clone())).collect();
         q.push(("source", "reel_feed_timeline".into()));
         let v = self.get("feed/reels_media/", &q).await?;

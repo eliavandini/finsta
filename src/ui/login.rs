@@ -51,15 +51,15 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
             glib::spawn_future_local(async move {
                 let c = client.clone();
                 let res = rt::bg(async move {
-                    c.current_user().await
+                    c.account_username().await
                 })
                 .await;
                 spinner.set_visible(false);
                 content.set_sensitive(true);
                 match res {
-                    Ok(user) => {
+                    Ok(username) => {
                         let mut session = client.session();
-                        session.username = user.username;
+                        session.username = username;
                         if let Err(e) = session.save() {
                             eprintln!("finsta: could not save session: {e:#}");
                         }

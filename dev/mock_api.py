@@ -207,6 +207,22 @@ LIST_DOC = "24000000000000002"
 MESSAGES_DOC = "24000000000000003"
 SEND_DOC = "24000000000000004"
 MARK_DOC = "24000000000000005"
+WEB_DOCS = {"25000000000000001": "PolarisProfilePageContentQuery", "25000000000000002": "PolarisProfilePostsQuery",
+            "25000000000000003": "PolarisStoriesV3ReelPageStandaloneQuery", "25000000000000004": "usePolarisLikeMediaXIGLikeMutation",
+            "25000000000000005": "usePolarisLikeMediaXIGUnlikeMutation"}
+# Saved-style definitions: what the app reads to fill in and fit inputs.
+WEB_MODULES = (
+    '__d("PolarisProfilePostsQuery.graphql",["PolarisProfilePostsQuery_instagramRelayOperation","PolarisShortDramaEnabled.relayprovider"],'
+    '(function(t,n,r,o,a,i){"use strict";var e=(function(){var e={defaultValue:null,kind:"LocalArgument",name:"data"},'
+    't={defaultValue:null,kind:"LocalArgument",name:"username"},r={defaultValue:null,kind:"LocalArgument",name:"first"},'
+    'o={defaultValue:null,kind:"LocalArgument",name:"after"},l={defaultValue:null,kind:"LocalArgument",name:"before"},'
+    's={defaultValue:null,kind:"LocalArgument",name:"last"},u={defaultValue:null,kind:"LocalArgument",name:"__relay_internal__pv__PolarisShortDramaEnabledrelayprovider"};'
+    'return{fragment:{argumentDefinitions:[e,t,r,o,l,s,u]},params:{providedVariables:{__relay_internal__pv__PolarisShortDramaEnabledrelayprovider:n("PolarisShortDramaEnabled.relayprovider")}}}})();a.exports=e}),null);'
+    + "".join(
+        f'__d("usePolarisLikeMediaXIG{kind}Mutation.graphql",["usePolarisLikeMediaXIG{kind}Mutation_instagramRelayOperation"],'
+        '(function(t,n,r,o,a,i){"use strict";var e=(function(){var e={defaultValue:null,kind:"LocalArgument",name:"media_id"};'
+        'return{fragment:{argumentDefinitions:[e]}}})();a.exports=e}),null);' for kind in ("Like", "Unlike"))
+)
 SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read"}
 OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
 EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
@@ -255,6 +271,8 @@ def script(name):
                 '__d("IGDMessageListOffMsysQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MESSAGES_DOC + '"}),null);'
                 '__d("IGDirectTextSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + SEND_DOC + '"}),null);'
                 '__d("useIGDMarkThreadAsReadMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MARK_DOC + '"}),null);'
+                + "".join(f'__d("{n}_instagramRelayOperation",[],(function(a,b,c,d,e,f){{e.exports="{d}"}}),null);' for d, n in WEB_DOCS.items())
+                + WEB_MODULES +
                 '__d("IGDMaxUnreadMessagesCount.relayprovider",[],(function(t,n,r,o,a,i,l){l.get=function(){return 20}}),null);'
                 '__d("useIGDSendText",["IGDirectTextSendMutation.graphql"],(function(t,n,r,o,a,i,l){function s(e){return{ig_thread_igid:e.id,text:e.text}}l.default=s}),98);'
                 '__d("IGDThreadListOffMsysPaginationQuery.graphql",["IGDThreadListOffMsysPaginationQuery_instagramRelayOperation"],(function(t,n,r,o,a,i){"use strict";'
@@ -351,6 +369,50 @@ def slide_answer(op, v):
         sent = msg(f"s{time.time_ns()}", ME_CHAT, 0, v["text"])
         MESSAGES[key].append(sent)
         return {"data": {"xig_direct_text_send_with_slide_messaging_response": {"message_id": sent["mid"], "timestamp_ms": str(sent["ts"]), "id": "x"}}}
+
+
+# ----- instagram.com's current GraphQL for profiles, posts, stories, likes -----
+
+LIKES = {}
+
+
+def nulls(m):
+    """GraphQL spells out absent fields as null."""
+    return {"carousel_media": None, "video_versions": None, "caption": None, "location": None, **m}
+
+
+def web_answer(name, v):
+    pv = {k: x for k, x in v.items() if k.startswith("__relay_internal__pv__")}
+    if name == "PolarisProfilePageContentQuery":
+        u = dict(USERS.get(str(v["id"]), USERS["1001"]))
+        u.update({"pk": str(u["pk"]), "id": str(u["pk"]), "biography": "Photos, mountains & coffee ☕\nBologna 🇮🇹 (GraphQL)",
+                  "external_url": "https://example.com", "follower_count": 1234, "following_count": 321, "media_count": 15,
+                  "hd_profile_pic_url_info": {"url": u["profile_pic_url"]}, "bio_links": [],
+                  "friendship_status": {"following": u["friendship_status"]["following"], "followed_by": True, "outgoing_request": False, "blocking": False}})
+        return {"data": {"user": u}, "extensions": {"is_final": True}}
+    if name == "PolarisProfilePostsQuery":
+        if v.get("data", {}).get("count") != 12 or pv != {"__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False}:
+            return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        pk = next((k for k, u in USERS.items() if u["username"] == v["username"]), "1001")
+        start = int(v["after"]) if v.get("after") else 0
+        count = 12 if start == 0 else 3
+        items = [nulls(media(str(600 + start + i), pk, f"post {start + i} (GraphQL)", 86400 * (i + 1), w=1080, h=1080,
+                             carousel=3 if i % 5 == 1 else None)) for i in range(count)]
+        for m in items:
+            m["has_liked"] = LIKES.get(str(m["pk"]), False)
+        more = start == 0
+        return {"data": {"xdt_api__v1__feed__user_timeline_graphql_connection": {
+            "edges": [{"node": m, "cursor": str(m["pk"])} for m in items],
+            "page_info": {"end_cursor": "12" if more else None, "has_next_page": more, "has_previous_page": False, "start_cursor": None}},
+            "xdt_viewer": {"user": {"id": ME}}}}
+    if name == "PolarisStoriesV3ReelPageStandaloneQuery":
+        reels = [{**reel(i), "id": str(i), "items": [nulls(x) for x in story_items(i, 3)], "cover_media": None, "title": None} for i in v["reel_ids_arr"] if i in USERS]
+        return {"data": {"xdt_api__v1__feed__reels_media": {"reels_media": reels, "unviewable_authors_infos": []}, "xdt_viewer": {"user": {"id": ME}}}}
+    if name.startswith("usePolarisLikeMedia"):
+        if set(v) != {"media_id"}:
+            return {"errors": [{"message": "Variables not declared", "severity": "CRITICAL", "code": 1675030}], "data": None}
+        LIKES[v["media_id"]] = "XIGLike" in name
+        return {"data": {"xdt_mark_media_like" if "XIGLike" in name else "xdt_mark_media_unlike": {"__typename": "XDTEmptyResponse", "success": True}}}
 
 
 def mqtt_string(b, i):
@@ -554,6 +616,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(js)
             return
+        if path == "/api/graphql" and body.get("doc_id", [""])[0] in WEB_DOCS:
+            f = {k: v[0] for k, v in body.items()}
+            v = json.loads(f.get("variables", "{}"))
+            name = WEB_DOCS[f["doc_id"]]
+            with open(sys.argv[2] if len(sys.argv) > 2 else "/dev/null", "a") as log:
+                log.write(f"GRAPHQL {name} variables={v} referer={self.headers.get('Referer')}\n")
+            return self.send_json(web_answer(name, v))
         if path == "/api/graphql" and body.get("doc_id", [""])[0] in SLIDE_DOCS:
             f = {k: v[0] for k, v in body.items()}
             op = SLIDE_DOCS[f["doc_id"]]
@@ -592,6 +661,15 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(page)
             return
         p = path.replace("/api/v1/", "")
+        if OFFMSYS and (p == "users/web_profile_info/" or re.match(r"users/\d+/info/", p)):
+            self.send_response(429)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if OFFMSYS and (re.match(r"feed/user/", p) or re.match(r"web/likes/", p)):
+            return self.send_json({"status": "fail", "message": "mock: gone"}, 404)
+        if OFFMSYS and p == "feed/reels_media/":
+            return self.send_json({"message": "We're sorry, but something went wrong. Please try again.", "status": "fail"}, 500)
         if WWW and re.match(r"users/\d+/info/", p):
             self.send_response(429)
             self.send_header("Content-Length", "0")

@@ -24,6 +24,11 @@ pub fn de_string<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
     })
 }
 
+/// A value that may be `null` (GraphQL answers spell out missing fields).
+pub fn de_or_default<'de, D: Deserializer<'de>, T: Deserialize<'de> + Default>(d: D) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 pub fn de_opt_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
     let s = de_string(d)?;
     Ok(if s.is_empty() { None } else { Some(s) })
@@ -88,7 +93,7 @@ pub struct ImageCandidate {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ImageVersions {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_default")]
     pub candidates: Vec<ImageCandidate>,
 }
 
@@ -279,9 +284,9 @@ impl Media {
 pub struct Reel {
     #[serde(default, deserialize_with = "de_id")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_default")]
     pub user: User,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_or_default")]
     pub items: Vec<Media>,
     #[serde(default, deserialize_with = "de_i64")]
     pub seen: i64,
@@ -735,5 +740,31 @@ impl DmContent {
             DmContent::Disappearing(d) => format!("Sent a disappearing {}", d.kind()),
             DmContent::Info(i) => i.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// instagram.com's GraphQL answers spell out absent fields as null.
+    #[test]
+    fn graphql_shapes_parse() {
+        let post = json!({
+            "pk": "3600000000000000001", "id": "3600000000000000001_42", "code": "Cabc", "media_type": 1,
+            "taken_at": 1700000000, "caption": null, "carousel_media": null, "video_versions": null,
+            "location": null, "like_count": 3, "has_liked": null,
+            "image_versions2": {"candidates": [{"url": "u", "width": 1080, "height": 1350}]},
+            "user": {"pk": "42", "username": "x", "profile_pic_url": "p", "friendship_status": null, "hd_profile_pic_url_info": null},
+        });
+        let m: Media = parse(&post).unwrap();
+        assert_eq!(m.id, "3600000000000000001_42");
+        assert!(m.caption.is_none() && !m.has_liked);
+        let reel = json!({"id": "42", "user": null, "items": null, "seen": null, "latest_reel_media": 5});
+        let r: Reel = parse(&reel).unwrap();
+        assert!(r.items.is_empty() && r.user.pk.is_empty());
+        let r: Reel = parse(&json!({"id": "42", "items": [post], "image_versions2": {"candidates": null}})).unwrap();
+        assert_eq!(r.items.len(), 1);
     }
 }

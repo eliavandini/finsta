@@ -20,7 +20,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::{DmState, time_id};
+use super::{DmState, query, time_id};
 use crate::api::{Client, InboxPage, Recipient, Thread, parse};
 
 const INBOX: &str = "PolarisDirectInboxQuery";
@@ -331,10 +331,12 @@ impl Client {
             .get(name)
             .cloned()
             .ok_or_else(|| anyhow!("instagram.com changed how messages work ({name} is gone)"))?;
-        let answer = self.web_graphql(&cfg, name, &id, &variables).await?;
+        let mut variables = variables;
+        query::fill_providers(name, &mut variables);
+        let answer = self.web_graphql(&cfg, name, &id, &variables, super::INBOX_REFERER).await?;
         let errors = answer.json.as_ref().is_some_and(|v| !v["errors"].is_null() || !v["error"].is_null());
         if st.slide.logged.insert(name.to_string()) || errors {
-            answer.log(name);
+            answer.log("dm", name);
         }
         let Some(v) = answer.json else {
             bail!("Instagram sent an answer Finsta couldn't read");

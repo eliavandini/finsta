@@ -78,12 +78,14 @@ iPhone app, which Instagram now rejects.) That means:
 - It can break whenever Instagram changes its API.
 - Using unofficial clients is against Instagram's terms and could get an
   account flagged. Use it at your own risk.
-- Messages use the same GraphQL requests as instagram.com's own inbox
-  (which no longer runs on the older "Lightspeed" chat protocol). Finsta
-  finds their current ids in the website's scripts once a day, and keeps
-  the website's public code for them in `~/.cache/finsta/webcode/`. This
+- Messages, profiles, profile posts, stories and likes use the same
+  GraphQL requests as instagram.com itself: its older routes for them now
+  fail, and its inbox no longer runs on the "Lightspeed" chat protocol.
+  Finsta finds the requests' current ids in the website's scripts every
+  few days, and keeps the website's public code for them in
+  `~/.cache/finsta/webcode/`. The older routes remain as fallbacks. This
   part is new; it logs the structure of what it can't read (never names or
-  message text) with a `dm:` prefix, visible with
+  message text) with `dm:` and `web:` prefixes, visible with
   `journalctl --user | grep finsta:`.
 - Opening a conversation marks it as read on Instagram, so the other
   person sees "Seen", just like on instagram.com.

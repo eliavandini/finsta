@@ -19,6 +19,7 @@ use reqwest::Method;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
+mod query;
 mod slide;
 
 use super::lightspeed::{self, AttachmentKind, LsAttachment, LsContact, LsMessage, LsThread, Tables};
@@ -670,11 +671,17 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 5;
+const META_SCANNER: u64 = 6;
 
-/// Website code that calls the message operations: saved (to
+/// Website code that calls the operations Finsta uses: saved (to
 /// webcode/callers/) to work out the inputs the website passes them.
-const CALLER_NEEDLES: [&str; 8] = [
+const CALLER_NEEDLES: &[&str] = &[
+    "PolarisProfilePostsQuery",
+    "PolarisProfilePageContentQuery",
+    "PolarisStoriesV3ReelPageStandaloneQuery",
+    "PolarisStoriesV3TrayContainerQuery",
+    "usePolarisLikeMediaXIGLikeMutation",
+    "PolarisAPIReelSeenMutation",
     "IGDirectTextSendMutation",
     "useIGDMarkThreadAsReadMutation",
     "device_id_for_iris_subscription",
@@ -761,18 +768,19 @@ struct GraphqlAnswer {
 }
 
 impl GraphqlAnswer {
-    /// Log the answer's structure: key paths, array sizes and errors, never values.
-    fn log(&self, what: &str) {
+    /// Log the answer's structure: key paths, array sizes and errors, never
+    /// values. `area` prefixes the lines ("dm", "web").
+    fn log(&self, area: &str, what: &str) {
         let Some(v) = &self.json else {
             let kind = if self.html { "an HTML page" } else { "not JSON" };
-            eprintln!("finsta: dm: {what} -> HTTP {}, {} bytes, {kind}", self.status, self.bytes);
+            eprintln!("finsta: {area}: {what} -> HTTP {}, {} bytes, {kind}", self.status, self.bytes);
             return;
         };
         let mut paths = BTreeSet::new();
         key_paths(&v["data"], "data", 14, &mut paths);
         let top: Vec<&String> = v.as_object().map(|o| o.keys().collect()).unwrap_or_default();
         eprintln!(
-            "finsta: dm: {what} -> HTTP {}, {} bytes in {} part(s), keys {top:?}, data {paths:?}",
+            "finsta: {area}: {what} -> HTTP {}, {} bytes in {} part(s), keys {top:?}, data {paths:?}",
             self.status, self.bytes, self.parts
         );
         for e in v["errors"].as_array().into_iter().flatten().take(4) {
@@ -788,7 +796,7 @@ impl GraphqlAnswer {
                 })
                 .collect();
             eprintln!(
-                "finsta: dm: {what} error: code {} severity {} path {path:?} \"{}\" {}",
+                "finsta: {area}: {what} error: code {} severity {} path {path:?} \"{}\" {}",
                 e["code"],
                 e["severity"].as_str().unwrap_or("-"),
                 text("message"),
@@ -798,7 +806,7 @@ impl GraphqlAnswer {
         if !v["error"].is_null() {
             let summary: String = v["errorSummary"].as_str().unwrap_or_default().chars().take(160).collect();
             let description: String = v["errorDescription"].as_str().unwrap_or_default().chars().take(160).collect();
-            eprintln!("finsta: dm: {what} error {}: \"{summary}\" {description}", v["error"]);
+            eprintln!("finsta: {area}: {what} error {}: \"{summary}\" {description}", v["error"]);
         }
     }
 }
@@ -813,7 +821,7 @@ fn webcode_dir() -> Option<std::path::PathBuf> {
 fn interesting_op(name: &str) -> bool {
     [
         "IGD", "useIGD", "IGDirect", "PolarisDirect", "PolarisProfile", "PolarisStor", "PolarisFeed", "PolarisPost",
-        "PolarisUser", "PolarisMedia", "PolarisTimeline",
+        "PolarisUser", "PolarisMedia", "PolarisTimeline", "usePolarisLikeMedia", "usePolarisStoryLikes", "PolarisAPI",
     ]
     .iter()
     .any(|p| name.starts_with(p))
@@ -828,6 +836,7 @@ fn task(label: &str, payload: Value, queue: String) -> (String, Value, String) {
 }
 
 const GRAPHQL_KEY: &str = "graphql/inbox";
+const INBOX_REFERER: &str = "https://www.instagram.com/direct/inbox/";
 
 impl Client {
     fn page_headers(&self) -> HeaderMap {
@@ -1422,7 +1431,14 @@ impl Client {
     /// One of the website's GraphQL operations, sent the way instagram.com
     /// sends it. Returns the first JSON part of the answer (answers with
     /// deferred parts come as several JSON documents, one per line).
-    async fn web_graphql(&self, cfg: &PageConfig, name: &str, doc_id: &str, variables: &Value) -> Result<GraphqlAnswer> {
+    async fn web_graphql(
+        &self,
+        cfg: &PageConfig,
+        name: &str,
+        doc_id: &str,
+        variables: &Value,
+        referer: &str,
+    ) -> Result<GraphqlAnswer> {
         let Some(dtsg) = cfg.dtsg.clone() else {
             bail!("no fb_dtsg token on the inbox page");
         };
@@ -1459,7 +1475,7 @@ impl Client {
                 headers.insert(HeaderName::from_static(k), v);
             }
         };
-        put("referer", "https://www.instagram.com/direct/inbox/");
+        put("referer", referer);
         put("x-fb-friendly-name", name);
         if let Some(lsd) = &cfg.lsd {
             put("x-fb-lsd", lsd);
@@ -1511,8 +1527,8 @@ impl Client {
             "requestPayload": request.to_string(),
             "requestType": 1,
         });
-        let answer = self.web_graphql(&cfg, &name, &doc_id, &variables).await?;
-        answer.log("inbox query");
+        let answer = self.web_graphql(&cfg, &name, &doc_id, &variables, INBOX_REFERER).await?;
+        answer.log("dm", "inbox query");
         let Some(v) = answer.json else { return Ok(false) };
         let mut parsed = ParsedPage::default();
         scan(&v, &mut parsed);
