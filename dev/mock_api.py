@@ -9,6 +9,11 @@ connection. Point Finsta at them too:
 
     FINSTA_WEB_BASE=http://127.0.0.1:8765/ FINSTA_CHAT_URL=ws://127.0.0.1:8765/chat
 
+Like instagram.com today, the inbox page doesn't carry the conversations:
+Finsta finds the GraphQL query that loads them in the inbox worker's
+scripts. Add --embed to put them in the page instead, or --no-graphql to
+make that query fail so they come over the chat connection.
+
 With "www" as the third argument, users/{id}/info/ answers 429, as
 instagram.com did for web sessions in November 2026.
 
@@ -194,20 +199,53 @@ def convo_calls(convos, last=5):
     return out
 
 
+DOC_ID = "7357432314358409"
+EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
+
+
+def base():
+    return f"http://127.0.0.1:{PORT}"
+
+
 def inbox_page():
+    worker = f"{base()}/rsrc.php/v4/yW/r/IGDAWMainV4Worker.js"
     defines = [
-        ["MqttWebConfig", [], {"fbid": ME, "appID": 936619743392459, "endpoint": f"ws://127.0.0.1:{PORT}/chat", "subscribedTopics": []}, 1],
+        # The chat refuses this id (the profile id), so Finsta must fall back to USER_ID.
+        ["MqttWebConfig", [], {"fbid": "99999999999", "appID": 936619743392459, "endpoint": f"ws://127.0.0.1:{PORT}/chat",
+                               "subscribedTopics": [], "capabilities": 10, "chatVisibility": True}, 1],
         ["MqttWebDeviceID", [], {"clientID": "6f1d2c3b-0000-4000-8000-123456789abc"}, 2],
-        ["CurrentUserInitialData", [], {"USER_ID": ME, "ACCOUNT_ID": ME, "IG_USER_EIMU": str(ME_CHAT), "NAME": "Your Name"}, 3],
+        ["CurrentUserInitialData", [], {"USER_ID": str(ME_CHAT), "ACCOUNT_ID": str(ME_CHAT), "IG_USER_EIMU": str(ME_CHAT),
+                                        "NON_FACEBOOK_USER_ID": ME, "NAME": "Your Name", "APP_ID": "936619743392459"}, 3],
+        ["LSPlatformMessengerSyncParams", [], {"mailbox": json.dumps({"locale": "en_US"}), "contact": json.dumps({"locale": "en_US"}), "e2ee": "{}"}, 4],
+        ["DTSGInitialData", [], {"token": "mockdtsg"}, 5],
+        ["LSD", [], {"token": "mocklsd"}, 6],
+        ["SiteData", [], {"server_revision": 1012345678, "haste_session": "20400.HYP:instagram_web_pkg.2.1...0", "hsi": "7400000000000000000",
+                          "__spin_r": 1012345678, "__spin_b": "trunk", "__spin_t": NOW}, 7],
+        ["IGDAWMainV4WebWorkerResource", [], {"url": worker, "name": "IGDAWMainV4"}, 8],
     ]
-    calls = convo_calls(CONVOS) + [("upsertSyncGroupThreadsRange", {0: 1, 1: 1, 2: True})]
-    data = {"require": [["ScheduledServerJS", "handle", None, [{"__bbox": {"define": defines, "require": [
-        ["RelayPrefetchedStreamCache", "next", [], ["adp_inbox", {"__bbox": {"complete": True, "result": {"data": {"viewer": {
-            "lightspeed_web_request_for_igd": {"payload": ls_program(calls), "dependencies": []}}}}}}]]]}}]]]}
-    return (f'<!DOCTYPE html><html><head><title>Inbox • Direct</title></head><body>'
+    require = [["PolarisDirectInboxRoot", "init", [], [{"preloaderID": "adp_PolarisDirectInboxQueryRelayPreloader_6720a2b1c3e5f9_0"}]]]
+    if EMBED:
+        calls = convo_calls(CONVOS) + [("upsertSyncGroupThreadsRange", {0: 1, 1: 1, 2: True})]
+        require.append(["RelayPrefetchedStreamCache", "next", [], ["adp_inbox", {"__bbox": {"complete": True, "result": {"data": {"viewer": {
+            "lightspeed_web_request_for_igd": {"payload": ls_program(calls), "dependencies": []}}}}}}]])
+    data = {"require": [["ScheduledServerJS", "handle", None, [{"__bbox": {"define": defines, "require": require}}]]]}
+    preload = "".join(f'<link rel="preload" href="{base()}/rsrc.php/v4/y{i}/r/bundle{i}.js" as="script">' for i in range(12))
+    return (f'<!DOCTYPE html><html><head><title>Inbox • Direct</title>{preload}</head><body>'
             f'<script type="application/json" data-sjs>{json.dumps(data)}</script>'
-            f'<script>__d("LSVersion",[],(function(a,b,c,d,e,f){{a="{LS_VERSION}";f["default"]=a}}),66);</script>'
             f'</body></html>')
+
+
+def script(name):
+    if name == "IGDAWMainV4Worker.js":
+        return f'self.importScripts("{base()}/rsrc.php/v4/yL/r/LSWorkerBundle.js");'
+    if name == "LSWorkerBundle.js":
+        return ('__d("LSVersion",[],(function(a,b,c,d,e,f){e.exports="' + LS_VERSION + '"}),66);'
+                '__d("LSPlatformGraphQLLightspeedRequestForIGDQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + DOC_ID + '"}),null);')
+    return f'__d("{name[:-3]}",[],(function(a,b,c,d,e,f){{e.exports={{}}}}),null);' * 50
+
+
+def inbox_snapshot():
+    return ls_program(convo_calls(CONVOS) + [("upsertSyncGroupThreadsRange", {0: 1, 1: 1, 2: True})])
 
 
 def mqtt_string(b, i):
@@ -278,6 +316,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.ws_lock = threading.Lock()
         self.chat_log(f"open {self.path} origin={self.headers.get('Origin')} cookie={'sessionid=' in (self.headers.get('Cookie') or '')} ua={self.headers.get('User-Agent')}")
+        try:
+            self.chat_loop()
+        except ConnectionAbortedError:
+            pass
+        self.chat_log("closed")
+
+    def chat_loop(self):
         buf = b""
         while (frame := self.ws_read()) is not None:
             opcode, data = frame
@@ -296,7 +341,6 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 kind, flags, body, buf = buf[0] >> 4, buf[0] & 0x0F, buf[i:i + n], buf[i + n:]
                 self.mqtt(kind, flags, body)
-        self.chat_log("closed")
 
     def mqtt(self, kind, flags, body):
         if kind == 1:  # CONNECT
@@ -305,8 +349,11 @@ class Handler(BaseHTTPRequestHandler):
             client, i = mqtt_string(body, i + 4)
             username, i = mqtt_string(body, i)
             u = json.loads(username)
-            self.chat_log(f"CONNECT {proto} level={level} flags={conn_flags:#x} keepalive={keepalive} client={client} user={u.get('u')} aid={u.get('aid')} d={u.get('d')} keys={sorted(u)}")
-            self.ws_send(bytes([0x20, 0x02, 0x00, 0x00]))
+            ok = u.get("u") == str(ME_CHAT)
+            self.chat_log(f"CONNECT {proto} level={level} flags={conn_flags:#x} keepalive={keepalive} client={client} user={u.get('u')} aid={u.get('aid')} d={u.get('d')} keys={sorted(u)} -> {'ok' if ok else 'refused'}")
+            self.ws_send(bytes([0x20, 0x02, 0x00, 0x00 if ok else 0x05]))
+            if not ok:
+                raise ConnectionAbortedError
         elif kind == 8:  # SUBSCRIBE
             pid, topics, i = body[:2], [], 2
             while i < len(body):
@@ -330,6 +377,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def ls_request(self, req):
         inner = json.loads(req["payload"])
+        if req.get("type") == 1:
+            self.chat_log(f"sync database={inner.get('database')} version={inner.get('version')} cursor={inner.get('last_applied_cursor')} sync_params={inner.get('sync_params')}")
+            payload = inbox_snapshot() if inner.get("database") == 1 else ls_program([])
+            return self.publish("/ls_resp", json.dumps({"request_id": req["request_id"], "payload": payload, "sp": []}))
         calls = []
         for t in inner["tasks"]:
             p = json.loads(t["payload"])
@@ -390,6 +441,29 @@ class Handler(BaseHTTPRequestHandler):
             f.write(f"{method} :{PORT}{path} q={dict(q)} body={body} cookie={self.headers.get('Cookie')} csrf={self.headers.get('X-CSRFToken')} app={self.headers.get('X-IG-App-ID')} xhr={self.headers.get('X-Requested-With')} origin={self.headers.get('Origin')} ua={self.headers.get('User-Agent')}\n")
         if path.startswith("/img/"):
             return self.serve_image(path[5:])
+        if path.startswith("/rsrc.php/"):
+            js = script(path.rsplit("/", 1)[1]).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", str(len(js)))
+            self.end_headers()
+            self.wfile.write(js)
+            return
+        if path == "/api/graphql":
+            f = {k: v[0] for k, v in body.items()}
+            variables = json.loads(f.get("variables", "{}"))
+            req = json.loads(variables.get("requestPayload", "{}"))
+            checks = {"doc": f.get("doc_id") == DOC_ID, "dtsg": f.get("fb_dtsg") == "mockdtsg", "lsd": f.get("lsd") == "mocklsd",
+                      "lsd_header": self.headers.get("X-FB-LSD") == "mocklsd", "name": self.headers.get("X-FB-Friendly-Name"),
+                      "av": f.get("av"), "version": req.get("version"), "database": req.get("database"), "device": variables.get("deviceId"),
+                      "fields": sorted(f)}
+            with open(sys.argv[2] if len(sys.argv) > 2 else "/dev/null", "a") as log:
+                log.write(f"GRAPHQL {checks}\n")
+            if "--no-graphql" in sys.argv or not (checks["doc"] and checks["dtsg"]):
+                return self.send_json({"errors": [{"message": "A server error noncoercible_variable_value occured. Check server logs for details.",
+                                                   "severity": "CRITICAL", "code": 1675030}], "data": None})
+            return self.send_json({"data": {"viewer": {"lightspeed_web_request_for_igd": {"payload": inbox_snapshot(), "dependencies": [], "experiment_value": None}}},
+                                   "extensions": {"is_final": True}})
         if path == "/chat":
             return self.chat()
         if path == "/direct/inbox/":

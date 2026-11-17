@@ -11,17 +11,18 @@
 //! rest of the app already uses. Diagnostics are logged with the `dm:` prefix
 //! and never include names or message text.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
+use reqwest::Method;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use super::lightspeed::{self, AttachmentKind, LsAttachment, LsContact, LsMessage, LsThread, Tables};
 use super::mqtt::Conn;
 use super::{
-    Client, InboxPage, LoginRequired, RateLimited, Recipient, Thread, VERIFY, cooldown_remaining, parse,
+    Client, InboxPage, LoginRequired, RateLimited, Recipient, Thread, VERIFY, WEB_API, cooldown_remaining, parse,
     start_cooldown,
 };
 
@@ -51,10 +52,12 @@ fn time_id() -> i64 {
 #[derive(Default)]
 pub(super) struct DmState {
     config: Option<PageConfig>,
-    page_loaded: Option<Instant>,
     store: Store,
     conn: Option<Conn>,
     last_connect_attempt: Option<Instant>,
+    /// Whether the conversations have been loaded at least once.
+    inbox_loaded: bool,
+    last_sync_attempt: Option<Instant>,
     /// Which payload kinds have had their shapes logged already.
     logged: HashSet<String>,
 }
@@ -65,10 +68,20 @@ struct PageConfig {
     client_id: String,
     endpoint: String,
     version: Option<String>,
-    /// The id the chat connection logs in as.
-    mqtt_user: String,
+    /// (where it came from, id) to log in to the chat connection with, best first.
+    mqtt_users: Vec<(&'static str, String)>,
     /// Ids from the page that could be the viewer's id in the chat system.
     viewer_candidates: HashSet<i64>,
+    /// The GraphQL query that loads the inbox: (name, id).
+    doc: Option<(String, String)>,
+    /// `sync_params` for the inbox database.
+    mailbox_params: String,
+    dtsg: Option<String>,
+    lsd: Option<String>,
+    /// The account GraphQL requests act as ("av").
+    av: String,
+    /// Extra form fields the website sends with its GraphQL requests.
+    site: Vec<(&'static str, String)>,
 }
 
 #[derive(Default)]
@@ -339,6 +352,38 @@ struct ParsedPage {
     /// (key, payload) of every embedded Lightspeed request.
     payloads: Vec<(String, String)>,
     scripts: Vec<String>,
+    /// (name, id) of GraphQL queries the page names together with their ids.
+    queries: Vec<(String, String)>,
+    /// Message-related query and preloader names (diagnostics only).
+    names: BTreeSet<String>,
+    /// Message-related object keys (diagnostics only).
+    dm_keys: BTreeSet<String>,
+}
+
+const DM_WORDS: [&str; 9] = ["Direct", "IGD", "LS", "Lightspeed", "Inbox", "Thread", "Message", "Mqtt", "Mailbox"];
+
+fn is_identifier(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 150 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+}
+
+/// "adp_FooQueryRelayPreloader_64a1b2c3d4e5f_0" -> "adp_FooQueryRelayPreloader"
+fn strip_suffix_ids(s: &str) -> String {
+    let parts: Vec<&str> = s.split('_').collect();
+    let is_id = |p: &&str| {
+        !p.is_empty()
+            && (p.chars().all(|c| c.is_ascii_digit())
+                || (p.len() >= 6 && p.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())))
+    };
+    let keep = parts.iter().rposition(|p| !is_id(p)).map(|i| i + 1).unwrap_or(parts.len());
+    parts[..keep].join("_")
+}
+
+fn digits(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.is_empty() && s.len() <= 25 && s.chars().all(|c| c.is_ascii_digit()) => Some(s.clone()),
+        Value::Number(n) if n.is_u64() => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 fn scan(v: &Value, page: &mut ParsedPage) {
@@ -354,7 +399,24 @@ fn scan(v: &Value, page: &mut ParsedPage) {
             }
         }
         Value::Object(m) => {
+            if let Some(id) = ["queryID", "queryId", "doc_id"].iter().find_map(|k| m.get(*k).and_then(digits)) {
+                let name = ["queryName", "preloaderID", "name", "operationName"]
+                    .iter()
+                    .find_map(|k| m.get(*k)?.as_str())
+                    .filter(|n| is_identifier(n))
+                    .unwrap_or("unnamed");
+                page.queries.push((strip_suffix_ids(name), id));
+            }
             for (k, x) in m {
+                if page.dm_keys.len() < 200 && is_identifier(k) && !k.chars().all(|c| c.is_ascii_digit()) {
+                    let lower = k.to_ascii_lowercase();
+                    if ["lightspeed", "igd", "direct", "inbox", "thread", "message", "mailbox", "mqtt"]
+                        .iter()
+                        .any(|w| lower.contains(w))
+                    {
+                        page.dm_keys.insert(k.clone());
+                    }
+                }
                 if k.starts_with("lightspeed_web_request")
                     && let Some(p) = x["payload"].as_str()
                 {
@@ -362,6 +424,15 @@ fn scan(v: &Value, page: &mut ParsedPage) {
                 }
                 scan(x, page);
             }
+        }
+        Value::String(s)
+            if page.names.len() < 300
+                && is_identifier(s)
+                && (s.starts_with("adp_")
+                    || ["Query", "Mutation", "Subscription", "RelayOperation"].iter().any(|e| s.ends_with(e)))
+                && DM_WORDS.iter().any(|w| s.contains(w)) =>
+        {
+            page.names.insert(strip_suffix_ids(s));
         }
         _ => {}
     }
@@ -375,21 +446,143 @@ fn parse_page(html: &str) -> ParsedPage {
             scan(&v, &mut page);
         }
     }
-    let unescaped = html.replace("\\/", "/");
-    let js = regex::Regex::new(r#"https://static\.cdninstagram\.com/rsrc\.php/[A-Za-z0-9_\-./]+\.js(?:\?[A-Za-z0-9_\-=&.%]*)?"#)
-        .unwrap();
+    page.scripts = script_urls(html);
+    page
+}
+
+/// Script bundle addresses in `text`: the website's (or the mock's, in tests).
+fn script_urls(text: &str) -> Vec<String> {
+    let unescaped = text.replace("\\/", "/");
+    let base = web_base();
+    let local = if base == WEB { String::new() } else { format!("|{}", regex::escape(base.trim_end_matches('/'))) };
+    let js = regex::Regex::new(&format!(
+        r#"(?:https://static\.cdninstagram\.com{local})/rsrc\.php/[A-Za-z0-9_\-./]+\.js(?:\?[A-Za-z0-9_\-=&.%]*)?"#
+    ))
+    .unwrap();
     let mut seen = HashSet::new();
-    for m in js.find_iter(&unescaped) {
-        if seen.insert(m.as_str().to_string()) {
-            page.scripts.push(m.as_str().to_string());
+    js.find_iter(&unescaped).map(|m| m.as_str().to_string()).filter(|u| seen.insert(u.clone())).collect()
+}
+
+/// Whether Finsta may download a script from `url`: only the website's own
+/// hosts (or the mock's).
+fn script_allowed(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else { return false };
+    let host = u.host_str().unwrap_or_default();
+    let base_host = url::Url::parse(&web_base()).ok().and_then(|b| b.host_str().map(str::to_string));
+    (u.scheme() == "https" && (host.ends_with(".cdninstagram.com") || host == "www.instagram.com"))
+        || base_host.as_deref() == Some(host) && web_base() != WEB
+}
+
+/// Script addresses inside a config object (such as a web worker's).
+fn collect_urls(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s)
+            if (s.starts_with("http") || s.starts_with('/'))
+                && (s.contains(".js") || s.contains("rsrc.php") || s.contains("worker")) =>
+        {
+            let url = if s.starts_with('/') { format!("{}{s}", web_base().trim_end_matches('/')) } else { s.clone() };
+            if script_allowed(&url) && !out.contains(&url) {
+                out.push(url);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_urls(x, out)),
+        Value::Object(m) => m.values().for_each(|x| collect_urls(x, out)),
+        _ => {}
+    }
+}
+
+/// A config object's keys with the kind of each value (never the values).
+fn shape(v: &Value) -> String {
+    fn kind(v: &Value) -> &'static str {
+        match v {
+            Value::Null => "null",
+            Value::Bool(_) => "bool",
+            Value::Number(_) => "num",
+            Value::String(s) if s.starts_with("http") || s.starts_with('/') => "url",
+            Value::String(_) => "str",
+            Value::Array(_) => "list",
+            Value::Object(_) => "obj",
         }
     }
-    page
+    match v {
+        Value::Object(m) => m.iter().map(|(k, x)| format!("{k}:{}", kind(x))).collect::<Vec<_>>().join(","),
+        other => kind(other).to_string(),
+    }
+}
+
+/// Object key paths (never values) below `v`, for logging a response's structure.
+fn key_paths(v: &Value, prefix: &str, depth: usize, out: &mut BTreeSet<String>) {
+    if depth == 0 || out.len() > 60 {
+        return;
+    }
+    if let Value::Object(m) = v {
+        for (k, x) in m {
+            let k = if is_identifier(k) && !k.chars().all(|c| c.is_ascii_digit()) { k.as_str() } else { "#" };
+            let path = format!("{prefix}.{k}");
+            if x.is_object() {
+                key_paths(x, &path, depth - 1, out);
+            } else {
+                out.insert(path);
+            }
+        }
+    }
+}
+
+/// Which of the page's ids are the same number, with digit counts only.
+fn id_relations(named: &[(&str, Option<i64>)]) -> String {
+    let mut groups: Vec<(i64, Vec<&str>)> = Vec::new();
+    let mut missing = Vec::new();
+    for (name, v) in named {
+        match v {
+            Some(v) => match groups.iter_mut().find(|(g, _)| g == v) {
+                Some((_, names)) => names.push(name),
+                None => groups.push((*v, vec![name])),
+            },
+            None => missing.push(*name),
+        }
+    }
+    let mut parts: Vec<String> =
+        groups.iter().map(|(v, names)| format!("{} ({} digits)", names.join("="), v.to_string().len())).collect();
+    if !missing.is_empty() {
+        parts.push(format!("missing: {}", missing.join(",")));
+    }
+    parts.join("; ")
+}
+
+/// A short, printable excerpt of the website's own code around `needle`.
+fn snippet(text: &str, needle: &str) -> Option<String> {
+    let i = text.find(needle)?;
+    let mut start = i.saturating_sub(40);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (i + 160).min(text.len());
+    while !text.is_char_boundary(end) {
+        end += 1;
+    }
+    Some(text[start..end].chars().map(|c| if c.is_ascii_graphic() || c == ' ' { c } else { '.' }).collect())
 }
 
 fn find_version(text: &str) -> Option<String> {
     let re = regex::Regex::new(r#"__d\("LSVersion"[\s\S]{0,80}?"(\d{10,25})""#).unwrap();
     re.captures(text).map(|c| c[1].to_string())
+}
+
+/// The GraphQL query that loads the inbox: (name, id). Prefers Instagram's own variant.
+fn find_doc(text: &str) -> Option<(String, String)> {
+    let re = regex::Regex::new(
+        r#"__d\("(LSPlatformGraphQLLightspeedRequest(?:ForIGD)?Query)_[A-Za-z]*RelayOperation"[\s\S]{0,80}?"(\d{8,25})""#,
+    )
+    .unwrap();
+    let mut best = None;
+    for c in re.captures_iter(text) {
+        let found = (c[1].to_string(), c[2].to_string());
+        if found.0.ends_with("ForIGDQuery") {
+            return Some(found);
+        }
+        best.get_or_insert(found);
+    }
+    best
 }
 
 fn numeric(v: &Value) -> Option<i64> {
@@ -400,33 +593,68 @@ fn numeric(v: &Value) -> Option<i64> {
     }
 }
 
+fn scalar(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// Details from the website's scripts: the protocol version and the inbox query.
+#[derive(Clone, Default)]
+struct Meta {
+    version: Option<String>,
+    doc: Option<(String, String)>,
+}
+
+/// Bumped when the way scripts are searched changes, so old results are redone.
+const META_SCANNER: u64 = 2;
+
 fn version_cache_path() -> Option<std::path::PathBuf> {
     Some(dirs::cache_dir()?.join("finsta").join("lightspeed.json"))
 }
 
-fn cached_version() -> Option<String> {
-    let text = std::fs::read_to_string(version_cache_path()?).ok()?;
-    let v: Value = serde_json::from_str(&text).ok()?;
-    let saved = v["saved"].as_u64()?;
-    let age = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs().saturating_sub(saved);
-    if age > 24 * 3600 {
-        return None;
-    }
-    v["version"].as_str().map(str::to_string)
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn save_version(version: &str) {
+fn cached_meta() -> Option<Meta> {
+    let text = std::fs::read_to_string(version_cache_path()?).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    if v["scanner"].as_u64() != Some(META_SCANNER) || now_secs().saturating_sub(v["saved"].as_u64()?) > 24 * 3600 {
+        return None;
+    }
+    Some(Meta {
+        version: v["version"].as_str().map(str::to_string),
+        doc: v["doc_name"].as_str().zip(v["doc_id"].as_str()).map(|(a, b)| (a.to_string(), b.to_string())),
+    })
+}
+
+fn save_meta(meta: &Meta) {
     let Some(path) = version_cache_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let saved = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let _ = std::fs::write(path, json!({"version": version, "saved": saved}).to_string());
+    let v = json!({
+        "scanner": META_SCANNER,
+        "saved": now_secs(),
+        "version": meta.version,
+        "doc_name": meta.doc.as_ref().map(|d| &d.0),
+        "doc_id": meta.doc.as_ref().map(|d| &d.1),
+    });
+    let _ = std::fs::write(path, v.to_string());
+}
+
+fn found<T>(x: &Option<T>) -> &'static str {
+    if x.is_some() { "found" } else { "unknown" }
 }
 
 fn task(label: &str, payload: Value, queue: String) -> (String, Value, String) {
     (label.to_string(), payload, queue)
 }
+
+const GRAPHQL_KEY: &str = "graphql/inbox";
 
 impl Client {
     fn page_headers(&self) -> HeaderMap {
@@ -495,21 +723,56 @@ impl Client {
         Ok(html)
     }
 
-    /// The Lightspeed protocol version, needed for every chat request. It's
-    /// defined in one of the website's scripts, so look there (once a day).
-    async fn ls_version(&self, html: &str, scripts: &[String]) -> Option<String> {
-        if let Some(v) = find_version(html) {
+    /// The protocol version (needed for every chat request) and the id of the
+    /// GraphQL query that loads the inbox. Both live in the website's scripts,
+    /// which change with every release, so they're looked up once a day.
+    async fn ls_meta(&self, html: &str, page: &ParsedPage, worker_urls: Vec<String>) -> Meta {
+        let mut meta = Meta {
+            version: find_version(html),
+            doc: find_doc(html)
+                .or_else(|| page.queries.iter().find(|(n, _)| n.contains("LightspeedRequest")).cloned()),
+        };
+        if meta.version.is_some() {
             eprintln!("finsta: dm: protocol version found in the page");
-            save_version(&v);
-            return Some(v);
         }
-        if let Some(v) = cached_version() {
-            return Some(v);
+        if let Some((name, _)) = &meta.doc {
+            eprintln!("finsta: dm: inbox query ({name}) found in the page");
         }
+        if meta.version.is_some() && meta.doc.is_some() {
+            save_meta(&meta);
+            return meta;
+        }
+        if let Some(c) = cached_meta() {
+            eprintln!(
+                "finsta: dm: using saved script details (version {}, inbox query {})",
+                found(&c.version),
+                found(&c.doc)
+            );
+            meta.version = meta.version.or(c.version);
+            meta.doc = meta.doc.or(c.doc);
+            return meta;
+        }
+
         let ua = self.user_agent();
-        let mut checked = 0;
-        for chunk in scripts.iter().take(160).collect::<Vec<_>>().chunks(6) {
-            let fetches = chunk.iter().map(|url| {
+        let workers: HashSet<String> = worker_urls.iter().cloned().collect();
+        let mut queue: VecDeque<String> = worker_urls.into_iter().collect();
+        queue.extend(page.scripts.iter().cloned());
+        let mut seen: HashSet<String> = HashSet::new();
+        let (mut checked, mut failed, mut bytes) = (0usize, 0usize, 0usize);
+        let (mut version_mentions, mut doc_mentions) = (0usize, 0usize);
+        let (mut version_snippet, mut doc_snippet) = (None, None);
+        while checked + failed < 1000 {
+            let mut batch = Vec::new();
+            while batch.len() < 8 {
+                let Some(u) = queue.pop_front() else { break };
+                if script_allowed(&u) && seen.insert(u.clone()) {
+                    batch.push(u);
+                }
+            }
+            if batch.is_empty() {
+                break;
+            }
+            let fetches = batch.iter().map(|url| {
                 let req = self
                     .inner
                     .http
@@ -520,96 +783,235 @@ impl Client {
                     .header("sec-fetch-dest", "script")
                     .header("sec-fetch-mode", "no-cors")
                     .header("sec-fetch-site", "cross-site");
-                async move { req.send().await.ok()?.text().await.ok() }
+                async move {
+                    let r = req.send().await.ok()?;
+                    if !r.status().is_success() {
+                        return None;
+                    }
+                    r.text().await.ok()
+                }
             });
-            for text in futures_util::future::join_all(fetches).await.into_iter().flatten() {
+            let results = futures_util::future::join_all(fetches).await;
+            let mut next = Vec::new();
+            for (url, text) in batch.iter().zip(results) {
+                let Some(text) = text else {
+                    failed += 1;
+                    continue;
+                };
                 checked += 1;
-                if let Some(v) = find_version(&text) {
-                    eprintln!("finsta: dm: protocol version found in script {checked}/{}", scripts.len());
-                    save_version(&v);
-                    return Some(v);
+                bytes += text.len();
+                let worker = workers.contains(url);
+                let place = if worker { "the inbox worker's script".to_string() } else { format!("script {checked}") };
+                if meta.version.is_none()
+                    && let Some(v) = find_version(&text)
+                {
+                    eprintln!("finsta: dm: protocol version found in {place}");
+                    meta.version = Some(v);
+                }
+                if meta.doc.is_none()
+                    && let Some(d) = find_doc(&text)
+                {
+                    eprintln!("finsta: dm: inbox query ({}) found in {place}", d.0);
+                    meta.doc = Some(d);
+                }
+                if text.contains("LSVersion") {
+                    version_mentions += 1;
+                    version_snippet = version_snippet.or_else(|| snippet(&text, "LSVersion"));
+                }
+                if text.contains("LightspeedRequest") {
+                    doc_mentions += 1;
+                    doc_snippet = doc_snippet.or_else(|| snippet(&text, "LightspeedRequest"));
+                }
+                if worker {
+                    let inner = script_urls(&text);
+                    eprintln!("finsta: dm: the inbox worker's script refers to {} more scripts", inner.len());
+                    next.extend(inner);
                 }
             }
+            for u in next.into_iter().rev() {
+                queue.push_front(u);
+            }
+            if meta.version.is_some() && meta.doc.is_some() {
+                break;
+            }
         }
-        eprintln!("finsta: dm: protocol version not found in {checked} of {} scripts", scripts.len());
-        None
+        eprintln!(
+            "finsta: dm: searched {checked} scripts ({:.1} MB, {failed} failed, {} left): LSVersion in {version_mentions}, LightspeedRequest in {doc_mentions}",
+            bytes as f64 / 1e6,
+            queue.len()
+        );
+        if meta.version.is_none()
+            && let Some(s) = version_snippet
+        {
+            eprintln!("finsta: dm: website code around LSVersion: {s}");
+        }
+        if meta.doc.is_none()
+            && let Some(s) = doc_snippet
+        {
+            eprintln!("finsta: dm: website code around LightspeedRequest: {s}");
+        }
+        save_meta(&meta);
+        meta
     }
 
-    /// Load (or reload) the inbox page: the conversations it carries and the
-    /// chat settings.
+    /// Read the chat settings from the inbox page (and log their structure).
+    async fn page_config(&self, html: &str, page: &ParsedPage) -> PageConfig {
+        let def = |name: &str| page.defines.get(name).cloned().unwrap_or(Value::Null);
+        let shape_of = |name: &str| page.defines.get(name).map(shape).unwrap_or_else(|| "missing".into());
+        let interesting: BTreeSet<&String> = page
+            .defines
+            .keys()
+            .filter(|k| {
+                ["Mqtt", "LS", "Lightspeed", "CurrentUser", "Version", "IGD", "Direct", "DTSG", "Worker", "SiteData"]
+                    .iter()
+                    .any(|p| k.contains(p))
+            })
+            .collect();
+        eprintln!(
+            "finsta: dm: inbox page: {} bytes, {} config modules, {} scripts, payloads {:?}",
+            html.len(),
+            page.defines.len(),
+            page.scripts.len(),
+            page.payloads.iter().map(|(k, p)| format!("{k} ({} bytes)", p.len())).collect::<Vec<_>>()
+        );
+        eprintln!("finsta: dm: config modules of interest: {interesting:?}");
+        for name in [
+            "MqttWebConfig",
+            "LSPlatformMessengerSyncParams",
+            "IGDAWMainV4WebWorkerResource",
+            "IGDMqttWebDeviceID",
+            "LSPlatformDGWHostnameOverride",
+            "DTSGInitialData",
+            "LSD",
+            "SiteData",
+        ] {
+            eprintln!("finsta: dm: {name}: {}", shape_of(name));
+        }
+        eprintln!("finsta: dm: message-related names in the page: {:?}", page.names);
+        eprintln!("finsta: dm: message-related keys in the page: {:?}", page.dm_keys);
+        let queries: BTreeSet<&String> = page.queries.iter().map(|(n, _)| n).take(80).collect();
+        eprintln!("finsta: dm: queries with ids in the page: {queries:?}");
+
+        let mqtt = def("MqttWebConfig");
+        let user = def("CurrentUserInitialData");
+        let pk: Option<i64> = self.user_id().parse().ok();
+        let named = [
+            ("MqttWebConfig.fbid", numeric(&mqtt["fbid"])),
+            ("USER_ID", numeric(&user["USER_ID"])),
+            ("ACCOUNT_ID", numeric(&user["ACCOUNT_ID"])),
+            ("IG_USER_EIMU", numeric(&user["IG_USER_EIMU"])),
+            ("NON_FACEBOOK_USER_ID", numeric(&user["NON_FACEBOOK_USER_ID"])),
+            ("ds_user_id", pk),
+        ];
+        eprintln!("finsta: dm: ids: {}", id_relations(&named));
+        let mut mqtt_users: Vec<(&'static str, String)> = Vec::new();
+        for (label, v) in [named[0], named[1], named[3], named[5]] {
+            if let Some(v) = v.filter(|v| *v > 0).map(|v| v.to_string())
+                && !mqtt_users.iter().any(|(_, u)| *u == v)
+            {
+                mqtt_users.push((label, v));
+            }
+        }
+        let av = [named[3].1, named[0].1, named[2].1, named[1].1]
+            .into_iter()
+            .flatten()
+            .find(|v| *v > 0)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "0".into());
+        let mut candidates: HashSet<i64> =
+            user.as_object().map(|o| o.values().filter_map(numeric).collect()).unwrap_or_default();
+        candidates.extend(named.iter().filter_map(|(_, v)| *v));
+
+        let sync = def("LSPlatformMessengerSyncParams");
+        let mailbox_params = sync["mailbox"]
+            .as_str()
+            .filter(|s| serde_json::from_str::<Value>(s).is_ok_and(|v| v.is_object()))
+            .map(str::to_string)
+            .unwrap_or_else(|| json!({"locale": "en_US"}).to_string());
+        let mailbox_keys = serde_json::from_str::<Value>(&mailbox_params)
+            .ok()
+            .and_then(|v| v.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()))
+            .unwrap_or_default();
+        eprintln!(
+            "finsta: dm: inbox sync settings {} (keys {mailbox_keys:?})",
+            if sync["mailbox"].is_string() { "from the page" } else { "assumed" }
+        );
+
+        let dtsg = ["DTSGInitialData", "DTSGInitData"].iter().find_map(|n| scalar(&def(n)["token"]));
+        let lsd = scalar(&def("LSD")["token"]);
+        let site_data = def("SiteData");
+        let site: Vec<(&'static str, String)> = [
+            ("__spin_r", "__spin_r"),
+            ("__spin_b", "__spin_b"),
+            ("__spin_t", "__spin_t"),
+            ("__hs", "haste_session"),
+            ("__hsi", "hsi"),
+            ("__rev", "server_revision"),
+        ]
+        .into_iter()
+        .filter_map(|(field, key)| scalar(&site_data[key]).map(|v| (field, v)))
+        .collect();
+        eprintln!(
+            "finsta: dm: request tokens: fb_dtsg {}, lsd {}, site fields {}",
+            found(&dtsg),
+            found(&lsd),
+            site.len()
+        );
+
+        let mut worker_urls = Vec::new();
+        for (name, v) in &page.defines {
+            if name.contains("Worker") && (name.contains("IGD") || name.contains("LS")) {
+                collect_urls(v, &mut worker_urls);
+            }
+        }
+        eprintln!("finsta: dm: {} inbox worker script(s) to search first", worker_urls.len());
+        let meta = self.ls_meta(html, page, worker_urls).await;
+
+        PageConfig {
+            app_id: numeric(&mqtt["appID"]).unwrap_or(DEFAULT_APP_ID),
+            client_id: ["MqttWebDeviceID", "IGDMqttWebDeviceID"]
+                .iter()
+                .find_map(|n| def(n)["clientID"].as_str().map(str::to_string))
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            endpoint: mqtt["endpoint"].as_str().unwrap_or_default().to_string(),
+            version: meta.version,
+            mqtt_users,
+            viewer_candidates: candidates,
+            doc: meta.doc,
+            mailbox_params,
+            dtsg,
+            lsd,
+            av,
+            site,
+        }
+    }
+
+    /// Load (or reload) the inbox page: its chat settings, and the
+    /// conversations if it still carries them.
     async fn dm_load_page(&self, st: &mut DmState) -> Result<()> {
         let html = self.load_inbox_page().await?;
         let page = parse_page(&html);
-        st.page_loaded = Some(Instant::now());
-
         if st.config.is_none() {
-            let interesting: Vec<&String> = page
-                .defines
-                .keys()
-                .filter(|k| {
-                    ["Mqtt", "LS", "Lightspeed", "CurrentUser", "Version", "IGD", "Direct", "DTSG"]
-                        .iter()
-                        .any(|p| k.contains(p))
-                })
-                .collect();
-            let keys = |name: &str| {
-                page.defines
-                    .get(name)
-                    .and_then(Value::as_object)
-                    .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
-                    .unwrap_or_else(|| "missing".into())
-            };
-            eprintln!(
-                "finsta: dm: inbox page: {} bytes, {} config modules, {} scripts, payloads {:?}",
-                html.len(),
-                page.defines.len(),
-                page.scripts.len(),
-                page.payloads.iter().map(|(k, p)| format!("{k} ({} bytes)", p.len())).collect::<Vec<_>>()
-            );
-            eprintln!("finsta: dm: config modules of interest: {interesting:?}");
-            eprintln!("finsta: dm: MqttWebConfig keys: {}", keys("MqttWebConfig"));
-            eprintln!("finsta: dm: MqttWebDeviceID keys: {}", keys("MqttWebDeviceID"));
-            eprintln!("finsta: dm: CurrentUserInitialData keys: {}", keys("CurrentUserInitialData"));
-
-            let mqtt = page.defines.get("MqttWebConfig").cloned().unwrap_or_default();
-            let user = page.defines.get("CurrentUserInitialData").cloned().unwrap_or_default();
-            let mut candidates: HashSet<i64> = user
-                .as_object()
-                .map(|o| o.values().filter_map(numeric).collect())
-                .unwrap_or_default();
-            if let Ok(pk) = self.user_id().parse::<i64>() {
-                candidates.insert(pk);
-            }
-            let mqtt_user = numeric(&user["USER_ID"])
-                .or_else(|| numeric(&mqtt["fbid"]))
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| self.user_id());
-            st.config = Some(PageConfig {
-                app_id: numeric(&mqtt["appID"]).unwrap_or(DEFAULT_APP_ID),
-                client_id: page.defines.get("MqttWebDeviceID").and_then(|d| d["clientID"].as_str()).map(str::to_string)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                endpoint: mqtt["endpoint"].as_str().unwrap_or_default().to_string(),
-                version: self.ls_version(&html, &page.scripts).await,
-                mqtt_user,
-                viewer_candidates: candidates,
-            });
+            st.config = Some(self.page_config(&html, &page).await);
         }
-
-        if page.payloads.is_empty() {
-            bail!("Couldn't find your conversations on instagram.com's inbox page");
+        if page.payloads.is_empty() && !st.inbox_loaded {
+            eprintln!("finsta: dm: the inbox page carries no conversations; fetching them separately");
         }
         for (key, payload) in &page.payloads {
-            self.dm_apply_payload(st, payload, &format!("page {key}"));
+            if self.dm_apply_payload(st, payload, &format!("page {key}")) {
+                st.inbox_loaded = true;
+            }
         }
         Ok(())
     }
 
-    fn dm_apply_payload(&self, st: &mut DmState, payload: &str, what: &str) {
+    /// Apply a Lightspeed payload; false if it couldn't be read at all.
+    fn dm_apply_payload(&self, st: &mut DmState, payload: &str, what: &str) -> bool {
         let calls = match lightspeed::decode(payload) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("finsta: dm: {what}: payload isn't readable: {e}");
-                return;
+                return false;
             }
         };
         let tables = Tables::from_calls(&calls);
@@ -624,9 +1026,10 @@ impl Client {
         }
         st.store.apply(tables);
         st.store.detect_viewer(&candidates);
+        !calls.is_empty()
     }
 
-    fn dm_apply_response(&self, st: &mut DmState, v: &Value, what: &str) {
+    fn dm_apply_response(&self, st: &mut DmState, v: &Value, what: &str) -> bool {
         match v["payload"].as_str() {
             Some(p) if !p.is_empty() => self.dm_apply_payload(st, p, what),
             _ => {
@@ -634,6 +1037,7 @@ impl Client {
                     let keys = v.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
                     eprintln!("finsta: dm: {what}: answer without payload, keys {keys:?}");
                 }
+                false
             }
         }
     }
@@ -645,7 +1049,8 @@ impl Client {
         }
     }
 
-    /// Make sure the page has been loaded and the chat connection is up (if possible).
+    /// Make sure the page has been loaded, the chat connection is up (if
+    /// possible) and the conversations have been fetched.
     async fn dm_ensure(&self, st: &mut DmState) -> Result<()> {
         if st.config.is_none() {
             self.dm_load_page(st).await?;
@@ -664,14 +1069,182 @@ impl Client {
             }
         }
         self.dm_drain(st);
+        if !st.inbox_loaded && st.last_sync_attempt.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+            st.last_sync_attempt = Some(Instant::now());
+            self.dm_initial_sync(st).await?;
+        }
+        if !st.inbox_loaded {
+            bail!("Couldn't load your conversations from instagram.com");
+        }
         Ok(())
+    }
+
+    /// Fetch the conversations the way the website does once its inbox page
+    /// has loaded: with a GraphQL query, or else over the chat connection.
+    async fn dm_initial_sync(&self, st: &mut DmState) -> Result<()> {
+        match self.dm_graphql_sync(st).await {
+            Ok(true) => {
+                st.inbox_loaded = true;
+                return Ok(());
+            }
+            Ok(false) => {}
+            Err(e) if e.is::<RateLimited>() || e.is::<LoginRequired>() => return Err(e),
+            Err(e) => eprintln!("finsta: dm: inbox query failed: {e:#}"),
+        }
+        match self.dm_socket_sync(st, 1).await {
+            Ok(true) => st.inbox_loaded = true,
+            Ok(false) => {}
+            Err(e) => eprintln!("finsta: dm: inbox sync over the chat connection failed: {e:#}"),
+        }
+        Ok(())
+    }
+
+    fn sync_request(cfg: &PageConfig, database: i64) -> Value {
+        let mut p = json!({
+            "database": database,
+            "epoch_id": time_id(),
+            "failure_count": null,
+            "last_applied_cursor": null,
+            "sync_params": cfg.mailbox_params,
+        });
+        if let Some(v) = cfg.version.as_ref().and_then(|v| v.parse::<i64>().ok()) {
+            p["version"] = v.into();
+        }
+        p
+    }
+
+    /// The website's "LSPlatformGraphQLLightspeedRequestForIGDQuery".
+    async fn dm_graphql_sync(&self, st: &mut DmState) -> Result<bool> {
+        let cfg = st.config.clone().ok_or_else(|| anyhow!("inbox not loaded"))?;
+        let Some((name, doc_id)) = cfg.doc.clone() else {
+            eprintln!("finsta: dm: skipping the inbox query: its id is unknown");
+            return Ok(false);
+        };
+        let Some(dtsg) = cfg.dtsg.clone() else {
+            eprintln!("finsta: dm: skipping the inbox query: no fb_dtsg token on the page");
+            return Ok(false);
+        };
+        if cooldown_remaining(GRAPHQL_KEY).is_some() {
+            return Err(RateLimited.into());
+        }
+        let mut request = Self::sync_request(&cfg, 1);
+        request.as_object_mut().map(|o| o.remove("failure_count"));
+        let variables = json!({
+            "deviceId": cfg.client_id,
+            "includeChatVisibility": false,
+            "requestId": 0,
+            "requestPayload": request.to_string(),
+            "requestType": 1,
+        });
+        let jazoest = format!("2{}", dtsg.bytes().map(u32::from).sum::<u32>());
+        let mut form: Vec<(&str, String)> = vec![
+            ("av", cfg.av.clone()),
+            ("__d", "www".into()),
+            ("__user", "0".into()),
+            ("__a", "1".into()),
+            ("__req", "1".into()),
+            ("dpr", "1".into()),
+            ("__ccg", "GOOD".into()),
+            ("__comet_req", "7".into()),
+            ("fb_dtsg", dtsg),
+            ("jazoest", jazoest),
+        ];
+        if let Some(lsd) = &cfg.lsd {
+            form.push(("lsd", lsd.clone()));
+        }
+        form.extend(cfg.site.iter().map(|(k, v)| (*k, v.clone())));
+        form.extend([
+            ("fb_api_caller_class", "RelayModern".to_string()),
+            ("fb_api_req_friendly_name", name.clone()),
+            ("variables", variables.to_string()),
+            ("server_timestamps", "true".to_string()),
+            ("doc_id", doc_id),
+        ]);
+        let mut headers = self.headers(&Method::POST, WEB_API);
+        let mut put = |k: &'static str, v: &str| {
+            if let Ok(v) = HeaderValue::from_str(v) {
+                headers.insert(HeaderName::from_static(k), v);
+            }
+        };
+        put("referer", "https://www.instagram.com/direct/inbox/");
+        put("x-fb-friendly-name", &name);
+        if let Some(lsd) = &cfg.lsd {
+            put("x-fb-lsd", lsd);
+        }
+        let resp = self.inner.http.post(format!("{}api/graphql", web_base())).headers(headers).form(&form).send().await?;
+        let status = resp.status();
+        let location = resp.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+        self.absorb_headers(resp.headers());
+        let text = resp.text().await?;
+        if status.as_u16() == 429 {
+            eprintln!("finsta: dm: inbox query -> HTTP 429");
+            start_cooldown(GRAPHQL_KEY, None);
+            return Err(RateLimited.into());
+        }
+        if status.is_redirection() {
+            let path = location.split('?').next().unwrap_or_default();
+            eprintln!("finsta: dm: inbox query -> HTTP {status} {path}");
+            if path.contains("/challenge") || path.contains("/checkpoint") {
+                bail!(VERIFY);
+            }
+            if path.contains("/accounts/login") {
+                return Err(LoginRequired.into());
+            }
+            return Ok(false);
+        }
+        let body = text.trim_start().trim_start_matches("for (;;);");
+        let Ok(v) = serde_json::from_str::<Value>(body) else {
+            let kind = if body.trim_start().starts_with('<') { "an HTML page" } else { "not JSON" };
+            eprintln!("finsta: dm: inbox query -> HTTP {status}, {} bytes, {kind}", text.len());
+            return Ok(false);
+        };
+        let mut paths = BTreeSet::new();
+        key_paths(&v["data"], "data", 4, &mut paths);
+        let top: Vec<&String> = v.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+        eprintln!("finsta: dm: inbox query -> HTTP {status}, {} bytes, keys {top:?}, data {paths:?}", text.len());
+        for e in v["errors"].as_array().into_iter().flatten().take(3) {
+            let msg: String = e["message"].as_str().unwrap_or_default().chars().take(140).collect();
+            eprintln!(
+                "finsta: dm: inbox query error: code {} severity {} \"{msg}\"",
+                e["code"],
+                e["severity"].as_str().unwrap_or("-")
+            );
+        }
+        if !v["error"].is_null() {
+            let summary: String = v["errorSummary"].as_str().unwrap_or_default().chars().take(140).collect();
+            eprintln!("finsta: dm: inbox query error {}: \"{summary}\"", v["error"]);
+        }
+        let mut parsed = ParsedPage::default();
+        scan(&v, &mut parsed);
+        let mut ok = false;
+        for (key, payload) in &parsed.payloads {
+            ok |= self.dm_apply_payload(st, payload, &format!("inbox query {key}"));
+        }
+        Ok(ok)
+    }
+
+    /// Ask for a whole database over the chat connection (a "sync" request).
+    async fn dm_socket_sync(&self, st: &mut DmState, database: i64) -> Result<bool> {
+        let cfg = st.config.clone().ok_or_else(|| anyhow!("inbox not loaded"))?;
+        let Some(conn) = st.conn.as_ref().filter(|c| c.is_alive()) else {
+            eprintln!("finsta: dm: skipping the chat sync: not connected");
+            return Ok(false);
+        };
+        let msg = json!({
+            "app_id": cfg.app_id.to_string(),
+            "payload": Self::sync_request(&cfg, database).to_string(),
+            "request_id": conn.next_request_id(),
+            "type": 1,
+        });
+        let answer = conn.request(&msg, Duration::from_secs(20)).await?;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let ok = self.dm_apply_response(st, &answer, &format!("sync {database}"));
+        self.dm_drain(st);
+        Ok(ok)
     }
 
     async fn dm_connect(&self, st: &DmState) -> Result<Conn> {
         let cfg = st.config.clone().ok_or_else(|| anyhow!("inbox not loaded"))?;
-        let Some(version) = cfg.version.clone() else {
-            bail!("the protocol version is unknown");
-        };
         let mut url = match std::env::var("FINSTA_CHAT_URL") {
             Ok(u) => url::Url::parse(&u)?,
             Err(_) => url::Url::parse(&cfg.endpoint)
@@ -690,30 +1263,12 @@ impl Client {
         if !has(&url, "cid") {
             url.query_pairs_mut().append_pair("cid", &cfg.client_id);
         }
-        eprintln!("finsta: dm: connecting to {}{}", url.host_str().unwrap_or_default(), url.path());
-        let username = json!({
-            "u": cfg.mqtt_user,
-            "s": sid,
-            "cp": 3,
-            "ecp": 10,
-            "chat_on": true,
-            "fg": true,
-            "d": cfg.client_id,
-            "ct": "websocket",
-            "mqtt_sid": "",
-            "aid": cfg.app_id,
-            "st": [],
-            "pm": [],
-            "dc": "",
-            "no_auto_fg": true,
-            "gas": null,
-            "pack": [],
-            "php_override": "",
-            "p": null,
-            "a": self.user_agent(),
-            "aids": null,
-        })
-        .to_string();
+        eprintln!(
+            "finsta: dm: connecting to {}{} (protocol version {})",
+            url.host_str().unwrap_or_default(),
+            url.path(),
+            found(&cfg.version)
+        );
         let headers = [
             ("origin", "https://www.instagram.com".to_string()),
             ("user-agent", self.user_agent()),
@@ -722,16 +1277,49 @@ impl Client {
             ("cache-control", "no-cache".to_string()),
             ("pragma", "no-cache".to_string()),
         ];
-        let conn = Conn::connect(
-            url.as_str(),
-            &headers,
-            "mqttwsclient",
-            &username,
-            &["/ls_foreground_state", "/ls_resp"],
-        )
-        .await?;
-        conn.publish("/ls_app_settings", &json!({"ls_fdid": "", "ls_sv": version}).to_string())?;
-        Ok(conn)
+        let mut last_err = anyhow!("no id to log in to the chat with");
+        for (label, user) in &cfg.mqtt_users {
+            let username = json!({
+                "u": user,
+                "s": sid,
+                "cp": 3,
+                "ecp": 10,
+                "chat_on": true,
+                "fg": true,
+                "d": cfg.client_id,
+                "ct": "websocket",
+                "mqtt_sid": "",
+                "aid": cfg.app_id,
+                "st": [],
+                "pm": [],
+                "dc": "",
+                "no_auto_fg": true,
+                "gas": null,
+                "pack": [],
+                "php_override": "",
+                "p": null,
+                "a": self.user_agent(),
+                "aids": null,
+            })
+            .to_string();
+            match Conn::connect(url.as_str(), &headers, "mqttwsclient", &username, &["/ls_foreground_state", "/ls_resp"])
+                .await
+            {
+                Ok(conn) => {
+                    eprintln!("finsta: dm: chat login accepted as {label}");
+                    if let Some(v) = &cfg.version {
+                        conn.publish("/ls_app_settings", &json!({"ls_fdid": "", "ls_sv": v}).to_string())?;
+                    }
+                    return Ok(conn);
+                }
+                Err(e) if format!("{e:#}").contains("refused") => {
+                    eprintln!("finsta: dm: chat login as {label}: {e:#}");
+                    last_err = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err)
     }
 
     /// Run tasks on the chat connection and apply what comes back.
@@ -812,10 +1400,11 @@ impl Client {
                         "cursor": null, "messaging_tag": null, "sync_group": 1,
                     });
                     let _ = self.dm_tasks(&mut st, "refresh conversations", vec![task("145", payload, "trq".into())]).await;
-                } else if st.page_loaded.is_none_or(|t| t.elapsed() > Duration::from_secs(300))
-                    && let Err(e) = self.dm_load_page(&mut st).await
-                {
-                    eprintln!("finsta: dm: reloading the inbox failed: {e:#}");
+                } else if st.last_sync_attempt.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
+                    st.last_sync_attempt = Some(Instant::now());
+                    if let Err(e) = self.dm_graphql_sync(&mut st).await {
+                        eprintln!("finsta: dm: refreshing the inbox failed: {e:#}");
+                    }
                 }
             }
             None
