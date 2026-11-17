@@ -72,16 +72,17 @@ pub fn is_rate_limited(err: &anyhow::Error) -> bool {
 /// Shared by every client, since the limits apply to the account.
 static COOLDOWNS: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
 
-/// "users/123/info/" -> "users/*/info/"
+/// "users/123/info/" -> "users/*/info/", "feed/user/name/username/" ->
+/// "feed/user/*/username/". Also what request logs show, so they never
+/// contain ids or usernames.
 fn cooldown_key(path: &str) -> String {
-    path.trim_start_matches('/')
-        .split('/')
-        .map(|seg| {
-            if !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit() || c == '_') {
-                "*"
-            } else {
-                seg
-            }
+    let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    segs.iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            let id = !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit() || c == '_');
+            let username = segs.get(i + 1) == Some(&"username");
+            if id || username { "*" } else { seg }
         })
         .collect::<Vec<_>>()
         .join("/")
@@ -305,10 +306,10 @@ impl Client {
             }
             let req = req.headers(self.headers(&method, base)).build()?;
             let what = format!(
-                "{} {}{}",
+                "{} {}/{}",
                 req.method(),
                 req.url().host_str().unwrap_or_default(),
-                req.url().path()
+                cooldown_key(req.url().path())
             );
             let resp = match self.inner.http.execute(req).await {
                 Ok(r) => r,

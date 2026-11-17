@@ -58,6 +58,8 @@ pub(super) struct DmState {
     /// Whether the conversations have been loaded at least once.
     inbox_loaded: bool,
     last_sync_attempt: Option<Instant>,
+    /// Whether the new GraphQL inbox has been tried this run.
+    probed: bool,
     /// Which payload kinds have had their shapes logged already.
     logged: HashSet<String>,
 }
@@ -86,6 +88,8 @@ struct PageConfig {
     host_override: Option<String>,
     /// Chat login settings from MqttWebConfig: cp, ecp, chat_on, st.
     mqtt_params: Value,
+    /// The website's GraphQL operations: name -> id.
+    ops: BTreeMap<String, String>,
 }
 
 #[derive(Default)]
@@ -516,18 +520,30 @@ fn shape(v: &Value) -> String {
 
 /// Object key paths (never values) below `v`, for logging a response's structure.
 fn key_paths(v: &Value, prefix: &str, depth: usize, out: &mut BTreeSet<String>) {
-    if depth == 0 || out.len() > 60 {
+    if depth == 0 || out.len() > 200 {
         return;
     }
-    if let Value::Object(m) = v {
-        for (k, x) in m {
-            let k = if is_identifier(k) && !k.chars().all(|c| c.is_ascii_digit()) { k.as_str() } else { "#" };
-            let path = format!("{prefix}.{k}");
-            if x.is_object() {
-                key_paths(x, &path, depth - 1, out);
-            } else {
-                out.insert(path);
+    match v {
+        Value::Object(m) if !m.is_empty() => {
+            for (k, x) in m {
+                let k = if is_identifier(k) && !k.chars().all(|c| c.is_ascii_digit()) { k.as_str() } else { "#" };
+                key_paths(x, &format!("{prefix}.{k}"), depth - 1, out);
             }
+        }
+        // Arrays: their length, then the structure of the first element.
+        Value::Array(a) if !a.is_empty() => key_paths(&a[0], &format!("{prefix}[{}]", a.len()), depth - 1, out),
+        Value::Array(_) => {
+            out.insert(format!("{prefix}[0]"));
+        }
+        other => {
+            let kind = match other {
+                Value::Null => "null",
+                Value::Bool(_) => "b",
+                Value::Number(_) => "n",
+                Value::String(_) => "s",
+                _ => "{}",
+            };
+            out.insert(format!("{prefix}:{kind}"));
         }
     }
 }
@@ -650,7 +666,7 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 3;
+const META_SCANNER: u64 = 4;
 
 /// Places in the website's own code worth quoting in the log while working
 /// out how its messaging works now. Only ever matched against public scripts.
@@ -689,7 +705,13 @@ fn cached_meta() -> Option<Meta> {
     };
     // A found version goes stale with website releases; a search that found
     // nothing is expensive (all scripts) and not worth repeating daily.
-    let max_age = if meta.version.is_some() { 24 * 3600 } else { 7 * 24 * 3600 };
+    let max_age = if meta.version.is_some() {
+        24 * 3600
+    } else if !meta.ops.is_empty() {
+        3 * 24 * 3600
+    } else {
+        7 * 24 * 3600
+    };
     if v["scanner"].as_u64() != Some(META_SCANNER) || now_secs().saturating_sub(v["saved"].as_u64()?) > max_age {
         return None;
     }
@@ -710,6 +732,89 @@ fn save_meta(meta: &Meta) {
         "ops": meta.ops,
     });
     let _ = std::fs::write(path, v.to_string());
+}
+
+/// An answer from instagram.com's GraphQL endpoint.
+struct GraphqlAnswer {
+    status: u16,
+    bytes: usize,
+    parts: usize,
+    html: bool,
+    json: Option<Value>,
+}
+
+impl GraphqlAnswer {
+    /// Log the answer's structure: key paths, array sizes and errors, never values.
+    fn log(&self, what: &str) {
+        let Some(v) = &self.json else {
+            let kind = if self.html { "an HTML page" } else { "not JSON" };
+            eprintln!("finsta: dm: {what} -> HTTP {}, {} bytes, {kind}", self.status, self.bytes);
+            return;
+        };
+        let mut paths = BTreeSet::new();
+        key_paths(&v["data"], "data", 14, &mut paths);
+        let top: Vec<&String> = v.as_object().map(|o| o.keys().collect()).unwrap_or_default();
+        eprintln!(
+            "finsta: dm: {what} -> HTTP {}, {} bytes in {} part(s), keys {top:?}, data {paths:?}",
+            self.status, self.bytes, self.parts
+        );
+        for e in v["errors"].as_array().into_iter().flatten().take(4) {
+            let text = |k: &str| e[k].as_str().unwrap_or_default().chars().take(200).collect::<String>();
+            let path: Vec<String> = e["path"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|p| match p {
+                    Value::String(s) if is_identifier(s) => s.clone(),
+                    Value::Number(_) => "#".into(),
+                    _ => "?".into(),
+                })
+                .collect();
+            eprintln!(
+                "finsta: dm: {what} error: code {} severity {} path {path:?} \"{}\" {}",
+                e["code"],
+                e["severity"].as_str().unwrap_or("-"),
+                text("message"),
+                text("description")
+            );
+        }
+        if !v["error"].is_null() {
+            let summary: String = v["errorSummary"].as_str().unwrap_or_default().chars().take(160).collect();
+            let description: String = v["errorDescription"].as_str().unwrap_or_default().chars().take(160).collect();
+            eprintln!("finsta: dm: {what} error {}: \"{summary}\" {description}", v["error"]);
+        }
+    }
+}
+
+/// Where the website's code modules for the operations Finsta needs are kept
+/// (public code, for working out their inputs and answers).
+fn webcode_dir() -> Option<std::path::PathBuf> {
+    Some(dirs::cache_dir()?.join("finsta").join("webcode"))
+}
+
+/// Operations whose code is worth keeping: messages, profiles, stories, feed.
+fn interesting_op(name: &str) -> bool {
+    [
+        "IGD", "useIGD", "IGDirect", "PolarisDirect", "PolarisProfile", "PolarisStor", "PolarisFeed", "PolarisPost",
+        "PolarisUser", "PolarisMedia", "PolarisTimeline",
+    ]
+    .iter()
+    .any(|p| name.starts_with(p))
+}
+
+/// An operation's arguments from its saved `.graphql` module: (name, has a default).
+fn saved_arguments(op: &str) -> Vec<(String, bool)> {
+    let Some(text) = webcode_dir().and_then(|d| std::fs::read_to_string(d.join(format!("{op}.graphql.js"))).ok()) else {
+        return Vec::new();
+    };
+    let re = regex::Regex::new(r#"\{defaultValue:([^{}]*?),kind:"LocalArgument",name:"([A-Za-z0-9_]+)"\}"#).unwrap();
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for c in re.captures_iter(&text) {
+        if !out.iter().any(|(n, _)| *n == c[2]) {
+            out.push((c[2].to_string(), &c[1] != "null"));
+        }
+    }
+    out
 }
 
 fn found<T>(x: &Option<T>) -> &'static str {
@@ -830,9 +935,16 @@ impl Client {
         let mut mentions = [0usize; NEEDLES.len()];
         let mut snippets: [Option<String>; NEEDLES.len()] = Default::default();
         let op_def = regex::Regex::new(
-            r#"__d\("([A-Za-z0-9]*(?:IGD|Direct|Inbox|Thread|Message|Mailbox)[A-Za-z0-9]*(?:Query|Mutation|Subscription))_[A-Za-z]*RelayOperation"[\s\S]{0,80}?"(\d{8,25})""#,
+            r#"__d\("([A-Za-z0-9]+(?:Query|Mutation|Subscription))_[a-z][A-Za-z]*RelayOperation"[\s\S]{0,80}?"(\d{8,25})""#,
         )
         .unwrap();
+        let module = regex::Regex::new(r#"__d\("([A-Za-z0-9_]+)(\.graphql|\$Parameters)","#).unwrap();
+        let code_dir = webcode_dir();
+        if let Some(dir) = &code_dir {
+            let _ = std::fs::remove_dir_all(dir);
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut saved_modules = 0usize;
         let op_name = regex::Regex::new(
             r"\b((?:IGD|PolarisDirect|PolarisIGD|IGDirect|PolarisInbox)[A-Za-z0-9]*(?:Query|Mutation|Subscription))\b",
         )
@@ -902,6 +1014,23 @@ impl Client {
                 for c in op_def.captures_iter(&text) {
                     meta.ops.insert(c[1].to_string(), c[2].to_string());
                 }
+                if let Some(dir) = &code_dir {
+                    for c in module.captures_iter(&text) {
+                        if !interesting_op(&c[1]) {
+                            continue;
+                        }
+                        let start = c.get(0).unwrap().start();
+                        let rest = &text[start + 4..];
+                        let mut len = rest.find("__d(\"").map(|i| i + 4).unwrap_or(rest.len() + 4).min(400_000);
+                        while !text.is_char_boundary(start + len) {
+                            len -= 1;
+                        }
+                        let file = dir.join(format!("{}{}.js", &c[1], if &c[2] == ".graphql" { ".graphql" } else { ".parameters" }));
+                        if std::fs::write(file, &text[start..start + len]).is_ok() {
+                            saved_modules += 1;
+                        }
+                    }
+                }
                 if named_ops.len() < 400 {
                     named_ops.extend(op_name.captures_iter(&text).map(|c| c[1].to_string()));
                 }
@@ -929,9 +1058,11 @@ impl Client {
                 None => eprintln!("finsta: dm: website code, {needle}: not found"),
             }
         }
+        let message_ops: Vec<&String> = meta.ops.keys().filter(|n| interesting_op(n) && DM_WORDS.iter().any(|w| n.contains(w))).collect();
         eprintln!(
-            "finsta: dm: message operations with ids in the scripts: {:?}",
-            meta.ops.keys().collect::<Vec<_>>()
+            "finsta: dm: {} operations with ids in the scripts, {} about messages; saved {saved_modules} code modules",
+            meta.ops.len(),
+            message_ops.len()
         );
         let unnamed: Vec<&String> = named_ops.iter().filter(|n| !meta.ops.contains_key(*n)).collect();
         eprintln!("finsta: dm: other message operation names in the scripts: {unnamed:?}");
@@ -1040,7 +1171,7 @@ impl Client {
             mqtt_params["chat_on"],
             mqtt_params["st"]
         );
-        let av = [named[3].1, named[0].1, named[2].1, named[1].1]
+        let av = [named[4].1, named[3].1, named[0].1, named[2].1, named[1].1]
             .into_iter()
             .flatten()
             .find(|v| *v > 0)
@@ -1119,6 +1250,7 @@ impl Client {
             site,
             host_override,
             mqtt_params,
+            ops: meta.ops,
         }
     }
 
@@ -1193,7 +1325,10 @@ impl Client {
         }
         let alive = st.conn.as_ref().is_some_and(|c| c.is_alive());
         let recently = st.last_connect_attempt.is_some_and(|t| t.elapsed() < Duration::from_secs(60));
-        if !alive && !recently {
+        // Without the protocol version the chat refuses every login (and
+        // instagram.com itself no longer uses it for messages), so don't try.
+        let usable = st.config.as_ref().is_some_and(|c| c.version.is_some()) || std::env::var("FINSTA_CHAT_URL").is_ok();
+        if !alive && !recently && usable {
             st.last_connect_attempt = Some(Instant::now());
             st.conn = None;
             match self.dm_connect(st).await {
@@ -1218,6 +1353,10 @@ impl Client {
     /// Fetch the conversations the way the website does once its inbox page
     /// has loaded: with a GraphQL query, or else over the chat connection.
     async fn dm_initial_sync(&self, st: &mut DmState) -> Result<()> {
+        if st.config.as_ref().is_some_and(|c| c.doc.is_none()) && !st.probed {
+            st.probed = true;
+            self.dm_probe_offmsys(st).await;
+        }
         match self.dm_graphql_sync(st).await {
             Ok(true) => {
                 st.inbox_loaded = true;
@@ -1249,29 +1388,16 @@ impl Client {
         p
     }
 
-    /// The website's "LSPlatformGraphQLLightspeedRequestForIGDQuery".
-    async fn dm_graphql_sync(&self, st: &mut DmState) -> Result<bool> {
-        let cfg = st.config.clone().ok_or_else(|| anyhow!("inbox not loaded"))?;
-        let Some((name, doc_id)) = cfg.doc.clone() else {
-            eprintln!("finsta: dm: skipping the inbox query: its id is unknown");
-            return Ok(false);
-        };
+    /// One of the website's GraphQL operations, sent the way instagram.com
+    /// sends it. Returns the first JSON part of the answer (answers with
+    /// deferred parts come as several JSON documents, one per line).
+    async fn web_graphql(&self, cfg: &PageConfig, name: &str, doc_id: &str, variables: &Value) -> Result<GraphqlAnswer> {
         let Some(dtsg) = cfg.dtsg.clone() else {
-            eprintln!("finsta: dm: skipping the inbox query: no fb_dtsg token on the page");
-            return Ok(false);
+            bail!("no fb_dtsg token on the inbox page");
         };
         if cooldown_remaining(GRAPHQL_KEY).is_some() {
             return Err(RateLimited.into());
         }
-        let mut request = Self::sync_request(&cfg, 1);
-        request.as_object_mut().map(|o| o.remove("failure_count"));
-        let variables = json!({
-            "deviceId": cfg.client_id,
-            "includeChatVisibility": false,
-            "requestId": 0,
-            "requestPayload": request.to_string(),
-            "requestType": 1,
-        });
         let jazoest = format!("2{}", dtsg.bytes().map(u32::from).sum::<u32>());
         let mut form: Vec<(&str, String)> = vec![
             ("av", cfg.av.clone()),
@@ -1291,10 +1417,10 @@ impl Client {
         form.extend(cfg.site.iter().map(|(k, v)| (*k, v.clone())));
         form.extend([
             ("fb_api_caller_class", "RelayModern".to_string()),
-            ("fb_api_req_friendly_name", name.clone()),
+            ("fb_api_req_friendly_name", name.to_string()),
             ("variables", variables.to_string()),
             ("server_timestamps", "true".to_string()),
-            ("doc_id", doc_id),
+            ("doc_id", doc_id.to_string()),
         ]);
         let mut headers = self.headers(&Method::POST, WEB_API);
         let mut put = |k: &'static str, v: &str| {
@@ -1303,7 +1429,7 @@ impl Client {
             }
         };
         put("referer", "https://www.instagram.com/direct/inbox/");
-        put("x-fb-friendly-name", &name);
+        put("x-fb-friendly-name", name);
         if let Some(lsd) = &cfg.lsd {
             put("x-fb-lsd", lsd);
         }
@@ -1313,43 +1439,50 @@ impl Client {
         self.absorb_headers(resp.headers());
         let text = resp.text().await?;
         if status.as_u16() == 429 {
-            eprintln!("finsta: dm: inbox query -> HTTP 429");
+            eprintln!("finsta: dm: {name} -> HTTP 429");
             start_cooldown(GRAPHQL_KEY, None);
             return Err(RateLimited.into());
         }
         if status.is_redirection() {
             let path = location.split('?').next().unwrap_or_default();
-            eprintln!("finsta: dm: inbox query -> HTTP {status} {path}");
             if path.contains("/challenge") || path.contains("/checkpoint") {
                 bail!(VERIFY);
             }
             if path.contains("/accounts/login") {
                 return Err(LoginRequired.into());
             }
-            return Ok(false);
+            bail!("{name} -> HTTP {status} {path}");
         }
         let body = text.trim_start().trim_start_matches("for (;;);");
-        let Ok(v) = serde_json::from_str::<Value>(body) else {
-            let kind = if body.trim_start().starts_with('<') { "an HTML page" } else { "not JSON" };
-            eprintln!("finsta: dm: inbox query -> HTTP {status}, {} bytes, {kind}", text.len());
+        let mut parts = body.lines().filter(|l| !l.trim().is_empty());
+        let first = parts.next().unwrap_or_default();
+        // A pretty-printed answer is one document over several lines.
+        let (json, parts) = match serde_json::from_str::<Value>(first) {
+            Ok(v) => (Some(v), 1 + parts.count()),
+            Err(_) => (serde_json::from_str::<Value>(body).ok(), 1),
+        };
+        Ok(GraphqlAnswer { status: status.as_u16(), bytes: text.len(), parts, html: body.starts_with('<'), json })
+    }
+
+    /// The website's "LSPlatformGraphQLLightspeedRequestForIGDQuery".
+    async fn dm_graphql_sync(&self, st: &mut DmState) -> Result<bool> {
+        let cfg = st.config.clone().ok_or_else(|| anyhow!("inbox not loaded"))?;
+        let Some((name, doc_id)) = cfg.doc.clone() else {
+            eprintln!("finsta: dm: skipping the Lightspeed inbox query: its id is unknown");
             return Ok(false);
         };
-        let mut paths = BTreeSet::new();
-        key_paths(&v["data"], "data", 4, &mut paths);
-        let top: Vec<&String> = v.as_object().map(|o| o.keys().collect()).unwrap_or_default();
-        eprintln!("finsta: dm: inbox query -> HTTP {status}, {} bytes, keys {top:?}, data {paths:?}", text.len());
-        for e in v["errors"].as_array().into_iter().flatten().take(3) {
-            let msg: String = e["message"].as_str().unwrap_or_default().chars().take(140).collect();
-            eprintln!(
-                "finsta: dm: inbox query error: code {} severity {} \"{msg}\"",
-                e["code"],
-                e["severity"].as_str().unwrap_or("-")
-            );
-        }
-        if !v["error"].is_null() {
-            let summary: String = v["errorSummary"].as_str().unwrap_or_default().chars().take(140).collect();
-            eprintln!("finsta: dm: inbox query error {}: \"{summary}\"", v["error"]);
-        }
+        let mut request = Self::sync_request(&cfg, 1);
+        request.as_object_mut().map(|o| o.remove("failure_count"));
+        let variables = json!({
+            "deviceId": cfg.client_id,
+            "includeChatVisibility": false,
+            "requestId": 0,
+            "requestPayload": request.to_string(),
+            "requestType": 1,
+        });
+        let answer = self.web_graphql(&cfg, &name, &doc_id, &variables).await?;
+        answer.log("inbox query");
+        let Some(v) = answer.json else { return Ok(false) };
         let mut parsed = ParsedPage::default();
         scan(&v, &mut parsed);
         let mut ok = false;
@@ -1357,6 +1490,47 @@ impl Client {
             ok |= self.dm_apply_payload(st, payload, &format!("inbox query {key}"));
         }
         Ok(ok)
+    }
+
+    /// instagram.com now runs its inbox on plain GraphQL operations (named
+    /// "...OffMsys..."). Until their inputs and answers are worked out, try
+    /// the ones that list conversations and log the structure of the answers.
+    async fn dm_probe_offmsys(&self, st: &mut DmState) {
+        let Some(cfg) = st.config.clone() else { return };
+        for name in ["PolarisDirectInboxQuery", "IGDThreadListOffMsysPaginationQuery"] {
+            let Some(id) = cfg.ops.get(name).cloned() else {
+                eprintln!("finsta: dm: probe {name}: its id wasn't found");
+                continue;
+            };
+            let args = saved_arguments(name);
+            let mut vars = serde_json::Map::new();
+            let mut left_out = Vec::new();
+            for (arg, has_default) in &args {
+                if *has_default {
+                    continue;
+                }
+                let lower = arg.to_ascii_lowercase();
+                if ["after", "before", "cursor"].iter().any(|w| lower.contains(w)) {
+                    vars.insert(arg.clone(), Value::Null);
+                } else if ["first", "count", "limit", "last"].iter().any(|w| lower == *w || lower.ends_with(w)) {
+                    vars.insert(arg.clone(), 20.into());
+                } else {
+                    left_out.push(arg.clone());
+                }
+            }
+            let described: Vec<String> =
+                args.iter().map(|(a, d)| if *d { format!("{a} (has default)") } else { a.clone() }).collect();
+            eprintln!("finsta: dm: probe {name}: arguments {described:?}, left out {left_out:?}");
+            match self.web_graphql(&cfg, name, &id, &Value::Object(vars)).await {
+                Ok(answer) => answer.log(&format!("probe {name}")),
+                Err(e) => {
+                    eprintln!("finsta: dm: probe {name} failed: {e:#}");
+                    if e.is::<RateLimited>() || e.is::<LoginRequired>() {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Ask for a whole database over the chat connection (a "sync" request).

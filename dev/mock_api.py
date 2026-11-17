@@ -200,6 +200,9 @@ def convo_calls(convos, last=5):
 
 
 DOC_ID = "7357432314358409"
+INBOX_DOC = "24000000000000001"
+LIST_DOC = "24000000000000002"
+OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
 EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
 
 
@@ -238,6 +241,14 @@ def inbox_page():
 def script(name):
     if name == "IGDAWMainV4Worker.js":
         return f'self.importScripts("{base()}/rsrc.php/v4/yL/r/LSWorkerBundle.js");'
+    if name == "LSWorkerBundle.js" and OFFMSYS:
+        # Like instagram.com in November 2026: no Lightspeed, plain GraphQL operations.
+        return ('__d("PolarisDirectInboxQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + INBOX_DOC + '"}),null);'
+                '__d("IGDThreadListOffMsysPaginationQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + LIST_DOC + '"}),null);'
+                '__d("IGDThreadListOffMsysPaginationQuery.graphql",["IGDThreadListOffMsysPaginationQuery_instagramRelayOperation"],(function(t,n,r,o,a,i){"use strict";'
+                'var e=function(){var e={defaultValue:null,kind:"LocalArgument",name:"after"},t={defaultValue:20,kind:"LocalArgument",name:"first"},'
+                'n={defaultValue:null,kind:"LocalArgument",name:"folder"};return{fragment:{argumentDefinitions:[e,t,n],kind:"Fragment",name:"IGDThreadListOffMsysPaginationQuery"}}}();a.exports=e}),null);'
+                '__d("PolarisDirectInboxQuery.graphql",[],(function(t,n,r,o,a,i){"use strict";var e={defaultValue:null,kind:"LocalArgument",name:"thread_count"};a.exports={fragment:{argumentDefinitions:[e]}}}),null);')
     if name == "LSWorkerBundle.js":
         return ('__d("LSVersion",[],(function(a,b,c,d,e,f){e.exports="' + LS_VERSION + '"}),66);'
                 '__d("LSPlatformGraphQLLightspeedRequestForIGDQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + DOC_ID + '"}),null);'
@@ -451,6 +462,16 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(js)
             return
+        if path == "/api/graphql" and body.get("doc_id", [""])[0] in (INBOX_DOC, LIST_DOC):
+            f = {k: v[0] for k, v in body.items()}
+            with open(sys.argv[2] if len(sys.argv) > 2 else "/dev/null", "a") as log:
+                log.write(f"GRAPHQL {f.get('fb_api_req_friendly_name')} variables={f.get('variables')} av={f.get('av')}\n")
+            if f["doc_id"] == INBOX_DOC:
+                return self.send_json({"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL",
+                                                   "code": 1675030, "path": ["xdt_get_inbox"], "description": "thread_count"}], "data": None})
+            edges = [{"node": {"thread_key": str(k), "thread_title": "x", "users": [{"pk": "1", "username": "u"}], "last_activity_at": 1}} for k in CONVOS]
+            return self.send_json({"data": {"get_slide_mailbox": {"threads_connection": {"edges": edges, "page_info": {"end_cursor": "c", "has_next_page": True}}}},
+                                   "extensions": {"is_final": True}})
         if path == "/api/graphql":
             f = {k: v[0] for k, v in body.items()}
             variables = json.loads(f.get("variables", "{}"))
