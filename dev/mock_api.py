@@ -106,10 +106,17 @@ def timeline():
 VIDEOS = sorted(os.listdir(os.environ["FINSTA_MOCK_VIDEOS"])) if os.environ.get("FINSTA_MOCK_VIDEOS") else []
 
 
+STORY_LIKES = {}
+# reel -> taken_at of the newest story you've watched; someone's first two stories are already watched.
+SEEN = {"1001": NOW - 3600 * 4, "1005": NOW - 3600}
+
+
 def story_items(pk, n):
     items = []
     for i in range(n):
-        it = {"id": f"s{pk}{i}_{pk}", "media_type": 1, "taken_at": NOW - 3600 * (i + 1),
+        sid = f"9{pk}{i}"
+        it = {"id": f"{sid}_{pk}", "pk": int(sid), "media_type": 1, "taken_at": NOW - 3600 * (n - i),
+              "has_liked": STORY_LIKES.get(sid, False),
               "original_width": 1080, "original_height": 1920,
               "image_versions2": {"candidates": [{"url": img(f"story{pk}{i}", 1080, 1920), "width": 1080, "height": 1920}]}}
         if VIDEOS and i % 3 != 2:  # two videos, then a photo
@@ -119,9 +126,8 @@ def story_items(pk, n):
     return items
 
 
-def reel(pk, seen=False):
-    latest = NOW - 3600
-    return {"id": int(pk), "user": USERS[pk], "latest_reel_media": latest, "seen": latest if seen else 0}
+def reel(pk):
+    return {"id": int(pk), "user": USERS[pk], "latest_reel_media": NOW - 3600, "seen": SEEN.get(pk, 0)}
 
 
 # ----- Direct messages: instagram.com's web inbox (Lightspeed over MQTT) -----
@@ -219,7 +225,8 @@ SEND_DOC = "24000000000000004"
 MARK_DOC = "24000000000000005"
 WEB_DOCS = {"25000000000000006": "PolarisFeedTimelineRootV2Query", "25000000000000001": "PolarisProfilePageContentQuery", "25000000000000002": "PolarisProfilePostsQuery",
             "25000000000000003": "PolarisStoriesV3ReelPageStandaloneQuery", "25000000000000004": "usePolarisLikeMediaXIGLikeMutation",
-            "25000000000000005": "usePolarisLikeMediaXIGUnlikeMutation"}
+            "25000000000000005": "usePolarisLikeMediaXIGUnlikeMutation", "25000000000000007": "PolarisAPIReelSeenMutation",
+            "25000000000000008": "usePolarisStoryLikesLikeMutation", "25000000000000009": "usePolarisStoryLikesUnlikeMutation"}
 # Saved-style definitions: what the app reads to fill in and fit inputs.
 WEB_MODULES = (
     '__d("PolarisFeedTimelineRootV2Query.graphql",["PolarisFeedTimelineRootV2Query_instagramRelayOperation"],(function(t,n,r,o,a,i){var e=(function(){'
@@ -238,8 +245,17 @@ WEB_MODULES = (
         f'__d("usePolarisLikeMediaXIG{kind}Mutation.graphql",["usePolarisLikeMediaXIG{kind}Mutation_instagramRelayOperation"],'
         '(function(t,n,r,o,a,i){"use strict";var e=(function(){var e={defaultValue:null,kind:"LocalArgument",name:"media_id"};'
         'return{fragment:{argumentDefinitions:[e]}}})();a.exports=e}),null);'.replace('name:"media_id"', 'name:"input"') for kind in ("Like", "Unlike"))
+    + "".join(
+        f'__d("usePolarisStoryLikes{kind}Mutation.graphql",[],(function(t,n,r,o,a,i){{var e={{defaultValue:null,kind:"LocalArgument",name:"input"}};'
+        'a.exports={fragment:{argumentDefinitions:[e]}}}),null);' for kind in ("Like", "Unlike"))
+    + '__d("PolarisAPIReelSeenMutation.graphql",[],(function(t,n,r,o,a,i){var e=["reelId","reelMediaId","reelMediaOwnerId","reelMediaTakenAt","viewSeenAt"]'
+      '.map(function(x){return{defaultValue:null,kind:"LocalArgument",name:x}});'
+      'a.exports={fragment:{argumentDefinitions:[{defaultValue:null,kind:"LocalArgument",name:"reelId"},{defaultValue:null,kind:"LocalArgument",name:"reelMediaId"},'
+      '{defaultValue:null,kind:"LocalArgument",name:"reelMediaOwnerId"},{defaultValue:null,kind:"LocalArgument",name:"reelMediaTakenAt"},'
+      '{defaultValue:null,kind:"LocalArgument",name:"viewSeenAt"}]}}}),null);'
 )
-SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read"}
+REPLY_DOC = "24000000000000006"
+SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read", REPLY_DOC: "story reply"}
 OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
 EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
 
@@ -287,6 +303,7 @@ def script(name):
                 '__d("IGDMessageListOffMsysQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MESSAGES_DOC + '"}),null);'
                 '__d("IGDirectTextSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + SEND_DOC + '"}),null);'
                 '__d("useIGDMarkThreadAsReadMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MARK_DOC + '"}),null);'
+                '__d("IGDirectStoryShareReplyMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + REPLY_DOC + '"}),null);'
                 + "".join(f'__d("{n}_instagramRelayOperation",[],(function(a,b,c,d,e,f){{e.exports="{d}"}}),null);' for d, n in WEB_DOCS.items())
                 + WEB_MODULES +
                 '__d("IGDMaxUnreadMessagesCount.relayprovider",[],(function(t,n,r,o,a,i,l){l.get=function(){return 20}}),null);'
@@ -325,7 +342,7 @@ def slide_content(m):
     if a[0] == "raven":
         return {"__typename": "SlideMessageRavenImageContent", "attachment": {"__typename": "XFBSlideAttachment", "preview_cdn_url": img("secret", 100, 100)}}
     if a[0] == "audio":
-        return {"__typename": "SlideMessageAudiosContent", "audio_attachments": [{"attachment_cdn_url": "x", "playable_duration_ms": 4000}]}
+        return {"__typename": "SlideMessageAudiosContent", "audio_attachments": [{"attachment_cdn_url": f"{BASE}/vid/{VIDEOS[0]}" if VIDEOS else "x", "playable_duration_ms": 4000}]}
     return {"__typename": "SlideMessageXMAContent", "xma_text_body": None,
             "xma": {"__typename": "SlideMessagePortraitXMA", "target_url": a[1], "header_title_text": "natgeo_fan", "title_text": a[2],
                     "preview_image": {"url": img("xmapreview", 640, 640)}}}
@@ -378,6 +395,16 @@ def slide_answer(op, v):
                 "edges": [{"node": slide_message(m), "cursor": m["mid"]} for m in page],
                 "page_info": {"end_cursor": str(start + v["first"]) if more else None, "has_next_page": more,
                               "has_previous_page": start > 0, "start_cursor": str(start)}}}}}}
+    if op == "story reply":
+        d, sd = v.get("data") or {}, v.get("send_data") or {}
+        if not str(d.get("media_id", "")).isdigit() or not d.get("text") or not sd.get("offline_threading_id") \
+                or not (sd.get("ig_thread_igid") or sd.get("recipient_igids")):
+            return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        key = next((k for k in MESSAGES if f"34028236684171030{k}" == sd.get("ig_thread_igid")), None)
+        sent = msg(f"r{time.time_ns()}", ME_CHAT, 0, d["text"])
+        if key is not None:
+            MESSAGES[key].append(sent)
+        return {"data": {"direct_story_share_reply_with_slide_message_response": {"message_id": sent["mid"], "timestamp_ms": str(sent["ts"]), "id": "x"}}}
     if op == "send":
         key = next((k for k in MESSAGES if f"34028236684171030{k}" == v.get("ig_thread_igid")), None)
         if key is None or not v.get("offline_threading_id") or not v.get("text"):
@@ -406,6 +433,9 @@ def following_feed():
         pk = authors[i % len(authors)]
         m = nulls(media(str(700 + i), pk, f"following post {i}", 3600 * 2 + i * 11 * 3600, w=1080, h=1080))
         m["organic_tracking_token"] = f"tok{700 + i}"
+        if VIDEOS and i % 4 == 1:
+            m["media_type"] = 2
+            m["video_versions"] = [{"type": 101, "url": f"{BASE}/vid/{VIDEOS[i % len(VIDEOS)]}", "width": 720, "height": 1280}]
         edges.append({"node": {"__typename": "XDTFeedItem", "media": m, "ad": None, "end_of_feed_demarcator": None}, "cursor": str(i)})
         if i == 3:
             edges.append({"node": {"__typename": "XDTFeedItem", "media": None, "ad": {"ad_id": "1"}}, "cursor": "ad"})
@@ -416,6 +446,22 @@ def following_feed():
 
 def web_answer(name, v):
     pv = {k: x for k, x in v.items() if k.startswith("__relay_internal__pv__")}
+    bad = {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675030}], "data": None}
+    if name == "PolarisAPIReelSeenMutation":
+        reel_id, item = str(v.get("reelId")), str(v.get("reelMediaId"))
+        if reel_id not in USERS or not item.isdigit() or not item.startswith(f"9{reel_id}") or v.get("reelMediaOwnerId") != reel_id \
+                or not isinstance(v.get("reelMediaTakenAt"), int) or not isinstance(v.get("viewSeenAt"), int):
+            return bad
+        SEEN[reel_id] = max(SEEN.get(reel_id, 0), v["reelMediaTakenAt"])
+        return {"data": {"xdt_mark_story_reel_seen": {"__typename": "XDTMarkSeenResponse"}}}
+    if name.startswith("usePolarisStoryLikes"):
+        i = v.get("input") or {}
+        if set(v) != {"input"} or not str(i.get("media_id", "")).isdigit():
+            return bad
+        like = not name.startswith("usePolarisStoryLikesUnlike")
+        STORY_LIKES[str(i["media_id"])] = like
+        field = "xig_send_story_like" if like else "xig_unsend_story_like"
+        return {"data": {field: {"__typename": "XIGSendStoryLikeResponsePayload"}}}
     if name == "PolarisFeedTimelineRootV2Query":
         d = v.get("data") or {}
         if v.get("variant") != "following" or d.get("pagination_source") != "following" or not d.get("device_id"):
@@ -765,7 +811,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"feed_items": [], "more_available": False, "status": "ok"})
             return self.send_json(timeline())
         if p == "feed/reels_tray/":
-            return self.send_json({"tray": [reel("1000"), reel("1001"), reel("2001"), reel("1003"), reel("1005", seen=True), reel("1002")], "status": "ok"})
+            return self.send_json({"tray": [reel("1000"), reel("1001"), reel("2001"), reel("1003"), reel("1005"), reel("1002")], "status": "ok"})
         if p == "feed/reels_media/":
             ids = q.get("reel_ids", [])
             return self.send_json({"reels": {i: {**reel(i), "items": story_items(i, 3)} for i in ids}, "status": "ok"})

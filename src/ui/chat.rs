@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::glib;
 use serde_json::Value;
 
 use crate::api::{Disappearing, DmContent, DmItem, Media, Recipient, Thread, User};
@@ -16,6 +16,7 @@ use crate::ui::util;
 use crate::ui::window::Main;
 use crate::ui::media_viewer::{self, Ephemeral};
 use crate::ui::images;
+use crate::ui::video;
 
 pub enum ChatTarget {
     Thread(Thread),
@@ -1093,13 +1094,7 @@ fn message_widget(
                 secs % 60
             ))));
             if let Some(url) = url {
-                let stream = gtk::MediaFile::for_file(&gio::File::for_uri(&url));
-                let controls = gtk::MediaControls::builder()
-                    .media_stream(&stream)
-                    .width_request(220)
-                    .build();
-                b.set_orientation(gtk::Orientation::Vertical);
-                b.append(&controls);
+                b.prepend(&video::voice_button(url));
             }
             b.upcast()
         }

@@ -28,6 +28,7 @@ const MORE_THREADS: &str = "IGDThreadListOffMsysPaginationQuery";
 const MESSAGES: &str = "IGDMessageListOffMsysQuery";
 const SEND_TEXT: &str = "IGDirectTextSendMutation";
 const MARK_READ: &str = "useIGDMarkThreadAsReadMutation";
+const STORY_REPLY: &str = "IGDirectStoryShareReplyMutation";
 
 /// Values the website computes on its side ("provided variables").
 const MAX_UNREAD: i64 = 20;
@@ -505,6 +506,31 @@ impl Client {
         let t = &st.slide.threads[&id];
         let items: Vec<Value> = st.slide.preview(&id, t, &viewer_pk).into_iter().collect();
         parse(&st.slide.thread(&id, &viewer_pk, items, false, None))
+    }
+
+    pub(super) async fn slide_story_reply(&self, st: &mut DmState, owner_pk: &str, media_id: &str, text: &str) -> Result<()> {
+        let viewer_pk = self.user_id();
+        let igid = st
+            .slide
+            .one_to_one(owner_pk, &viewer_pk)
+            .map(|id| s(&st.slide.threads.get(&id).cloned().unwrap_or_default()["thread_id"]))
+            .filter(|id| !id.is_empty());
+        let recipients = igid.is_none().then(|| vec![owner_pk.to_string()]);
+        let vars = json!({
+            "data": {"media_id": media_id.split('_').next().unwrap_or(media_id), "reel_id": owner_pk, "text": text},
+            "send_data": {
+                "ig_thread_igid": igid,
+                "recipient_igids": recipients,
+                "offline_threading_id": time_id().to_string(),
+                "send_attribution": "reel_feed_timeline",
+            },
+        });
+        let data = self.slide_op(st, STORY_REPLY, vars).await?;
+        let sent = &data["direct_story_share_reply_with_slide_message_response"];
+        if s(&sent["message_id"]).is_empty() && s(&sent["id"]).is_empty() {
+            bail!("Instagram didn't confirm the reply");
+        }
+        Ok(())
     }
 
     pub(super) async fn slide_send(&self, st: &mut DmState, to: &Recipient, text: &str) -> Result<Option<String>> {

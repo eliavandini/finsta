@@ -671,7 +671,7 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 6;
+const META_SCANNER: u64 = 7;
 
 /// Website code that calls the operations Finsta uses: saved (to
 /// webcode/callers/) to work out the inputs the website passes them.
@@ -682,6 +682,8 @@ const CALLER_NEEDLES: &[&str] = &[
     "PolarisStoriesV3TrayContainerQuery",
     "usePolarisLikeMediaXIGLikeMutation",
     "PolarisAPIReelSeenMutation",
+    "usePolarisStoryLikesLikeMutation",
+    "IGDirectStoryShareReplyMutation",
     "IGDirectTextSendMutation",
     "useIGDMarkThreadAsReadMutation",
     "device_id_for_iris_subscription",
@@ -821,7 +823,8 @@ fn webcode_dir() -> Option<std::path::PathBuf> {
 fn interesting_op(name: &str) -> bool {
     [
         "IGD", "useIGD", "IGDirect", "PolarisDirect", "PolarisProfile", "PolarisStor", "PolarisFeed", "PolarisPost",
-        "PolarisUser", "PolarisMedia", "PolarisTimeline", "usePolarisLikeMedia", "usePolarisStoryLikes", "PolarisAPI",
+        "PolarisUser", "PolarisMedia", "PolarisTimeline", "usePolarisLikeMedia", "usePolarisStor", "usePolarisReel",
+        "PolarisAPI", "PolarisReel",
     ]
     .iter()
     .any(|p| name.starts_with(p))
@@ -1867,6 +1870,18 @@ impl Client {
         let ts = st.store.message_index.get(item_id).map(|(_, ts)| *ts).unwrap_or_else(now_ms);
         let read = json!({"thread_id": key, "last_read_watermark_ts": ts, "sync_group": 1});
         self.dm_tasks(&mut st, "mark read", vec![task("21", read, key.to_string())]).await
+    }
+
+    /// Reply to someone's story; the reply arrives in your conversation with them.
+    pub async fn story_reply(&self, owner_pk: &str, media_id: &str, text: &str) -> Result<()> {
+        let mut st = self.inner.dm.lock().await;
+        if st.config.is_none() {
+            self.dm_load_page(&mut st).await?;
+        }
+        if !Self::slide_mode(&st) {
+            bail!("Replying to stories isn't available for this account in Finsta yet.");
+        }
+        self.slide_story_reply(&mut st, owner_pk, media_id, text).await
     }
 
     /// Opening disappearing photos goes through a part of the chat protocol

@@ -4,13 +4,14 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::{gio, glib};
+use gtk::glib;
 
 use crate::api::Media;
 use crate::rt;
 use crate::ui::images;
 use crate::ui::ratio_bin::RatioBin;
 use crate::ui::util;
+use crate::ui::video;
 use crate::ui::window::Main;
 
 const MEDIA_WIDTH: i32 = 600;
@@ -363,24 +364,9 @@ fn single_media(media: &Media, aspect: f64, width: i32) -> RatioBin {
         return RatioBin::new(aspect, width, &picture);
     };
 
+    // Plays (muted, looping) while it's the most visible video on screen.
     let overlay = gtk::Overlay::builder().child(&picture).build();
-    let play = gtk::Button::builder()
-        .icon_name("media-playback-start-symbolic")
-        .css_classes(["osd", "circular"])
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
-        .tooltip_text("Play Video")
-        .build();
-    play.set_size_request(64, 64);
-    overlay.add_overlay(&play);
-    let bin = RatioBin::new(aspect, width, &overlay);
-    let weak_bin = bin.downgrade();
-    play.connect_clicked(move |_| {
-        let Some(bin) = weak_bin.upgrade() else { return };
-        let stream = gtk::MediaFile::for_file(&gio::File::for_uri(&video_url));
-        let video = gtk::Video::builder().autoplay(true).css_classes(["post-media"]).build();
-        video.set_media_stream(Some(&stream));
-        bin.set_child(&video);
-    });
-    bin
+    overlay.add_overlay(&video::mute_button());
+    video::autoplay(&picture, video_url);
+    RatioBin::new(aspect, width, &overlay)
 }

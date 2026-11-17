@@ -865,6 +865,54 @@ impl Client {
         Ok(())
     }
 
+    /// Tell Instagram you've watched a story (as instagram.com's
+    /// PolarisAPIReelSeen does), so it isn't shown as new again.
+    pub async fn mark_story_seen(&self, reel_id: &str, owner_pk: &str, item: &Media) -> Result<()> {
+        let now = chrono_now();
+        let vars = json!({
+            "reelId": reel_id,
+            "reelMediaId": media_pk(&item.id),
+            "reelMediaOwnerId": owner_pk,
+            "reelMediaTakenAt": item.taken_at,
+            "viewSeenAt": now,
+        });
+        match self.web_query("PolarisAPIReelSeenMutation", vars, WEB_REFERER).await {
+            Ok(_) => return Ok(()),
+            Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+            Err(e) => eprintln!("finsta: story seen query failed ({e}); trying the older route"),
+        }
+        self.post(
+            "stories/reel/seen",
+            &[
+                ("reelMediaId", media_pk(&item.id).to_string()),
+                ("reelMediaOwnerId", owner_pk.to_string()),
+                ("reelId", reel_id.to_string()),
+                ("reelMediaTakenAt", item.taken_at.to_string()),
+                ("viewSeenAt", now.to_string()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Like or unlike a story.
+    pub async fn story_like(&self, item: &Media, like: bool) -> Result<()> {
+        let name = if like { "usePolarisStoryLikesLikeMutation" } else { "usePolarisStoryLikesUnlikeMutation" };
+        let input = json!({"media_id": media_pk(&item.id)});
+        match self.web_query(name, json!({"input": input}), WEB_REFERER).await {
+            Ok(_) => return Ok(()),
+            Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+            Err(e) => eprintln!("finsta: story like query failed ({e}); trying the older route"),
+        }
+        let action = if like { "send_story_like" } else { "unsend_story_like" };
+        self.post(
+            &format!("story_interactions/{action}"),
+            &[("media_id", item.id.clone()), ("container_module", "reel_feed_timeline".into())],
+        )
+        .await?;
+        Ok(())
+    }
+
     pub async fn comments(&self, media_id: &str) -> Result<Vec<Comment>> {
         let v = self
             .get(

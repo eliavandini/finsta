@@ -107,13 +107,13 @@ distro_hint() {
     fi
     case " $id " in
         *" arch "*)
-            echo "sudo pacman -S --needed base-devel rustup gtk4 libadwaita webkitgtk-6.0 gstreamer gst-plugins-good gst-libav gst-plugin-gtk4" ;;
+            echo "sudo pacman -S --needed base-devel rustup gtk4 libadwaita webkitgtk-6.0 gstreamer gst-plugins-good gst-libav" ;;
         *" debian "*|*" ubuntu "*)
-            echo "sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgstreamer1.0-dev gstreamer1.0-plugins-good gstreamer1.0-libav gstreamer1.0-gtk4" ;;
+            echo "sudo apt install build-essential pkg-config libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev libgstreamer1.0-dev gstreamer1.0-plugins-good gstreamer1.0-libav" ;;
         *" fedora "*)
-            echo "sudo dnf install gcc pkgconf gtk4-devel libadwaita-devel webkitgtk6.0-devel gstreamer1-devel gstreamer1-plugins-good gstreamer1-plugin-libav gstreamer1-plugin-gtk4" ;;
+            echo "sudo dnf install gcc pkgconf gtk4-devel libadwaita-devel webkitgtk6.0-devel gstreamer1-devel gstreamer1-plugins-good gstreamer1-plugin-libav" ;;
         *" opensuse"*|*" suse "*)
-            echo "sudo zypper install gcc pkgconf gtk4-devel libadwaita-devel webkit2gtk4-devel gstreamer-devel gstreamer-plugins-good gstreamer-plugins-libav gstreamer-plugins-rs" ;;
+            echo "sudo zypper install gcc pkgconf gtk4-devel libadwaita-devel webkit2gtk4-devel gstreamer-devel gstreamer-plugins-good gstreamer-plugins-libav" ;;
         *) echo "" ;;
     esac
 }
@@ -150,9 +150,6 @@ if command -v gst-inspect-1.0 >/dev/null; then
     fi
     if ! { gst_has avdec_h264 || gst_has openh264dec || gst_has vah264dec || gst_has nvh264dec || gst_has v4l2slh264dec; }; then
         warn "no GStreamer H.264 decoder found (e.g. gst-libav); videos won't play"
-    fi
-    if ! gst_has gtk4paintablesink; then
-        warn "GStreamer's GTK 4 sink is missing (gst-plugin-gtk4); stories show videos as still images"
     fi
 else
     warn "GStreamer tools not found; videos may not play"

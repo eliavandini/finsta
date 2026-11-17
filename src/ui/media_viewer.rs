@@ -3,37 +3,30 @@
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::{gdk, gio};
+use gtk::gdk;
 
-use crate::ui::images;
+use crate::ui::{images, video};
 use crate::ui::window::Main;
 
 pub fn open(main: &Rc<Main>, image: Option<String>, video: Option<String>) {
-    let content: gtk::Widget = match video {
-        Some(url) => {
-            let stream = gtk::MediaFile::for_file(&gio::File::for_uri(&url));
-            let video = gtk::Video::builder().autoplay(true).vexpand(true).build();
-            video.set_media_stream(Some(&stream));
-            video.upcast()
-        }
-        None => {
-            let picture = gtk::Picture::builder()
-                .content_fit(gtk::ContentFit::Contain)
-                .can_shrink(true)
-                .vexpand(true)
-                .build();
-            images::load_picture(&picture, image);
-            picture.upcast()
-        }
-    };
+    let picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Contain)
+        .can_shrink(true)
+        .vexpand(true)
+        .build();
+    let overlay = gtk::Overlay::builder().child(&picture).vexpand(true).build();
+    images::load_picture(&picture, image);
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
-    toolbar.set_content(Some(&content));
+    toolbar.set_content(Some(&overlay));
     let dialog = adw::Dialog::builder()
         .content_width(900)
         .content_height(900)
         .child(&toolbar)
         .build();
+    if let Some(url) = video {
+        video::play_in_dialog(&dialog, &overlay, &picture, &url, true, || {});
+    }
     dialog.present(Some(&main.window));
 }
 
@@ -57,27 +50,12 @@ pub fn open_disappearing(main: &Rc<Main>, content: Ephemeral, note: &str) {
         .can_shrink(true)
         .build();
     overlay.set_child(Some(&picture));
-    let stream = match content {
+    let video_url = match content {
         Ephemeral::Photo(texture) => {
             picture.set_paintable(Some(&texture));
             None
         }
-        Ephemeral::Video(url) => {
-            let stream = gtk::MediaFile::for_file(&gio::File::for_uri(&url));
-            stream.set_loop(false);
-            picture.set_paintable(Some(&stream));
-            stream.play();
-            let ended = gtk::Label::builder()
-                .label("Finished")
-                .css_classes(["osd", "media-counter"])
-                .halign(gtk::Align::Center)
-                .valign(gtk::Align::Center)
-                .visible(false)
-                .build();
-            overlay.add_overlay(&ended);
-            stream.connect_ended_notify(move |s| ended.set_visible(s.is_ended()));
-            Some(stream)
-        }
+        Ephemeral::Video(url) => Some(url),
     };
 
     let header = adw::HeaderBar::builder()
@@ -91,11 +69,19 @@ pub fn open_disappearing(main: &Rc<Main>, content: Ephemeral, note: &str) {
         .content_height(900)
         .child(&toolbar)
         .build();
+    if let Some(url) = video_url {
+        // Plays once; it can't be scrubbed back and rewatched.
+        let ended = gtk::Label::builder()
+            .label("Finished")
+            .css_classes(["osd", "media-counter"])
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        overlay.add_overlay(&ended);
+        video::play_in_dialog(&dialog, &overlay, &picture, &url, false, move || ended.set_visible(true));
+    }
     dialog.connect_closed(move |_| {
-        if let Some(stream) = &stream {
-            stream.pause();
-            stream.set_file(gio::File::NONE);
-        }
         picture.set_paintable(gdk::Paintable::NONE);
     });
     dialog.present(Some(&main.window));

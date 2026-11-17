@@ -194,6 +194,21 @@ button.disappearing.openable image {
   background-image: linear-gradient(to bottom, alpha(black, 0.55), alpha(black, 0));
 }
 
+.story-viewer .story-bottom {
+  padding: 24px 10px 10px 10px;
+  background-image: linear-gradient(to top, alpha(black, 0.55), alpha(black, 0));
+}
+
+.story-viewer .story-bottom entry {
+  border-radius: 999px;
+  padding-left: 12px;
+  padding-right: 12px;
+}
+
+.story-viewer .story-liked {
+  color: #ed4956;
+}
+
 .story-viewer progressbar.horizontal > trough,
 .story-viewer progressbar.horizontal > trough > progress {
   min-height: 3px;

@@ -407,18 +407,17 @@ impl HomePage {
         }
     }
 
-    /// Stories viewer reports which reels were watched (and their items, so
-    /// reopening doesn't refetch).
+    /// The story viewer reports how far each reel was watched (and its items,
+    /// so reopening doesn't refetch and starts at the first unwatched story).
     pub fn reel_viewed(self: &Rc<Self>, reel: &Reel) {
         let mut changed = false;
         if let Some(r) = self.reels.borrow_mut().iter_mut().find(|r| r.id == reel.id) {
             if r.items.is_empty() {
                 r.items = reel.items.clone();
             }
-            if r.has_unseen() {
-                r.seen = r.latest_reel_media;
-                changed = true;
-            }
+            let was_unseen = r.has_unseen();
+            r.seen = r.seen.max(reel.seen);
+            changed = was_unseen != r.has_unseen();
         }
         if changed {
             self.render_stories();

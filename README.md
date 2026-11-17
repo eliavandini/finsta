@@ -23,6 +23,9 @@ There are no reels, no explore page, no suggested posts and no ads.
   older conversations load only when you press a button.
 - **Shared reels in chats open in your browser**, so a conversation can't
   turn into a reel feed.
+- **Videos play by themselves while they're on screen**, muted and one at a
+  time, and stop when you scroll past them. The speaker button turns the
+  sound on for all of them. Stories play with sound.
 
 ## Layout
 
@@ -37,12 +40,11 @@ There are no reels, no explore page, no suggested posts and no ads.
 You need Rust (via [rustup](https://rustup.rs)) and the development packages
 for GTK 4, libadwaita, GStreamer and WebKitGTK 6.0. Videos play through
 GStreamer, which needs gst-plugins-good and an H.264 decoder such as
-gst-libav; story videos also need GStreamer's GTK 4 sink (gst-plugin-gtk4),
-and show as still images without it.
+gst-libav.
 
 ```sh
 # Arch Linux
-sudo pacman -S --needed base-devel rustup gtk4 libadwaita webkitgtk-6.0 gstreamer gst-plugins-good gst-libav gst-plugin-gtk4
+sudo pacman -S --needed base-devel rustup gtk4 libadwaita webkitgtk-6.0 gstreamer gst-plugins-good gst-libav
 
 ./install.sh              # for your user, into ~/.local
 ./install.sh --system     # for all users, into /usr/local (asks for sudo)
@@ -93,7 +95,11 @@ iPhone app, which Instagram now rejects.) That means:
   message text) with `dm:` and `web:` prefixes, visible with
   `journalctl --user | grep finsta:`.
 - Opening a conversation marks it as read on Instagram, so the other
-  person sees "Seen", just like on instagram.com.
+  person sees "Seen", just like on instagram.com. Likewise, watching a
+  story marks it as seen, so you appear in its viewers, and the viewer
+  starts at the first story you haven't watched yet.
+- You can like stories and reply to them; replies arrive in your
+  conversation with that person.
 - Not supported yet in messages: disappearing photos, voice messages,
   sending anything but text. They show a note to use instagram.com
   instead.
