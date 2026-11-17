@@ -277,3 +277,27 @@ button.disappearing.openable image {
   font-size: smaller;
   font-weight: bold;
 }
+
+/* Saved: folder cards and covers. */
+.folder-cover {
+  border-radius: 12px;
+  background-color: alpha(currentColor, 0.08);
+}
+.folder-card {
+  padding: 6px;
+  border-radius: 16px;
+}
+.folder-card.selected {
+  background-color: alpha(@accent_bg_color, 0.18);
+}
+.folder-card.selected .heading {
+  color: @accent_color;
+}
+
+/* The small save button next to a song. */
+button.song-save {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  -gtk-icon-size: 12px;
+}

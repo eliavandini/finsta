@@ -564,21 +564,26 @@ impl Client {
         Ok(())
     }
 
+    /// Reply to a story, with the inputs instagram.com's
+    /// IGDMAPISendStoryShareReply builds.
     pub(super) async fn slide_story_reply(&self, st: &mut DmState, owner_pk: &str, media_id: &str, text: &str) -> Result<()> {
-        let viewer_pk = self.user_id();
-        let igid = st
-            .slide
-            .one_to_one(owner_pk, &viewer_pk)
-            .map(|id| s(&st.slide.threads.get(&id).cloned().unwrap_or_default()["thread_id"]))
-            .filter(|id| !id.is_empty());
-        let recipients = igid.is_none().then(|| vec![owner_pk.to_string()]);
+        let otid = time_id().to_string();
         let vars = json!({
-            "data": {"media_id": media_id.split('_').next().unwrap_or(media_id), "reel_id": owner_pk, "text": text},
+            "data": {
+                "is_shh_mode": false,
+                "media_id": media_id.split('_').next().unwrap_or(media_id),
+                "reaction_emoji": null,
+                "reel_id": owner_pk,
+                "sampled": false,
+                "share_client_context": otid,
+                "text": {"sensitive_string_value": text},
+            },
             "send_data": {
-                "ig_thread_igid": igid,
-                "recipient_igids": recipients,
-                "offline_threading_id": time_id().to_string(),
-                "send_attribution": "reel_feed_timeline",
+                "forwarded_from_thread_id": null,
+                "is_forwarded_from_own_message": null,
+                "offline_threading_id": otid,
+                "recipient_users": json!([owner_pk]).to_string(),
+                "thread_id": null,
             },
         });
         let data = self.slide_op(st, STORY_REPLY, vars).await?;

@@ -421,7 +421,15 @@ impl Main {
     }
 
     pub fn open_saved(self: &Rc<Self>) {
-        let page = crate::ui::saved::page(self);
+        self.show_saved(crate::ui::saved::Start::All);
+    }
+
+    pub fn open_saved_songs(self: &Rc<Self>) {
+        self.show_saved(crate::ui::saved::Start::Songs);
+    }
+
+    fn show_saved(self: &Rc<Self>, start: crate::ui::saved::Start) {
+        let page = crate::ui::saved::page(self, start);
         self.clear_search();
         self.nav.replace(&[page]);
         self.after_sidebar_choice();

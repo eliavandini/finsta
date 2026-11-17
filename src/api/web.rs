@@ -3,10 +3,54 @@
 
 use std::collections::HashSet;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::{Client, Media, Page, User, WEB_REFERER, is_login_required, is_rate_limited, parse};
+use super::{Client, Media, Page, User, WEB_REFERER, is_login_required, is_rate_limited, media_pk, parse};
+
+/// A folder of saved posts.
+#[derive(Debug, Clone, Default)]
+pub struct Collection {
+    pub id: String,
+    pub name: String,
+    pub count: Option<i64>,
+    pub cover: Option<String>,
+}
+
+fn text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Every folder in an answer (the older route and the website's query
+/// both describe them with a collection_id and a collection_name).
+fn collect_collections(v: &Value, out: &mut Vec<Collection>) {
+    match v {
+        Value::Object(o) if o.contains_key("collection_id") && o.contains_key("collection_name") => {
+            let id = text(&v["collection_id"]);
+            let auto = text(&v["collection_type"]).contains("AUTO") || id.contains("AUTO");
+            if id.is_empty() || auto || out.iter().any(|c| c.id == id) {
+                return;
+            }
+            let cover = [&v["cover_media"], &v["cover_media_list"][0]]
+                .into_iter()
+                .filter_map(parse::<Media>)
+                .find_map(|m| m.image_url(320));
+            out.push(Collection {
+                id,
+                name: text(&v["collection_name"]),
+                count: v["collection_media_count"].as_i64(),
+                cover,
+            });
+        }
+        Value::Object(o) => o.values().for_each(|x| collect_collections(x, out)),
+        Value::Array(a) => a.iter().for_each(|x| collect_collections(x, out)),
+        _ => {}
+    }
+}
 
 /// The media id behind a post's shortcode (the CODE in /p/CODE/).
 pub fn shortcode_pk(code: &str) -> Option<String> {
@@ -102,10 +146,20 @@ impl Client {
             Ok(data) => {
                 let mut found = Vec::new();
                 collect_media(&data, &mut HashSet::new(), &mut found);
+                let found_any = !found.is_empty();
                 if let Some(m) = found.into_iter().find(|m| m.code == code) {
                     return Ok(m);
                 }
-                eprintln!("finsta: post query answered without the post; trying the older route");
+                // What came back instead (field names only).
+                let items = data["xdt_api__v1__media__shortcode__web_info"]["items"].as_array();
+                let has = |k: &str| items.is_some_and(|i| i.iter().any(|m| !m[k].is_null()));
+                eprintln!(
+                    "finsta: post query answered without the post ({} items; code {}, images {}, user {}, other posts {found_any}); trying the older route",
+                    items.map_or(0, Vec::len),
+                    has("code"),
+                    has("image_versions2"),
+                    has("user"),
+                );
             }
             Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
             Err(e) => eprintln!("finsta: post query failed ({e}); trying the older route"),
@@ -115,13 +169,17 @@ impl Client {
         parse::<Media>(&v["items"][0]).ok_or_else(|| anyhow!("This post isn't available"))
     }
 
-    /// Your saved posts, a page at a time.
-    pub async fn saved_posts(&self, max_id: Option<String>) -> Result<Page<Media>> {
+    /// Your saved posts, a page at a time: all of them, or one folder's.
+    pub async fn saved_posts(&self, folder: Option<&str>, max_id: Option<String>) -> Result<Page<Media>> {
         let mut query = Vec::new();
         if let Some(id) = &max_id {
             query.push(("max_id", id.clone()));
         }
-        let v = self.get("feed/saved/posts/", &query).await?;
+        let path = match folder {
+            Some(id) => format!("feed/collection/{id}/posts/"),
+            None => "feed/saved/posts/".to_string(),
+        };
+        let v = self.get(&path, &query).await?;
         let items: Vec<Media> = v["items"]
             .as_array()
             .into_iter()
@@ -130,8 +188,66 @@ impl Client {
             .collect();
         let next = v["next_max_id"].as_str().map(str::to_string).filter(|s| !s.is_empty());
         let more = v["more_available"].as_bool().unwrap_or(next.is_some());
-        eprintln!("finsta: saved: {} posts, more {more}", items.len());
+        eprintln!(
+            "finsta: saved: {} posts{}, more {more}",
+            items.len(),
+            if folder.is_some() { " in a folder" } else { "" }
+        );
         Ok(Page { items, next_max_id: next, more_available: more })
+    }
+
+    /// Your folders of saved posts (not "All posts" itself).
+    pub async fn saved_folders(&self) -> Result<Vec<Collection>> {
+        let query = [
+            ("collection_types", r#"["ALL_MEDIA_AUTO_COLLECTION","MEDIA"]"#.to_string()),
+            ("include_public_only", "0".to_string()),
+            ("get_cover_media_lists", "true".to_string()),
+        ];
+        let mut out = Vec::new();
+        match self.get("collections/list/", &query).await {
+            Ok(v) => {
+                collect_collections(&v, &mut out);
+                eprintln!("finsta: saved: {} folders", out.len());
+                return Ok(out);
+            }
+            Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+            Err(e) => eprintln!("finsta: saved folders: older route failed ({e}); trying the website's query"),
+        }
+        let data = self
+            .web_query("PolarisSavedCollectionPickerQuery", json!({"first": 50, "after": null}), WEB_REFERER)
+            .await?;
+        collect_collections(&data, &mut out);
+        eprintln!("finsta: saved: {} folders (website query)", out.len());
+        Ok(out)
+    }
+
+    /// Save or unsave a post. With a folder, it's saved into that folder.
+    pub async fn save_post(&self, media: &Media, save: bool, folder: Option<&str>) -> Result<()> {
+        let pk = media_pk(&media.id).to_string();
+        if folder.is_none() {
+            let name = if save { "usePolarisSaveMediaSaveMutation" } else { "usePolarisSaveMediaUnsaveMutation" };
+            match self.web_query(name, json!({"input": {"media_id": pk}}), WEB_REFERER).await {
+                Ok(data) => {
+                    if !data["xig_media_save"].is_object() && !data["xig_media_unsave"].is_object() {
+                        eprintln!("finsta: save: Instagram answered without confirming");
+                    }
+                    return Ok(());
+                }
+                Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+                Err(e) => eprintln!("finsta: save query failed ({e}); trying the older route"),
+            }
+        }
+        let mut form = vec![("module_name", "feed_timeline".to_string())];
+        if let Some(id) = folder {
+            let list = if id.bytes().all(|b| b.is_ascii_digit()) { format!("[{id}]") } else { json!([id]).to_string() };
+            form.push(("added_collection_ids", list));
+        }
+        let action = if save { "save" } else { "unsave" };
+        let v = self.post(&format!("media/{pk}/{action}/"), &form).await?;
+        if v["status"] != "ok" {
+            bail!("Instagram didn't confirm it");
+        }
+        Ok(())
     }
 
     /// Accounts matching `query` (instagram.com's search box).
@@ -184,18 +300,16 @@ impl Client {
         Ok(users)
     }
 
-    /// Posts matching `query` (words or a #hashtag), as on instagram.com's
-    /// search results page: one short, fixed list.
+    /// Top posts for a hashtag (with or without the #): one short, fixed
+    /// list. (instagram.com's search results page for words is gone.)
     pub async fn search_posts(&self, query: &str) -> Result<Vec<Media>> {
-        let v = self
-            .get(
-                "fbsearch/web/top_serp/",
-                &[("enable_metadata", "true".into()), ("query", query.to_string())],
-            )
-            .await?;
+        let Some(tag) = hashtag(query) else { return Ok(Vec::new()) };
+        let v = self.get("tags/web_info/", &[("tag_name", tag)]).await?;
         let mut posts = Vec::new();
         collect_media(&v, &mut HashSet::new(), &mut posts);
+        posts.retain(|m| !m.is_ad());
         posts.truncate(24);
+        eprintln!("finsta: search: {} posts for a hashtag", posts.len());
         Ok(posts)
     }
 
@@ -213,6 +327,12 @@ impl Client {
     }
 }
 
+/// The hashtag a search is for: one word, with or without the #.
+pub fn hashtag(query: &str) -> Option<String> {
+    let tag = query.trim().trim_start_matches('#');
+    (!tag.is_empty() && tag.chars().all(|c| c.is_alphanumeric() || c == '_')).then(|| tag.to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +345,23 @@ mod tests {
         assert_eq!(link_code("https://www.instagram.com/reel/ABC123/").as_deref(), Some("ABC123"));
         assert_eq!(link_code("https://www.instagram.com/someone/p/XYZ/").as_deref(), Some("XYZ"));
         assert_eq!(link_code("https://www.instagram.com/stories/someone/123/"), None);
+        assert_eq!(hashtag("#Sunset").as_deref(), Some("sunset"));
+        assert_eq!(hashtag("sunset"), Some("sunset".into()));
+        assert_eq!(hashtag("two words"), None);
+    }
+
+    #[test]
+    fn folders() {
+        let v = json!({"items": [
+            {"collection_id": "ALL_MEDIA_AUTO_COLLECTION", "collection_name": "All posts", "collection_type": "ALL_MEDIA_AUTO_COLLECTION"},
+            {"collection_id": 17890, "collection_name": "Recipes", "collection_type": "MEDIA", "collection_media_count": 4,
+             "cover_media_list": [{"image_versions2": {"candidates": [{"url": "https://x/c.jpg", "width": 640, "height": 640}]}}]},
+        ]});
+        let mut out = Vec::new();
+        collect_collections(&v, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "17890");
+        assert_eq!(out[0].count, Some(4));
+        assert_eq!(out[0].cover.as_deref(), Some("https://x/c.jpg"));
     }
 }

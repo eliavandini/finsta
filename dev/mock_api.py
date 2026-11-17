@@ -73,7 +73,7 @@ def media(mid, pk, caption, ago, w=1080, h=1350, likes=120, comments=8, mtype=1,
     m = {
         "id": f"{mid}_{pk}", "pk": int(mid), "code": f"C{mid}xyz", "media_type": mtype,
         "taken_at": NOW - ago, "user": USERS[pk], "caption": {"text": caption} if caption else None,
-        "like_count": likes, "comment_count": comments, "has_liked": False,
+        "like_count": likes, "comment_count": comments, "has_liked": False, "has_viewer_saved": SAVED.get(str(mid), False),
         "original_width": w, "original_height": h,
         "image_versions2": {"candidates": [{"url": img(f"post{mid}", w, h), "width": w, "height": h}]},
     }
@@ -237,7 +237,11 @@ WEB_DOCS = {"25000000000000006": "PolarisFeedTimelineRootV2Query", "250000000000
             "25000000000000005": "usePolarisLikeMediaXIGUnlikeMutation", "25000000000000007": "PolarisAPIReelSeenMutation",
             "25000000000000008": "usePolarisStoryLikesLikeMutation", "25000000000000009": "usePolarisStoryLikesUnlikeMutation",
             "25000000000000010": "PolarisPostRootQuery", "25000000000000011": "PolarisSearchBoxRefetchableQuery",
-            "25000000000000012": "IGDOmniPickerSearchResultsListQuery"}
+            "25000000000000012": "IGDOmniPickerSearchResultsListQuery", "25000000000000013": "usePolarisSaveMediaSaveMutation",
+            "25000000000000014": "usePolarisSaveMediaUnsaveMutation", "25000000000000015": "PolarisSavedCollectionPickerQuery"}
+SAVED = {"703": True}  # media pk -> saved
+FOLDERS = {"17841": ["Recipes", set()], "17842": ["Travel", set()]}
+SAVE_FAILS = "--save-fails" in sys.argv  # the website's save mutation fails, so the older route is used
 # Saved-style definitions: what the app reads to fill in and fit inputs.
 WEB_MODULES = (
     '__d("PolarisFeedTimelineRootV2Query.graphql",["PolarisFeedTimelineRootV2Query_instagramRelayOperation"],(function(t,n,r,o,a,i){var e=(function(){'
@@ -428,16 +432,27 @@ def slide_answer(op, v):
         if REPLY_FAILS:
             return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
         d, sd = v.get("data") or {}, v.get("send_data") or {}
-        if not str(d.get("media_id", "")).isdigit() or not d.get("text") or not sd.get("offline_threading_id") \
-                or not (sd.get("ig_thread_igid") or sd.get("recipient_igids")):
+        if set(d) != {"is_shh_mode", "media_id", "reaction_emoji", "reel_id", "sampled", "share_client_context", "text"} \
+                or set(sd) != {"forwarded_from_thread_id", "is_forwarded_from_own_message", "offline_threading_id", "recipient_users", "thread_id"}:
+            return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        text = (d.get("text") or {}).get("sensitive_string_value")
+        if not str(d.get("media_id", "")).isdigit() or not text or not sd.get("offline_threading_id") \
+                or not (sd.get("thread_id") or isinstance(sd.get("recipient_users"), str)):
             return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
-        key = next((k for k in MESSAGES if f"34028236684171030{k}" == sd.get("ig_thread_igid")), None)
-        sent = msg(f"r{time.time_ns()}", ME_CHAT, 0, d["text"])
+        key = one_to_one(json.loads(sd["recipient_users"])[0]) if sd.get("recipient_users") else None
+        sent = msg(f"r{time.time_ns()}", ME_CHAT, 0, text)
         if key is not None:
             MESSAGES[key].append(sent)
         return {"data": {"direct_story_share_reply_with_slide_message_response": {"message_id": sent["mid"], "timestamp_ms": str(sent["ts"]), "id": "x"}}}
     if op == "send":
         key = next((k for k in MESSAGES if f"34028236684171030{k}" == v.get("ig_thread_igid")), None)
+        if key is None and v.get("recipient_igids"):
+            key = one_to_one(v["recipient_igids"][0])
+            chat = next((c for c, pk in CHAT_USERS.items() if pk == str(v["recipient_igids"][0])), None)
+            if key is None and chat is not None:  # Instagram starts the conversation
+                key = max(list(CONVOS) + list(OLDER_CONVOS)) + 1
+                CONVOS[key] = ["", 1, [chat], NOW * 1000]
+                MESSAGES[key] = []
         if key is None or not v.get("offline_threading_id") or not v.get("text"):
             return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
         sent = msg(f"s{time.time_ns()}", ME_CHAT, 0, v["text"])
@@ -464,6 +479,10 @@ def following_feed():
         pk = authors[i % len(authors)]
         m = nulls(media(str(700 + i), pk, f"following post {i}", 3600 * 2 + i * 11 * 3600, w=1080, h=1080))
         m["organic_tracking_token"] = f"tok{700 + i}"
+        if i == 1:
+            m["product_type"] = "clips"
+            m["clips_metadata"] = {"music_info": {"music_asset_info": {"audio_cluster_id": "5550001", "title": "Night Drive",
+                                   "display_artist": "Neon Coast", "cover_artwork_thumbnail_uri": img("cover1", 200, 200)}}}
         if VIDEOS and i % 4 == 1:
             m["media_type"] = 2
             m["video_versions"] = [{"type": 101, "url": f"{BASE}/vid/{VIDEOS[i % len(VIDEOS)]}", "width": 720, "height": 1280}]
@@ -487,6 +506,11 @@ def media_by_code(code):
     return m
 
 
+def one_to_one(pk):
+    """The 1:1 conversation with someone, by profile id."""
+    return next((k for k, c in CONVOS.items() if c[1] == 1 and CHAT_USERS.get(c[2][0]) == str(pk)), None)
+
+
 def web_answer(name, v):
     pv = {k: x for k, x in v.items() if k.startswith("__relay_internal__pv__")}
     if name == "PolarisPostRootQuery":
@@ -502,6 +526,16 @@ def web_answer(name, v):
         hits = [slide_user(c) for c in CHAT_USERS if q in USERS[CHAT_USERS[c]]["username"]]
         return {"data": {"xfb_combinedIGSearchQuery": {"search_messenger_contact_v2": [{**h, "pk": h["id"]} for h in hits]}}}
     bad = {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675030}], "data": None}
+    if name.startswith("usePolarisSaveMedia"):
+        i = v.get("input") or {}
+        if SAVE_FAILS or set(v) != {"input"} or set(i) != {"media_id"} or not str(i["media_id"]).isdigit():
+            return bad
+        save = name == "usePolarisSaveMediaSaveMutation"
+        SAVED[str(i["media_id"])] = save
+        return {"data": {"xig_media_save" if save else "xig_media_unsave": {"id": str(i["media_id"])}}}
+    if name == "PolarisSavedCollectionPickerQuery":
+        return {"data": {"viewer": {"media_collections": {"edges": [{"node": {"collection_id": k, "collection_name": f[0], "id": k}}
+                for k, f in FOLDERS.items()], "page_info": {"end_cursor": None, "has_next_page": False}}}}}
     if name == "PolarisAPIReelSeenMutation":
         reel_id, item = str(v.get("reelId")), str(v.get("reelMediaId"))
         if reel_id not in USERS or not item.isdigit() or not item.startswith(f"9{reel_id}") or v.get("reelMediaOwnerId") != reel_id \
@@ -885,6 +919,29 @@ class Handler(BaseHTTPRequestHandler):
             items = [{"media": media(str(800 + start + i), ["1001", "1003", "1005"][i % 3], f"saved post {start + i}", 86400 * (i + 2), w=1080, h=1080)}
                      for i in range(9 if start == 0 else 4)]
             return self.send_json({"items": items, "more_available": start == 0, "next_max_id": "s2" if start == 0 else None, "status": "ok"})
+        if p == "collections/list/":
+            if "--folders-v1-fails" in sys.argv:
+                return self.send_json({"status": "fail", "message": "mock: no"}, 400)
+            items = [{"collection_id": "ALL_MEDIA_AUTO_COLLECTION", "collection_name": "All posts", "collection_type": "ALL_MEDIA_AUTO_COLLECTION"}]
+            for k, f in FOLDERS.items():
+                items.append({"collection_id": int(k), "collection_name": f[0], "collection_type": "MEDIA", "collection_media_count": 4 + len(f[1]),
+                              "cover_media_list": [{"image_versions2": {"candidates": [{"url": img(f"folder{k}", 640, 640), "width": 640, "height": 640}]}}]})
+            return self.send_json({"items": items, "more_available": False, "status": "ok"})
+        if m := re.match(r"feed/collection/(\d+)/posts/", p):
+            base = 900 + (int(m.group(1)) % 10) * 10
+            items = [{"media": media(str(base + i), ["1002", "1004"][i % 2], f"folder post {i}", 86400 * (i + 1), w=1080, h=1080)} for i in range(4)]
+            items += [{"media": media(pk, "1001", "added to the folder", 3600, w=1080, h=1080)} for pk in FOLDERS[m.group(1)][1]]
+            return self.send_json({"items": items, "more_available": False, "status": "ok"})
+        if m := re.match(r"media/(\d+)/(save|unsave)/", p):
+            SAVED[m.group(1)] = m.group(2) == "save"
+            for fid in json.loads(body.get("added_collection_ids", ["[]"])[0]):
+                FOLDERS[str(fid)][1].add(m.group(1))
+            return self.send_json({"status": "ok"})
+        if p == "tags/web_info/":
+            tag = q.get("tag_name", [""])[0]
+            medias = [{"media": media(str(850 + i), ["1002", "1004"][i % 2], f"#{tag} number {i}", 86400 * (i + 1), w=1080, h=1080)} for i in range(7)]
+            return self.send_json({"data": {"top": {"sections": [{"layout_type": "media_grid", "layout_content": {"medias": medias[:3]}},
+                                                                {"layout_type": "media_grid", "layout_content": {"medias": medias[3:]}}]}}, "status": "ok"})
         if p == "fbsearch/web/top_serp/":
             word = q.get("query", [""])[0]
             medias = [{"media": media(str(850 + i), ["1002", "1004"][i % 2], f"a post about {word} #{i}", 86400 * (i + 1), w=1080, h=1080)} for i in range(7)]

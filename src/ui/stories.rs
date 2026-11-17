@@ -11,7 +11,7 @@ use crate::api::{Media, Reel, StoryReply, User};
 use crate::rt;
 use crate::ui::video::{self, Opts, Player};
 use crate::ui::window::Main;
-use crate::ui::{download, images, post, util};
+use crate::ui::{download, images, post, share, util};
 
 const PHOTO_SECONDS: f64 = 6.0;
 const TICK_MS: u64 = 50;
@@ -51,6 +51,7 @@ struct Viewer {
     /// Buttons for a shared post or a link (above the reply field).
     extras: gtk::Box,
     download_button: gtk::Button,
+    share_button: gtk::Button,
     reply: gtk::Entry,
     like_button: gtk::Button,
     notice: gtk::Label,
@@ -126,7 +127,13 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     info.append(&avatar_slot);
     info.append(&name);
     info.append(&time);
+    let share_button = gtk::Button::builder()
+        .icon_name("share-symbolic")
+        .tooltip_text("Share This Story")
+        .css_classes(["flat", "circular"])
+        .build();
     info.append(&gtk::Box::builder().hexpand(true).build());
+    info.append(&share_button);
     info.append(&download_button);
     info.append(&mute_button);
     info.append(&pause_button);
@@ -226,6 +233,7 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
         details,
         extras,
         download_button,
+        share_button,
         reply,
         like_button,
         notice,
@@ -266,6 +274,8 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     viewer.like_button.connect_clicked(move |_| f());
     let f = with(|v| v.download());
     viewer.download_button.connect_clicked(move |_| f());
+    let f = with(|v| v.share());
+    viewer.share_button.connect_clicked(move |_| f());
     let f = with(|v| v.send_reply());
     viewer.reply.connect_activate(move |_| f());
 
@@ -605,8 +615,11 @@ impl Viewer {
     fn render_details(self: &Rc<Self>, item: &Media) {
         util::clear_box(&self.details);
         util::clear_box(&self.extras);
-        if let Some(music) = item.music() {
-            self.details.append(&post::music_label(&music));
+        if let Some(song) = item.song()
+            && let Some(main) = self.main.upgrade()
+        {
+            let from = self.current().map(|(reel, item)| story_url(&reel, &item));
+            self.details.append(&post::music_label(&main, &song, from, Some(self.notifier())));
         }
         let open_profile = |label: String, user: User| {
             let b = gtk::Button::builder()
@@ -679,6 +692,37 @@ impl Viewer {
         }
         self.details.set_visible(self.details.first_child().is_some());
         self.extras.set_visible(self.extras.first_child().is_some());
+    }
+
+    /// Report something in the viewer (Finsta's toasts are behind it).
+    fn notifier(self: &Rc<Self>) -> share::Notify {
+        let weak = Rc::downgrade(self);
+        Rc::new(move |text: &str| {
+            if let Some(v) = weak.upgrade() {
+                v.show_notice(text);
+            }
+        })
+    }
+
+    fn share(self: &Rc<Self>) {
+        let Some((reel, item)) = self.current() else { return };
+        let Some(main) = self.main.upgrade() else { return };
+        // Hold the story while the share sheet is open.
+        let paused_here = !self.paused.get();
+        if paused_here {
+            self.toggle_pause();
+        }
+        let weak = Rc::downgrade(self);
+        let resume: Box<dyn Fn()> = Box::new(move || {
+            if paused_here
+                && let Some(v) = weak.upgrade()
+                && v.paused.get()
+            {
+                v.toggle_pause();
+            }
+        });
+        let shared = share::Shared { url: story_url(&reel, &item), kind: share::Kind::Story };
+        share::open(&main, shared, Some(self.notifier()), Some(resume));
     }
 
     fn download(self: &Rc<Self>) {
@@ -823,4 +867,10 @@ impl Viewer {
             d.close();
         }
     }
+}
+
+/// A story's address on instagram.com.
+fn story_url(reel: &Reel, item: &Media) -> String {
+    let pk = item.id.split('_').next().unwrap_or(&item.id);
+    format!("https://www.instagram.com/stories/{}/{pk}/", reel.user.username)
 }

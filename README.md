@@ -31,18 +31,29 @@ There are no reels, no explore page, no suggested posts and no ads.
 ## Layout
 
 - **Top bar**: a search field (<kbd>Ctrl</kbd>+<kbd>F</kbd>) for
-  conversations, people you could message, accounts and posts (words,
-  #hashtags, or a pasted post or reel link).
+  conversations, people you could message, accounts, a hashtag's top posts
+  (one word, with or without the #), or the post a pasted link points to.
 - **Sidebar**: Home, the list of conversations (filter by All / People /
   Groups), your Profile, and your Saved posts (the bookmark button).
-- **Content**: home feed with stories, conversations, profiles and posts.
-  On narrow windows the sidebar folds away.
+- **Content**: home feed with stories (the tray spans the whole page),
+  conversations, profiles and posts. On narrow windows the sidebar folds
+  away.
+- **Saved** (the bookmark button next to your profile): your folders across
+  the top, All Posts, each folder you made on Instagram, and Songs, with
+  the chosen folder's posts filling the page below.
 - **Feed layout** (the grid button above the feed): 1 to 4 columns, small,
   medium or large posts, and comments beside each post. Fewer columns, and
   comments below posts, are used when the window is too narrow. Saved in
   `~/.config/finsta/settings.json`.
 - **Posts** on a wide window show the photo or video on the left, and the
   account, caption, music, comments and a comment field on the right.
+  Under each post: like, comment, share, download and save. After saving,
+  "Add to Folder" puts the post in one of your folders.
+- **Sharing**: the paper plane button on posts, reels and stories sends
+  them to one or more conversations (or anyone you search for), with an
+  optional message, or copies the link.
+- **Songs**: the bookmark next to the song on a post, reel or story saves
+  it to Saved › Songs, with a button to get back to what it was on.
 - **Stories** show their music, who a reshared story is from, a button to
   open the post or reel it shares, links and mentions.
 - **Messages**: right-click a message (or long-press on a touchscreen) to
@@ -117,9 +128,15 @@ iPhone app, which Instagram now rejects.) That means:
   conversation with that person. If Instagram turns down the story reply
   (its format isn't fully known yet), Finsta tries the older route, and
   then sends your reply as a message with a link to the story.
-- Message reactions, search and saved posts use requests whose exact
-  format Finsta learns from the website's scripts; until it has seen them,
-  some of these may fail and say so in the log.
+- Message reactions, search, saving posts and saved folders use requests
+  whose exact format Finsta learns from the website's scripts; until it has
+  seen them, some of these may fail and say so in the log.
+- Shared posts, reels and stories are sent as links, which Instagram shows
+  as a preview. Sending them the way the app does needs a format Finsta
+  hasn't learned yet.
+- Saved songs stay in Finsta (`~/.config/finsta/saved_songs.json`):
+  instagram.com has no way to save a sound, so they don't appear in the
+  app's saved audio.
 - Not supported yet in messages: disappearing photos, voice messages,
   sending anything but text. They show a note to use instagram.com
   instead.

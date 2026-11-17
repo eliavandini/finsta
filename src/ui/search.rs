@@ -257,8 +257,12 @@ impl SearchPage {
         self.people.borrow_mut().clear();
         self.posts_grid.remove_all();
         self.posts.borrow_mut().clear();
-        self.posts_title.set_visible(!q.is_empty());
-        self.posts_status.set_visible(!q.is_empty());
+        // Posts: the one a pasted link points to, or a hashtag's top posts.
+        let link = api::web::link_code(query.trim());
+        let posts_wanted = link.is_some() || api::web::hashtag(&q).is_some();
+        self.posts_title.set_visible(posts_wanted);
+        self.posts_status.set_visible(posts_wanted);
+        self.posts_title.set_label(if link.is_some() { "Post" } else { "Top Posts for the Hashtag" });
         if q.is_empty() {
             return;
         }
@@ -333,13 +337,12 @@ impl SearchPage {
             });
         }
 
-        // Posts (words or #hashtags), or the post a pasted link points to.
-        {
+        if posts_wanted {
             let client = main.client.clone();
             let weak = Rc::downgrade(self);
             glib::spawn_future_local(async move {
                 let res = rt::bg(async move {
-                    match api::web::link_code(&query) {
+                    match link {
                         Some(code) => client.media_by_code(&code).await.map(|m| vec![m]),
                         None => client.search_posts(&query).await,
                     }
@@ -359,7 +362,9 @@ impl SearchPage {
                         s.posts.replace(posts);
                     }
                     Err(e) => {
-                        s.posts_status.set_visible_child_name("empty");
+                        // Say nothing rather than "No posts found".
+                        s.posts_title.set_visible(false);
+                        s.posts_status.set_visible(false);
                         if api::is_login_required(&e)
                             && let Some(main) = s.main.upgrade()
                         {

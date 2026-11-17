@@ -671,7 +671,7 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 8;
+const META_SCANNER: u64 = 9;
 
 /// How a story reply was delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,6 +709,18 @@ const CALLER_NEEDLES: &[&str] = &[
     "PolarisSearchBoxRefetchableQuery",
     "PolarisPostRootQuery",
     "IGDOmniPickerSearchResultsListQuery",
+    // How the website builds what it sends in chats (reactions, shared
+    // posts, reels and stories), and who calls those builders.
+    "publish({commitMutationConfig",
+    "IGDMAPISend",
+    "IGDirectMediaShareMutation",
+    "IGDirectStoryShareMutation",
+    "IGDirectReelShareMutation",
+    "IGDirectLinkShareMutation",
+    // Saving posts, and folders.
+    "usePolarisSaveMediaSaveMutation",
+    "usePolarisMediaSaveToCollectionAddMediaMutation",
+    "PolarisAPIEditCollectionAddMediaMutation",
 ];
 
 /// Places in the website's own code worth quoting in the log while working
@@ -842,6 +854,7 @@ fn interesting_op(name: &str) -> bool {
         "IGD", "useIGD", "IGDirect", "PolarisDirect", "PolarisProfile", "PolarisStor", "PolarisFeed", "PolarisPost",
         "PolarisUser", "PolarisMedia", "PolarisTimeline", "usePolarisLikeMedia", "usePolarisStor", "usePolarisReel",
         "PolarisAPI", "PolarisReel", "PolarisSearch", "usePolarisSave", "PolarisSaved", "usePolarisComment",
+        "usePolarisMediaSaveToCollection", "PolarisShareSheet",
     ]
     .iter()
     .any(|p| name.starts_with(p))

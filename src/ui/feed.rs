@@ -47,16 +47,21 @@ pub struct HomePage {
 
 impl HomePage {
     pub fn new(main: &Rc<Main>) -> Rc<Self> {
-        let content = gtk::Box::builder()
+        // The title and the stories span the page; the posts are centered.
+        let outer = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(16)
             .margin_top(12)
             .margin_bottom(12)
+            .build();
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(16)
             .margin_start(12)
             .margin_end(12)
             .build();
 
-        let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let top = gtk::Box::builder().spacing(6).margin_start(18).margin_end(18).build();
         let title = gtk::Label::builder()
             .label("Home")
             .xalign(0.0)
@@ -76,16 +81,16 @@ impl HomePage {
         top.append(&title);
         top.append(&layout_button);
         top.append(&refresh);
-        content.append(&top);
+        outer.append(&top);
 
-        let stories_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        let stories_box = gtk::Box::builder().spacing(6).margin_start(12).margin_end(12).build();
         let stories_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
             .vscrollbar_policy(gtk::PolicyType::Never)
             .child(&stories_box)
             .visible(false)
             .build();
-        content.append(&stories_scroller);
+        outer.append(&stories_scroller);
 
         let columns_box = gtk::Box::builder().spacing(GAP).homogeneous(true).build();
         content.append(&columns_box);
@@ -98,9 +103,10 @@ impl HomePage {
             .tightening_threshold(480)
             .child(&content)
             .build();
+        outer.append(&clamp);
         let scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
-            .child(&clamp)
+            .child(&outer)
             .build();
 
         let page = adw::NavigationPage::builder()

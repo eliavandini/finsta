@@ -4,7 +4,7 @@
 //! strings; timestamps are sometimes strings) and frequently adds or drops
 //! fields, so everything here defaults instead of failing.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 pub fn de_id<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
@@ -171,6 +171,8 @@ pub struct Media {
     #[serde(default, deserialize_with = "de_bool")]
     pub has_liked: bool,
     #[serde(default, deserialize_with = "de_bool")]
+    pub has_viewer_saved: bool,
+    #[serde(default, deserialize_with = "de_bool")]
     pub like_and_view_counts_disabled: bool,
     #[serde(default, deserialize_with = "de_bool")]
     pub comments_disabled: bool,
@@ -222,35 +224,82 @@ pub struct Location {
     pub name: String,
 }
 
-fn music_text(info: &Value) -> Option<String> {
-    let title = info["title"].as_str().unwrap_or("").trim();
-    let artist = info["display_artist"].as_str().unwrap_or("").trim();
-    match (title.is_empty(), artist.is_empty()) {
-        (false, false) => Some(format!("{title} · {artist}")),
-        (false, true) => Some(title.to_string()),
-        (true, false) => Some(artist.to_string()),
-        (true, true) => None,
+/// The song or sound a post, reel or story uses.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Song {
+    /// Instagram's id for the sound.
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub artist: String,
+    #[serde(default)]
+    pub cover: Option<String>,
+}
+
+impl Song {
+    /// "Title · Artist".
+    pub fn label(&self) -> String {
+        match (self.title.is_empty(), self.artist.is_empty()) {
+            (false, false) => format!("{} · {}", self.title, self.artist),
+            (false, true) => self.title.clone(),
+            _ => self.artist.clone(),
+        }
     }
 }
 
+fn text_of(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.trim().to_string(),
+        Value::Number(n) => n.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn licensed_song(info: &Value) -> Option<Song> {
+    let song = Song {
+        id: [&info["audio_cluster_id"], &info["audio_asset_id"], &info["id"]]
+            .into_iter()
+            .map(text_of)
+            .find(|s| !s.is_empty())
+            .unwrap_or_default(),
+        title: text_of(&info["title"]),
+        artist: text_of(&info["display_artist"]),
+        cover: [&info["cover_artwork_thumbnail_uri"], &info["cover_artwork_uri"]]
+            .into_iter()
+            .map(text_of)
+            .find(|s| s.starts_with("http")),
+    };
+    (!song.title.is_empty() || !song.artist.is_empty()).then_some(song)
+}
+
 impl Media {
-    /// The song or sound a reel or story uses, as "Title · Artist".
-    pub fn music(&self) -> Option<String> {
+    /// The song or sound a reel or story uses.
+    pub fn song(&self) -> Option<Song> {
         let null = Value::Null;
         let sticker = self.story_music_stickers.as_ref().and_then(|v| v.get(0)).unwrap_or(&null);
-        if let Some(m) = music_text(&sticker["music_asset_info"]) {
-            return Some(m);
+        if let Some(s) = licensed_song(&sticker["music_asset_info"]) {
+            return Some(s);
         }
         for meta in [&self.clips_metadata, &self.music_metadata].into_iter().flatten() {
-            if let Some(m) = music_text(&meta["music_info"]["music_asset_info"]) {
-                return Some(m);
+            if let Some(s) = licensed_song(&meta["music_info"]["music_asset_info"]) {
+                return Some(s);
             }
             let sound = &meta["original_sound_info"];
-            let title = sound["original_audio_title"].as_str().unwrap_or("").trim();
-            let artist = sound["ig_artist"]["username"].as_str().unwrap_or("").trim();
+            let title = text_of(&sound["original_audio_title"]);
+            let artist = text_of(&sound["ig_artist"]["username"]);
             if !title.is_empty() || !artist.is_empty() {
-                let title = if title.is_empty() { "Original audio" } else { title };
-                return Some(if artist.is_empty() { title.to_string() } else { format!("{title} · {artist}") });
+                return Some(Song {
+                    id: [&sound["audio_asset_id"], &sound["audio_cluster_id"], &sound["original_media_id"]]
+                        .into_iter()
+                        .map(text_of)
+                        .find(|s| !s.is_empty())
+                        .unwrap_or_default(),
+                    title: if title.is_empty() { "Original audio".into() } else { title },
+                    artist,
+                    cover: Some(text_of(&sound["ig_artist"]["profile_pic_url"])).filter(|u| u.starts_with("http")),
+                });
             }
         }
         None
@@ -925,5 +974,23 @@ mod tests {
         assert!(r.items.is_empty() && r.user.pk.is_empty());
         let r: Reel = parse(&json!({"id": "42", "items": [post], "image_versions2": {"candidates": null}})).unwrap();
         assert_eq!(r.items.len(), 1);
+    }
+
+    #[test]
+    fn songs() {
+        let reel: Media = parse(&json!({"id": "1", "clips_metadata": {"music_info": {"music_asset_info": {
+            "audio_cluster_id": 77, "title": "Night Drive", "display_artist": "Neon Coast", "cover_artwork_thumbnail_uri": "https://x/c.jpg"}}}}))
+        .unwrap();
+        let song = reel.song().unwrap();
+        assert_eq!((song.id.as_str(), song.label().as_str()), ("77", "Night Drive · Neon Coast"));
+        assert_eq!(song.cover.as_deref(), Some("https://x/c.jpg"));
+        let original: Media = parse(&json!({"id": "2", "clips_metadata": {"music_info": null, "original_sound_info": {
+            "audio_asset_id": "88", "original_audio_title": "", "ig_artist": {"username": "someone"}}}}))
+        .unwrap();
+        assert_eq!(original.song().unwrap().label(), "Original audio · someone");
+        let story: Media = parse(&json!({"id": "3", "story_music_stickers": [{"music_asset_info": {"id": "99", "title": "Summer Song"}}]})).unwrap();
+        assert_eq!(story.song().unwrap().label(), "Summer Song");
+        let plain: Media = parse(&json!({"id": "4"})).unwrap();
+        assert!(plain.song().is_none() && !plain.has_viewer_saved);
     }
 }

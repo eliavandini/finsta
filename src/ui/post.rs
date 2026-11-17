@@ -8,13 +8,13 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::glib;
 
-use crate::api::Media;
+use crate::api::{Media, Song};
 use crate::rt;
 use crate::ui::layout::SIDE_WIDTH;
 use crate::ui::ratio_bin::RatioBin;
 use crate::ui::util;
 use crate::ui::window::Main;
-use crate::ui::{comments, download, images, video};
+use crate::ui::{comments, download, images, saving, share, video};
 
 /// How a feed card is drawn.
 #[derive(Debug, Clone, Copy)]
@@ -97,8 +97,8 @@ fn header(main: &Rc<Main>, media: &Media) -> gtk::Widget {
                 .build(),
         );
     }
-    if let Some(music) = media.music() {
-        names.append(&music_label(&music));
+    if let Some(song) = media.song() {
+        names.append(&music_label(main, &song, media.web_url(), None));
     }
     let time = gtk::Label::builder()
         .label(util::relative_time(media.taken_at))
@@ -130,19 +130,21 @@ fn header(main: &Rc<Main>, media: &Media) -> gtk::Widget {
     header.upcast()
 }
 
-/// "♫ Song · Artist", for posts and stories with music.
-pub fn music_label(music: &str) -> gtk::Widget {
+/// "♫ Song · Artist" and a button to save the song, for posts and stories
+/// with music. `from` is the post or story it's on.
+pub fn music_label(main: &Rc<Main>, song: &Song, from: Option<String>, notify: Option<share::Notify>) -> gtk::Widget {
+    let music = song.label();
     let b = gtk::Box::builder().spacing(4).margin_start(6).css_classes(["music"]).build();
     b.append(&gtk::Image::builder().icon_name("audio-x-generic-symbolic").pixel_size(12).build());
-    b.append(
-        &gtk::Label::builder()
-            .label(music)
-            .xalign(0.0)
-            .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["caption"])
-            .build(),
-    );
-    b.set_tooltip_text(Some(music));
+    let label = gtk::Label::builder()
+        .label(&music)
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .tooltip_text(&music)
+        .css_classes(["caption"])
+        .build();
+    b.append(&label);
+    b.append(&saving::song_button(main, song, from, notify));
     b.upcast()
 }
 
@@ -229,9 +231,14 @@ fn actions(main: &Rc<Main>, media: &Media, on_comment: Action) -> gtk::Widget {
         comment_button.connect_clicked(move |_| on_comment());
         row.append(&comment_button);
     }
+    if let Some(url) = media.web_url() {
+        let what = if media.product_type == "clips" { share::Kind::Reel } else { share::Kind::Post };
+        row.append(&share::button(main, share::Shared { url, kind: what }));
+    }
     row.append(&gtk::Box::builder().hexpand(true).build());
     let owner = media.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
     row.append(&download::button(main, media, &owner));
+    row.append(&saving::post_button(main, media));
     column.append(&row);
     column.append(&likes_label);
     column.upcast()

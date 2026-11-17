@@ -5,5 +5,8 @@
     <file preprocess="xml-stripblanks">icons/scalable/actions/heart-outline-symbolic.svg</file>
     <file preprocess="xml-stripblanks">icons/scalable/actions/heart-filled-symbolic.svg</file>
     <file preprocess="xml-stripblanks">icons/scalable/actions/comment-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/bookmark-outline-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/bookmark-filled-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/share-symbolic.svg</file>
   </gresource>
 </gresources>

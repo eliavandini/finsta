@@ -10,6 +10,8 @@ pub mod post;
 pub mod profile;
 pub mod ratio_bin;
 pub mod saved;
+pub mod saving;
+pub mod share;
 pub mod search;
 pub mod sidebar;
 pub mod stories;
