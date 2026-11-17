@@ -206,7 +206,8 @@ INBOX_DOC = "24000000000000001"
 LIST_DOC = "24000000000000002"
 MESSAGES_DOC = "24000000000000003"
 SEND_DOC = "24000000000000004"
-SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send"}
+MARK_DOC = "24000000000000005"
+SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read"}
 OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
 EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
 
@@ -253,6 +254,7 @@ def script(name):
                 '__d("IGDThreadListOffMsysPaginationQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + LIST_DOC + '"}),null);'
                 '__d("IGDMessageListOffMsysQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MESSAGES_DOC + '"}),null);'
                 '__d("IGDirectTextSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + SEND_DOC + '"}),null);'
+                '__d("useIGDMarkThreadAsReadMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MARK_DOC + '"}),null);'
                 '__d("IGDMaxUnreadMessagesCount.relayprovider",[],(function(t,n,r,o,a,i,l){l.get=function(){return 20}}),null);'
                 '__d("useIGDSendText",["IGDirectTextSendMutation.graphql"],(function(t,n,r,o,a,i,l){function s(e){return{ig_thread_igid:e.id,text:e.text}}l.default=s}),98);'
                 '__d("IGDThreadListOffMsysPaginationQuery.graphql",["IGDThreadListOffMsysPaginationQuery_instagramRelayOperation"],(function(t,n,r,o,a,i){"use strict";'
@@ -296,7 +298,7 @@ def slide_content(m):
 
 
 def slide_message(m):
-    return {"id": m["mid"], "sender_fbid": str(m["sender"]), "timestamp_ms": str(m["ts"]), "__typename": "SlideMessage",
+    return {"id": "node" + m["mid"], "message_id": m["mid"], "sender_fbid": str(m["sender"]), "timestamp_ms": str(m["ts"]), "__typename": "SlideMessage",
             "is_reported": False, "tombstone_reason": None, "content": slide_content(m), "igd_snippet": m["text"] or "sent an attachment"}
 
 
@@ -315,6 +317,14 @@ def slide_thread(key, convos):
 
 
 def slide_answer(op, v):
+    if op == "mark read":
+        key = next((k for k in MESSAGES if f"34028236684171030{k}" == v["metadata"]["ig_thread_igid"]), None)
+        m = next((m for m in MESSAGES.get(key, []) if m["mid"] == v["data"]["message_id"]), None)
+        if m is None or v["data"].get("item_id") != "":
+            return {"errors": [{"message": "Invalid message", "severity": "CRITICAL", "code": 1675030}], "data": None}
+        CONVOS[key][3] = max(CONVOS[key][3], m["ts"])
+        return {"data": {"xig_direct_item_seen_mutation_with_slide_messaging_response": {
+            "__typename": "XFBSlideReadReceipt", "participant_eimu_id": str(ME_CHAT), "watermark_timestamp_ms": str(m["ts"])}}}
     if op == "inbox":
         threads = [slide_thread(k, CONVOS) for k in CONVOS]
         return {"data": {"get_slide_mailbox_for_iris_subscription": {"__typename": "SlideMailbox", "id": "mailbox1",

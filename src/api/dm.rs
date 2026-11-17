@@ -1842,8 +1842,7 @@ impl Client {
     pub async fn mark_seen(&self, thread_id: &str, item_id: &str) -> Result<()> {
         let mut st = self.inner.dm.lock().await;
         if Self::slide_mode(&st) {
-            self.slide_mark_seen(&mut st);
-            return Ok(());
+            return self.slide_mark_seen(&mut st, thread_id, item_id).await;
         }
         let Ok(key) = thread_id.parse::<i64>() else { return Ok(()) };
         if !st.conn.as_ref().is_some_and(|c| c.is_alive()) {

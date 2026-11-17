@@ -9,6 +9,8 @@
 //! - `IGDThreadListOffMsysPaginationQuery`: more conversations
 //! - `IGDMessageListOffMsysQuery`: a conversation's messages, newest first
 //! - `IGDirectTextSendMutation`: send a text message
+//! - `useIGDMarkThreadAsReadMutation`: mark a conversation as read up to a
+//!   message (inputs as in the website's `useIGDMarkThreadAsRead`)
 //!
 //! Logs describe structure only (counts, field and type names), never names
 //! or message text.
@@ -25,6 +27,7 @@ const INBOX: &str = "PolarisDirectInboxQuery";
 const MORE_THREADS: &str = "IGDThreadListOffMsysPaginationQuery";
 const MESSAGES: &str = "IGDMessageListOffMsysQuery";
 const SEND_TEXT: &str = "IGDirectTextSendMutation";
+const MARK_READ: &str = "useIGDMarkThreadAsReadMutation";
 
 /// Values the website computes on its side ("provided variables").
 const MAX_UNREAD: i64 = 20;
@@ -41,6 +44,8 @@ pub(super) struct SlideState {
     has_next: bool,
     /// The viewer's id in the messaging system (senders use these ids).
     viewer_fbid: Option<String>,
+    /// Message id -> its time (ms), for marking as read.
+    message_times: HashMap<String, i64>,
     /// Content type names seen so far (for logging new ones once).
     content_types: BTreeSet<String>,
     logged: HashSet<String>,
@@ -154,8 +159,9 @@ impl SlideState {
 
     /// A message as the app's item.
     fn item(&self, t: &Value, m: &Value, viewer_pk: &str) -> Value {
+        let message_id = s(&m["message_id"]);
         let mut v = json!({
-            "item_id": s(&m["id"]),
+            "item_id": if message_id.is_empty() { s(&m["id"]) } else { message_id },
             "user_id": self.sender(t, &s(&m["sender_fbid"]), viewer_pk),
             "timestamp": n(&m["timestamp_ms"]) * 1000,
         });
@@ -276,18 +282,7 @@ impl SlideState {
         if users.is_empty() && !title.is_empty() {
             users.push(json!({"pk": id, "full_name": title, "profile_pic_url": s(&t["thread_image_url"])}));
         }
-        let read_ms = if t["marked_as_unread"].as_bool().unwrap_or(false) {
-            0
-        } else {
-            t["slide_read_receipts"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|r| Some(s(&r["participant_fbid"])) == self.viewer_fbid)
-                .map(|r| n(&r["watermark_timestamp_ms"]))
-                .max()
-                .unwrap_or(0)
-        };
+        let read_ms = Client::viewer_read_ms(self, t);
         let newest = items.iter().map(|i| n(&i["timestamp"]) / 1000).max().unwrap_or(0);
         let last_activity = n(&t["last_activity_timestamp_ms"]).max(newest);
         json!({
@@ -468,6 +463,9 @@ impl Client {
         let lookup = if meta.is_object() { &meta } else { &t };
         let mut items: Vec<Value> = nodes.iter().map(|m| st.slide.item(lookup, m, &viewer_pk)).collect();
         items.sort_by_key(|i| -n(&i["timestamp"]));
+        for i in &items {
+            st.slide.message_times.insert(s(&i["item_id"]), n(&i["timestamp"]) / 1000);
+        }
 
         let types: BTreeSet<String> = nodes.iter().map(|m| s(&m["content"]["__typename"])).collect();
         let new_types: Vec<&String> = types.iter().filter(|t| !st.slide.content_types.contains(*t)).collect();
@@ -538,10 +536,66 @@ impl Client {
         Ok(thread)
     }
 
-    pub(super) fn slide_mark_seen(&self, st: &mut DmState) {
-        if st.slide.logged.insert("mark read".into()) {
-            eprintln!("finsta: dm: marking as read isn't supported with the new inbox yet");
+    /// The viewer's read watermark (ms) in a conversation, 0 if marked unread.
+    fn viewer_read_ms(slide: &SlideState, t: &Value) -> i64 {
+        if t["marked_as_unread"].as_bool().unwrap_or(false) {
+            return 0;
         }
+        t["slide_read_receipts"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| Some(s(&r["participant_fbid"])) == slide.viewer_fbid)
+            .map(|r| n(&r["watermark_timestamp_ms"]))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub(super) async fn slide_mark_seen(&self, st: &mut DmState, id: &str, message_id: &str) -> Result<()> {
+        if message_id.is_empty() || message_id.starts_with("snippet:") {
+            return Ok(());
+        }
+        let Some(t) = st.slide.threads.get(id).cloned() else { return Ok(()) };
+        let igid = s(&t["thread_id"]);
+        if igid.is_empty() {
+            if st.slide.logged.insert("mark read: no id".into()) {
+                eprintln!("finsta: dm: mark read: the conversation has no Instagram thread id");
+            }
+            return Ok(());
+        }
+        let time = st.slide.message_times.get(message_id).copied().unwrap_or(0);
+        if time > 0 && Self::viewer_read_ms(&st.slide, &t) >= time {
+            return Ok(()); // Already read (on Instagram too).
+        }
+        let vars = json!({"data": {"item_id": "", "message_id": message_id}, "metadata": {"ig_thread_igid": igid}});
+        let data = self.slide_op(st, MARK_READ, vars).await?;
+        let r = &data["xig_direct_item_seen_mutation_with_slide_messaging_response"];
+        let watermark = n(&r["watermark_timestamp_ms"]).max(time);
+        if st.slide.logged.insert("marked read".into()) {
+            eprintln!(
+                "finsta: dm: mark read: confirmed (watermark {}, participant {})",
+                if n(&r["watermark_timestamp_ms"]) > 0 { "present" } else { "missing" },
+                match (s(&r["participant_eimu_id"]), &st.slide.viewer_fbid) {
+                    (p, _) if p.is_empty() => "missing",
+                    (p, Some(v)) if &p == v => "is you",
+                    _ => "another id",
+                }
+            );
+        }
+        // Remember it, so the next refresh doesn't show the conversation as unread.
+        let viewer = st.slide.viewer_fbid.clone().unwrap_or_else(|| s(&r["participant_eimu_id"]));
+        if let Some(t) = st.slide.threads.get_mut(id) {
+            t["marked_as_unread"] = false.into();
+            let receipt = json!({"participant_fbid": viewer, "watermark_timestamp_ms": watermark.to_string()});
+            match t["slide_read_receipts"].as_array_mut() {
+                Some(list) => {
+                    list.retain(|r| s(&r["participant_fbid"]) != viewer);
+                    list.push(receipt);
+                }
+                None => t["slide_read_receipts"] = json!([receipt]),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -582,6 +636,8 @@ mod tests {
     #[test]
     fn senders_and_content() {
         let (st, t) = sample();
+        let with_id = json!({"id": "node1", "message_id": "mid.$1", "sender_fbid": "100042", "content": {"__typename": "SlideMessageText", "text_body": "x"}});
+        assert_eq!(st.item(&t, &with_id, "7")["item_id"], "mid.$1");
         let mine = json!({"id": "m2", "sender_fbid": "100007", "timestamp_ms": 5, "content": {"__typename": "SlideMessageText", "text_body": "yo"}});
         assert_eq!(st.item(&t, &mine, "7")["user_id"], "7");
         let photo = json!({"id": "m3", "sender_fbid": "100042", "timestamp_ms": 6, "content": {"__typename": "SlideMessageImageContent", "attachments": [{"preview_cdn_url": "u", "preview_width": 10, "preview_height": 20}]}});

@@ -85,9 +85,11 @@ iPhone app, which Instagram now rejects.) That means:
   part is new; it logs the structure of what it can't read (never names or
   message text) with a `dm:` prefix, visible with
   `journalctl --user | grep finsta:`.
-- Not supported yet in messages: marking conversations as read on
-  Instagram, disappearing photos, voice messages, sending anything but
-  text. They show a note to use instagram.com instead.
+- Opening a conversation marks it as read on Instagram, so the other
+  person sees "Seen", just like on instagram.com.
+- Not supported yet in messages: disappearing photos, voice messages,
+  sending anything but text. They show a note to use instagram.com
+  instead.
 - Open conversations refresh every 15 seconds and the conversation list
   every minute. When Instagram rate limits an endpoint, Finsta pauses that
   endpoint until Instagram says to retry.
