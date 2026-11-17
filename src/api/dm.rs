@@ -82,6 +82,10 @@ struct PageConfig {
     av: String,
     /// Extra form fields the website sends with its GraphQL requests.
     site: Vec<(&'static str, String)>,
+    /// MqttWebConfig.hostNameOverride, when it names one of Meta's hosts.
+    host_override: Option<String>,
+    /// Chat login settings from MqttWebConfig: cp, ecp, chat_on, st.
+    mqtt_params: Value,
 }
 
 #[derive(Default)]
@@ -528,6 +532,41 @@ fn key_paths(v: &Value, prefix: &str, depth: usize, out: &mut BTreeSet<String>) 
     }
 }
 
+/// What an id field looks like, without its value.
+fn id_format(v: &Value) -> String {
+    match v {
+        Value::Null => "absent".into(),
+        Value::String(s) if s.is_empty() => "empty".into(),
+        Value::String(s) if s == "0" => "\"0\"".into(),
+        Value::Number(n) if n.as_i64() == Some(0) => "0".into(),
+        Value::String(s) if s.chars().all(|c| c.is_ascii_digit()) => format!("{} digits", s.len()),
+        Value::Number(n) => format!("number of {} digits", n.to_string().len()),
+        Value::String(s) => format!("text of {} chars", s.len()),
+        _ => "other".into(),
+    }
+}
+
+/// An address's scheme, host, path and query keys (never query values).
+fn describe_url(s: &str) -> String {
+    match url::Url::parse(s) {
+        Ok(u) => format!(
+            "{}://{}{} (query keys {:?})",
+            u.scheme(),
+            u.host_str().unwrap_or_default(),
+            u.path(),
+            u.query_pairs().map(|(k, _)| k.into_owned()).collect::<Vec<_>>()
+        ),
+        Err(_) if s.is_empty() => "absent".into(),
+        Err(_) => format!("not an address ({} chars)", s.len()),
+    }
+}
+
+fn meta_host(h: &str) -> bool {
+    !h.is_empty()
+        && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+        && [".facebook.com", ".instagram.com", ".fbcdn.net", ".meta.com", ".messenger.com"].iter().any(|d| h.ends_with(d))
+}
+
 /// Which of the page's ids are the same number, with digit counts only.
 fn id_relations(named: &[(&str, Option<i64>)]) -> String {
     let mut groups: Vec<(i64, Vec<&str>)> = Vec::new();
@@ -552,11 +591,11 @@ fn id_relations(named: &[(&str, Option<i64>)]) -> String {
 /// A short, printable excerpt of the website's own code around `needle`.
 fn snippet(text: &str, needle: &str) -> Option<String> {
     let i = text.find(needle)?;
-    let mut start = i.saturating_sub(40);
+    let mut start = i.saturating_sub(60);
     while !text.is_char_boundary(start) {
         start -= 1;
     }
-    let mut end = (i + 160).min(text.len());
+    let mut end = (i + 200).min(text.len());
     while !text.is_char_boundary(end) {
         end += 1;
     }
@@ -606,10 +645,28 @@ fn scalar(v: &Value) -> Option<String> {
 struct Meta {
     version: Option<String>,
     doc: Option<(String, String)>,
+    /// Message-related GraphQL operations the scripts define: name -> id.
+    ops: BTreeMap<String, String>,
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 2;
+const META_SCANNER: u64 = 3;
+
+/// Places in the website's own code worth quoting in the log while working
+/// out how its messaging works now. Only ever matched against public scripts.
+const NEEDLES: [&str; 11] = [
+    "\"LSVersion\"",
+    "ls_sv",
+    "version_id",
+    "/ls_req",
+    "hostNameOverride",
+    "edge-chat",
+    "bootloader-endpoint",
+    "IGDAWMainV4",
+    "DGWHostnameOverride",
+    "lightspeed_web_request",
+    "MqttWebConfig",
+];
 
 fn version_cache_path() -> Option<std::path::PathBuf> {
     Some(dirs::cache_dir()?.join("finsta").join("lightspeed.json"))
@@ -622,13 +679,21 @@ fn now_secs() -> u64 {
 fn cached_meta() -> Option<Meta> {
     let text = std::fs::read_to_string(version_cache_path()?).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    if v["scanner"].as_u64() != Some(META_SCANNER) || now_secs().saturating_sub(v["saved"].as_u64()?) > 24 * 3600 {
-        return None;
-    }
-    Some(Meta {
+    let meta = Meta {
         version: v["version"].as_str().map(str::to_string),
         doc: v["doc_name"].as_str().zip(v["doc_id"].as_str()).map(|(a, b)| (a.to_string(), b.to_string())),
-    })
+        ops: v["ops"]
+            .as_object()
+            .map(|o| o.iter().filter_map(|(k, x)| Some((k.clone(), x.as_str()?.to_string()))).collect())
+            .unwrap_or_default(),
+    };
+    // A found version goes stale with website releases; a search that found
+    // nothing is expensive (all scripts) and not worth repeating daily.
+    let max_age = if meta.version.is_some() { 24 * 3600 } else { 7 * 24 * 3600 };
+    if v["scanner"].as_u64() != Some(META_SCANNER) || now_secs().saturating_sub(v["saved"].as_u64()?) > max_age {
+        return None;
+    }
+    Some(meta)
 }
 
 fn save_meta(meta: &Meta) {
@@ -642,6 +707,7 @@ fn save_meta(meta: &Meta) {
         "version": meta.version,
         "doc_name": meta.doc.as_ref().map(|d| &d.0),
         "doc_id": meta.doc.as_ref().map(|d| &d.1),
+        "ops": meta.ops,
     });
     let _ = std::fs::write(path, v.to_string());
 }
@@ -731,6 +797,7 @@ impl Client {
             version: find_version(html),
             doc: find_doc(html)
                 .or_else(|| page.queries.iter().find(|(n, _)| n.contains("LightspeedRequest")).cloned()),
+            ops: BTreeMap::new(),
         };
         if meta.version.is_some() {
             eprintln!("finsta: dm: protocol version found in the page");
@@ -750,6 +817,7 @@ impl Client {
             );
             meta.version = meta.version.or(c.version);
             meta.doc = meta.doc.or(c.doc);
+            meta.ops = c.ops;
             return meta;
         }
 
@@ -759,8 +827,17 @@ impl Client {
         queue.extend(page.scripts.iter().cloned());
         let mut seen: HashSet<String> = HashSet::new();
         let (mut checked, mut failed, mut bytes) = (0usize, 0usize, 0usize);
-        let (mut version_mentions, mut doc_mentions) = (0usize, 0usize);
-        let (mut version_snippet, mut doc_snippet) = (None, None);
+        let mut mentions = [0usize; NEEDLES.len()];
+        let mut snippets: [Option<String>; NEEDLES.len()] = Default::default();
+        let op_def = regex::Regex::new(
+            r#"__d\("([A-Za-z0-9]*(?:IGD|Direct|Inbox|Thread|Message|Mailbox)[A-Za-z0-9]*(?:Query|Mutation|Subscription))_[A-Za-z]*RelayOperation"[\s\S]{0,80}?"(\d{8,25})""#,
+        )
+        .unwrap();
+        let op_name = regex::Regex::new(
+            r"\b((?:IGD|PolarisDirect|PolarisIGD|IGDirect|PolarisInbox)[A-Za-z0-9]*(?:Query|Mutation|Subscription))\b",
+        )
+        .unwrap();
+        let mut named_ops: BTreeSet<String> = BTreeSet::new();
         while checked + failed < 1000 {
             let mut batch = Vec::new();
             while batch.len() < 8 {
@@ -814,13 +891,19 @@ impl Client {
                     eprintln!("finsta: dm: inbox query ({}) found in {place}", d.0);
                     meta.doc = Some(d);
                 }
-                if text.contains("LSVersion") {
-                    version_mentions += 1;
-                    version_snippet = version_snippet.or_else(|| snippet(&text, "LSVersion"));
+                for (i, needle) in NEEDLES.iter().enumerate() {
+                    if text.contains(needle) {
+                        mentions[i] += 1;
+                        if snippets[i].is_none() {
+                            snippets[i] = snippet(&text, needle);
+                        }
+                    }
                 }
-                if text.contains("LightspeedRequest") {
-                    doc_mentions += 1;
-                    doc_snippet = doc_snippet.or_else(|| snippet(&text, "LightspeedRequest"));
+                for c in op_def.captures_iter(&text) {
+                    meta.ops.insert(c[1].to_string(), c[2].to_string());
+                }
+                if named_ops.len() < 400 {
+                    named_ops.extend(op_name.captures_iter(&text).map(|c| c[1].to_string()));
                 }
                 if worker {
                     let inner = script_urls(&text);
@@ -836,20 +919,22 @@ impl Client {
             }
         }
         eprintln!(
-            "finsta: dm: searched {checked} scripts ({:.1} MB, {failed} failed, {} left): LSVersion in {version_mentions}, LightspeedRequest in {doc_mentions}",
+            "finsta: dm: searched {checked} scripts ({:.1} MB, {failed} failed, {} left)",
             bytes as f64 / 1e6,
             queue.len()
         );
-        if meta.version.is_none()
-            && let Some(s) = version_snippet
-        {
-            eprintln!("finsta: dm: website code around LSVersion: {s}");
+        for (i, needle) in NEEDLES.iter().enumerate() {
+            match &snippets[i] {
+                Some(s) => eprintln!("finsta: dm: website code, {needle} ({} scripts): {s}", mentions[i]),
+                None => eprintln!("finsta: dm: website code, {needle}: not found"),
+            }
         }
-        if meta.doc.is_none()
-            && let Some(s) = doc_snippet
-        {
-            eprintln!("finsta: dm: website code around LightspeedRequest: {s}");
-        }
+        eprintln!(
+            "finsta: dm: message operations with ids in the scripts: {:?}",
+            meta.ops.keys().collect::<Vec<_>>()
+        );
+        let unnamed: Vec<&String> = named_ops.iter().filter(|n| !meta.ops.contains_key(*n)).collect();
+        eprintln!("finsta: dm: other message operation names in the scripts: {unnamed:?}");
         save_meta(&meta);
         meta
     }
@@ -904,14 +989,57 @@ impl Client {
             ("ds_user_id", pk),
         ];
         eprintln!("finsta: dm: ids: {}", id_relations(&named));
+        eprintln!(
+            "finsta: dm: id formats: MqttWebConfig.fbid {}, USER_ID {}, ACCOUNT_ID {}",
+            id_format(&mqtt["fbid"]),
+            id_format(&user["USER_ID"]),
+            id_format(&user["ACCOUNT_ID"])
+        );
         let mut mqtt_users: Vec<(&'static str, String)> = Vec::new();
-        for (label, v) in [named[0], named[1], named[3], named[5]] {
+        // The website logs in with MqttWebConfig.fbid, whatever it is.
+        if let Some(raw) = scalar(&mqtt["fbid"]).filter(|f| numeric(&mqtt["fbid"]).is_none() && f.len() <= 25) {
+            mqtt_users.push(("MqttWebConfig.fbid as is", raw));
+        }
+        for (label, v) in [named[0], named[1], named[4], named[3], named[5]] {
             if let Some(v) = v.filter(|v| *v > 0).map(|v| v.to_string())
                 && !mqtt_users.iter().any(|(_, u)| *u == v)
             {
                 mqtt_users.push((label, v));
             }
         }
+        let endpoint = mqtt["endpoint"].as_str().unwrap_or_default();
+        eprintln!(
+            "finsta: dm: chat endpoint {}; polling endpoint {}",
+            describe_url(endpoint),
+            describe_url(mqtt["pollingEndpoint"].as_str().unwrap_or_default())
+        );
+        let host_override = mqtt["hostNameOverride"].as_str().filter(|h| meta_host(h)).map(str::to_string);
+        eprintln!(
+            "finsta: dm: chat hostNameOverride: {}; DGW override in use: {}",
+            match (&host_override, mqtt["hostNameOverride"].as_str()) {
+                (Some(h), _) => h.clone(),
+                (None, Some("")) => "empty".into(),
+                (None, Some(other)) => format!("not a Meta host ({} chars)", other.len()),
+                (None, None) => "absent".into(),
+            },
+            def("LSPlatformDGWHostnameOverride")["useHostNameOverride"]
+        );
+        let mut mqtt_params = json!({"cp": 3, "ecp": 10, "chat_on": true, "st": []});
+        for (key, field) in [("cp", "clientCapabilities"), ("ecp", "capabilities"), ("chat_on", "chatVisibility")] {
+            if mqtt[field].is_number() || mqtt[field].is_boolean() {
+                mqtt_params[key] = mqtt[field].clone();
+            }
+        }
+        if let Some(topics) = mqtt["subscribedTopics"].as_array().filter(|t| t.iter().all(Value::is_string)) {
+            mqtt_params["st"] = Value::Array(topics.clone());
+        }
+        eprintln!(
+            "finsta: dm: chat login settings: cp {} ecp {} chat_on {} topics {}",
+            mqtt_params["cp"],
+            mqtt_params["ecp"],
+            mqtt_params["chat_on"],
+            mqtt_params["st"]
+        );
         let av = [named[3].1, named[0].1, named[2].1, named[1].1]
             .into_iter()
             .flatten()
@@ -958,6 +1086,12 @@ impl Client {
             site.len()
         );
 
+        let worker_name = def("IGDAWMainV4WebWorkerResource")["name"].as_str().filter(|n| is_identifier(n)).unwrap_or("-").to_string();
+        eprintln!(
+            "finsta: dm: inbox worker name {worker_name}; WebWorkerConfig: {}; WorkerConfig: {}",
+            shape_of("WebWorkerConfig"),
+            shape_of("WorkerConfig")
+        );
         let mut worker_urls = Vec::new();
         for (name, v) in &page.defines {
             if name.contains("Worker") && (name.contains("IGD") || name.contains("LS")) {
@@ -973,7 +1107,7 @@ impl Client {
                 .iter()
                 .find_map(|n| def(n)["clientID"].as_str().map(str::to_string))
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            endpoint: mqtt["endpoint"].as_str().unwrap_or_default().to_string(),
+            endpoint: endpoint.to_string(),
             version: meta.version,
             mqtt_users,
             viewer_candidates: candidates,
@@ -983,6 +1117,8 @@ impl Client {
             lsd,
             av,
             site,
+            host_override,
+            mqtt_params,
         }
     }
 
@@ -1245,30 +1381,33 @@ impl Client {
 
     async fn dm_connect(&self, st: &DmState) -> Result<Conn> {
         let cfg = st.config.clone().ok_or_else(|| anyhow!("inbox not loaded"))?;
-        let mut url = match std::env::var("FINSTA_CHAT_URL") {
-            Ok(u) => url::Url::parse(&u)?,
-            Err(_) => url::Url::parse(&cfg.endpoint)
-                .ok()
-                .filter(|u| {
-                    u.scheme() == "wss"
-                        && u.host_str().is_some_and(|h| h.ends_with(".instagram.com") || h.ends_with(".facebook.com"))
-                })
-                .unwrap_or_else(|| url::Url::parse(CHAT).unwrap()),
-        };
+        let mut endpoints: Vec<url::Url> = Vec::new();
+        if let Ok(u) = std::env::var("FINSTA_CHAT_URL") {
+            endpoints.push(url::Url::parse(&u)?);
+        } else {
+            let page = url::Url::parse(&cfg.endpoint).ok().filter(|u| {
+                u.scheme() == "wss" && u.host_str().is_some_and(|h| h.ends_with(".instagram.com") || h.ends_with(".facebook.com"))
+            });
+            if let (Some(mut u), Some(host)) = (page.clone(), &cfg.host_override)
+                && u.set_host(Some(host)).is_ok()
+            {
+                endpoints.push(u);
+            }
+            endpoints.extend(page);
+            endpoints.push(url::Url::parse(CHAT).unwrap());
+            let mut seen = HashSet::new();
+            endpoints.retain(|u| seen.insert(format!("{}{}", u.host_str().unwrap_or_default(), u.path())));
+        }
         let sid = (uuid::Uuid::new_v4().as_u128() % 9_007_199_254_740_991) as i64;
         let has = |u: &url::Url, k: &str| u.query_pairs().any(|(q, _)| q == k);
-        if !has(&url, "sid") {
-            url.query_pairs_mut().append_pair("sid", &sid.to_string());
+        for url in &mut endpoints {
+            if !has(url, "sid") {
+                url.query_pairs_mut().append_pair("sid", &sid.to_string());
+            }
+            if !has(url, "cid") {
+                url.query_pairs_mut().append_pair("cid", &cfg.client_id);
+            }
         }
-        if !has(&url, "cid") {
-            url.query_pairs_mut().append_pair("cid", &cfg.client_id);
-        }
-        eprintln!(
-            "finsta: dm: connecting to {}{} (protocol version {})",
-            url.host_str().unwrap_or_default(),
-            url.path(),
-            found(&cfg.version)
-        );
         let headers = [
             ("origin", "https://www.instagram.com".to_string()),
             ("user-agent", self.user_agent()),
@@ -1278,45 +1417,57 @@ impl Client {
             ("pragma", "no-cache".to_string()),
         ];
         let mut last_err = anyhow!("no id to log in to the chat with");
-        for (label, user) in &cfg.mqtt_users {
-            let username = json!({
-                "u": user,
-                "s": sid,
-                "cp": 3,
-                "ecp": 10,
-                "chat_on": true,
-                "fg": true,
-                "d": cfg.client_id,
-                "ct": "websocket",
-                "mqtt_sid": "",
-                "aid": cfg.app_id,
-                "st": [],
-                "pm": [],
-                "dc": "",
-                "no_auto_fg": true,
-                "gas": null,
-                "pack": [],
-                "php_override": "",
-                "p": null,
-                "a": self.user_agent(),
-                "aids": null,
-            })
-            .to_string();
-            match Conn::connect(url.as_str(), &headers, "mqttwsclient", &username, &["/ls_foreground_state", "/ls_resp"])
-                .await
-            {
-                Ok(conn) => {
-                    eprintln!("finsta: dm: chat login accepted as {label}");
-                    if let Some(v) = &cfg.version {
-                        conn.publish("/ls_app_settings", &json!({"ls_fdid": "", "ls_sv": v}).to_string())?;
+        let mut attempts = 0;
+        'endpoints: for url in &endpoints {
+            let host = format!("{}{}", url.host_str().unwrap_or_default(), url.path());
+            eprintln!("finsta: dm: connecting to {host} (protocol version {})", found(&cfg.version));
+            for (label, user) in &cfg.mqtt_users {
+                if attempts >= 6 {
+                    break 'endpoints;
+                }
+                attempts += 1;
+                let username = json!({
+                    "u": user,
+                    "s": sid,
+                    "cp": cfg.mqtt_params["cp"],
+                    "ecp": cfg.mqtt_params["ecp"],
+                    "chat_on": cfg.mqtt_params["chat_on"],
+                    "fg": true,
+                    "d": cfg.client_id,
+                    "ct": "websocket",
+                    "mqtt_sid": "",
+                    "aid": cfg.app_id,
+                    "st": cfg.mqtt_params["st"],
+                    "pm": [],
+                    "dc": "",
+                    "no_auto_fg": true,
+                    "gas": null,
+                    "pack": [],
+                    "php_override": "",
+                    "p": null,
+                    "a": self.user_agent(),
+                    "aids": null,
+                })
+                .to_string();
+                match Conn::connect(url.as_str(), &headers, "mqttwsclient", &username, &["/ls_foreground_state", "/ls_resp"])
+                    .await
+                {
+                    Ok(conn) => {
+                        eprintln!("finsta: dm: chat login accepted as {label} at {host}");
+                        if let Some(v) = &cfg.version {
+                            conn.publish("/ls_app_settings", &json!({"ls_fdid": "", "ls_sv": v}).to_string())?;
+                        }
+                        return Ok(conn);
                     }
-                    return Ok(conn);
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        eprintln!("finsta: dm: chat login as {label} at {host}: {msg}");
+                        last_err = e;
+                        if !msg.contains("refused") {
+                            continue 'endpoints;
+                        }
+                    }
                 }
-                Err(e) if format!("{e:#}").contains("refused") => {
-                    eprintln!("finsta: dm: chat login as {label}: {e:#}");
-                    last_err = e;
-                }
-                Err(e) => return Err(e),
             }
         }
         Err(last_err)

@@ -240,7 +240,9 @@ def script(name):
         return f'self.importScripts("{base()}/rsrc.php/v4/yL/r/LSWorkerBundle.js");'
     if name == "LSWorkerBundle.js":
         return ('__d("LSVersion",[],(function(a,b,c,d,e,f){e.exports="' + LS_VERSION + '"}),66);'
-                '__d("LSPlatformGraphQLLightspeedRequestForIGDQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + DOC_ID + '"}),null);')
+                '__d("LSPlatformGraphQLLightspeedRequestForIGDQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + DOC_ID + '"}),null);'
+                '__d("IGDInboxTrayQuery_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="1234567890123"}),null);'
+                'function s(){return{ls_fdid:"",ls_sv:c("LSVersion")}}var q=b("IGDThreadMessagesQuery");')
     return f'__d("{name[:-3]}",[],(function(a,b,c,d,e,f){{e.exports={{}}}}),null);' * 50
 
 
