@@ -12,8 +12,10 @@ There are no reels, no explore page, no suggested posts and no ads.
 ## Design rules
 
 - **The home feed is the only place that loads more as you scroll**, and it
-  stops for good at Instagram's "You're all caught up" marker. Everything
-  after that marker is suggested content, so Finsta never loads it.
+  ends after a week: it's Instagram's "Following" feed (the people you
+  follow, newest first, nothing suggested), and Finsta stops at posts older
+  than seven days. On the older ranked feed, used only as a fallback, it
+  stops at Instagram's "You're all caught up" marker instead.
 - **Feed filtering**: ads and injected items are dropped, and every post and
   story is checked against the list of accounts you follow.
 - **No endless scrolling anywhere else.** Profiles show 12 posts with a "Show
@@ -33,12 +35,14 @@ There are no reels, no explore page, no suggested posts and no ads.
 ## Installing
 
 You need Rust (via [rustup](https://rustup.rs)) and the development packages
-for GTK 4, libadwaita and WebKitGTK 6.0. Videos play through GStreamer, which
-needs gst-plugins-good and an H.264 decoder such as gst-libav.
+for GTK 4, libadwaita, GStreamer and WebKitGTK 6.0. Videos play through
+GStreamer, which needs gst-plugins-good and an H.264 decoder such as
+gst-libav; story videos also need GStreamer's GTK 4 sink (gst-plugin-gtk4),
+and show as still images without it.
 
 ```sh
 # Arch Linux
-sudo pacman -S --needed base-devel rustup gtk4 libadwaita webkitgtk-6.0 gst-plugins-good gst-libav
+sudo pacman -S --needed base-devel rustup gtk4 libadwaita webkitgtk-6.0 gstreamer gst-plugins-good gst-libav gst-plugin-gtk4
 
 ./install.sh              # for your user, into ~/.local
 ./install.sh --system     # for all users, into /usr/local (asks for sudo)
@@ -78,9 +82,10 @@ iPhone app, which Instagram now rejects.) That means:
 - It can break whenever Instagram changes its API.
 - Using unofficial clients is against Instagram's terms and could get an
   account flagged. Use it at your own risk.
-- Messages, profiles, profile posts, stories and likes use the same
-  GraphQL requests as instagram.com itself: its older routes for them now
-  fail, and its inbox no longer runs on the "Lightspeed" chat protocol.
+- Messages, the home feed, profiles, profile posts, stories and likes use
+  the same GraphQL requests as instagram.com itself: its older routes for
+  them now fail or have changed, and its inbox no longer runs on the
+  "Lightspeed" chat protocol.
   Finsta finds the requests' current ids in the website's scripts every
   few days, and keeps the website's public code for them in
   `~/.cache/finsta/webcode/`. The older routes remain as fallbacks. This

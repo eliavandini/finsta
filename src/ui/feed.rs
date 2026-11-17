@@ -173,12 +173,12 @@ impl HomePage {
         let (title, subtitle) = if self.shown.get() == 0 {
             (
                 "No new posts",
-                "When people you follow share something, it will show up here.",
+                "People you follow haven't posted in the last week.",
             )
         } else {
             (
                 "You're all caught up",
-                "You've seen all new posts from people you follow.",
+                "That's everything from people you follow in the last week.",
             )
         };
         let title = gtk::Label::builder().label(title).css_classes(["title-3"]).build();
@@ -263,14 +263,23 @@ impl HomePage {
                 Ok(page) => {
                     home.first_page.set(false);
                     let mut added = 0;
+                    let (mut not_followed, mut repeated) = (0, 0);
                     for media in page.posts {
-                        if !main.accept_post(&media) || !home.seen.borrow_mut().insert(media.id.clone()) {
+                        if !main.accept_post(&media) {
+                            not_followed += 1;
+                            continue;
+                        }
+                        if !home.seen.borrow_mut().insert(media.id.clone()) {
+                            repeated += 1;
                             continue;
                         }
                         home.posts_box.append(&post::card(&main, &media));
                         added += 1;
                     }
                     home.shown.set(home.shown.get() + added);
+                    if not_followed + repeated > 0 {
+                        eprintln!("finsta: feed: {added} shown, {not_followed} not from people you follow, {repeated} already shown");
+                    }
                     home.next_max_id.replace(page.next_max_id.clone());
                     home.more.set(page.more_available && page.next_max_id.is_some());
                     home.caught_up.set(page.caught_up);

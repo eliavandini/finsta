@@ -154,6 +154,7 @@ pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
     {
         let weak = Rc::downgrade(main);
         let media_id = media.id.clone();
+        let token = media.organic_tracking_token.clone();
         let update_like = update_like.clone();
         like_button.connect_clicked(move |button| {
             let Some(main) = weak.upgrade() else { return };
@@ -164,13 +165,14 @@ pub fn card(main: &Rc<Main>, media: &Media) -> gtk::Widget {
             button.set_sensitive(false);
             let client = main.client.clone();
             let media_id = media_id.clone();
+            let token = token.clone();
             let weak = weak.clone();
             let button = button.downgrade();
             let liked = liked.clone();
             let likes = likes.clone();
             let update_like = update_like.clone();
             glib::spawn_future_local(async move {
-                let res = rt::bg(async move { client.like(&media_id, now).await }).await;
+                let res = rt::bg(async move { client.like(&media_id, token.as_deref(), now).await }).await;
                 if let Some(b) = button.upgrade() {
                     b.set_sensitive(true);
                 }

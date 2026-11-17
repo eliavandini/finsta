@@ -24,6 +24,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 import re
 import struct
 import sys
@@ -102,11 +103,20 @@ def timeline():
     return {"feed_items": items, "more_available": True, "next_max_id": "page2", "status": "ok"}
 
 
+VIDEOS = sorted(os.listdir(os.environ["FINSTA_MOCK_VIDEOS"])) if os.environ.get("FINSTA_MOCK_VIDEOS") else []
+
+
 def story_items(pk, n):
-    return [{"id": f"s{pk}{i}_{pk}", "media_type": 1, "taken_at": NOW - 3600 * (i + 1),
-             "original_width": 1080, "original_height": 1920,
-             "image_versions2": {"candidates": [{"url": img(f"story{pk}{i}", 1080, 1920), "width": 1080, "height": 1920}]}}
-            for i in range(n)]
+    items = []
+    for i in range(n):
+        it = {"id": f"s{pk}{i}_{pk}", "media_type": 1, "taken_at": NOW - 3600 * (i + 1),
+              "original_width": 1080, "original_height": 1920,
+              "image_versions2": {"candidates": [{"url": img(f"story{pk}{i}", 1080, 1920), "width": 1080, "height": 1920}]}}
+        if VIDEOS and i % 3 != 2:  # two videos, then a photo
+            it["media_type"] = 2
+            it["video_versions"] = [{"type": 101, "url": f"{BASE}/vid/{VIDEOS[(int(pk) + i) % len(VIDEOS)]}", "width": 720, "height": 1280}]
+        items.append(it)
+    return items
 
 
 def reel(pk, seen=False):
@@ -207,11 +217,17 @@ LIST_DOC = "24000000000000002"
 MESSAGES_DOC = "24000000000000003"
 SEND_DOC = "24000000000000004"
 MARK_DOC = "24000000000000005"
-WEB_DOCS = {"25000000000000001": "PolarisProfilePageContentQuery", "25000000000000002": "PolarisProfilePostsQuery",
+WEB_DOCS = {"25000000000000006": "PolarisFeedTimelineRootV2Query", "25000000000000001": "PolarisProfilePageContentQuery", "25000000000000002": "PolarisProfilePostsQuery",
             "25000000000000003": "PolarisStoriesV3ReelPageStandaloneQuery", "25000000000000004": "usePolarisLikeMediaXIGLikeMutation",
             "25000000000000005": "usePolarisLikeMediaXIGUnlikeMutation"}
 # Saved-style definitions: what the app reads to fill in and fit inputs.
 WEB_MODULES = (
+    '__d("PolarisFeedTimelineRootV2Query.graphql",["PolarisFeedTimelineRootV2Query_instagramRelayOperation"],(function(t,n,r,o,a,i){var e=(function(){'
+    'var e={defaultValue:null,kind:"LocalArgument",name:"after"},t={defaultValue:null,kind:"LocalArgument",name:"before"},'
+    'r={defaultValue:null,kind:"LocalArgument",name:"data"},o={defaultValue:null,kind:"LocalArgument",name:"first"},'
+    'l={defaultValue:null,kind:"LocalArgument",name:"last"},s={defaultValue:null,kind:"LocalArgument",name:"variant"};'
+    'return{fragment:{argumentDefinitions:[e,t,r,o,l,s]}}})();a.exports=e}),null);'
+
     '__d("PolarisProfilePostsQuery.graphql",["PolarisProfilePostsQuery_instagramRelayOperation","PolarisShortDramaEnabled.relayprovider"],'
     '(function(t,n,r,o,a,i){"use strict";var e=(function(){var e={defaultValue:null,kind:"LocalArgument",name:"data"},'
     't={defaultValue:null,kind:"LocalArgument",name:"username"},r={defaultValue:null,kind:"LocalArgument",name:"first"},'
@@ -221,7 +237,7 @@ WEB_MODULES = (
     + "".join(
         f'__d("usePolarisLikeMediaXIG{kind}Mutation.graphql",["usePolarisLikeMediaXIG{kind}Mutation_instagramRelayOperation"],'
         '(function(t,n,r,o,a,i){"use strict";var e=(function(){var e={defaultValue:null,kind:"LocalArgument",name:"media_id"};'
-        'return{fragment:{argumentDefinitions:[e]}}})();a.exports=e}),null);' for kind in ("Like", "Unlike"))
+        'return{fragment:{argumentDefinitions:[e]}}})();a.exports=e}),null);'.replace('name:"media_id"', 'name:"input"') for kind in ("Like", "Unlike"))
 )
 SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read"}
 OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
@@ -381,8 +397,36 @@ def nulls(m):
     return {"carousel_media": None, "video_versions": None, "caption": None, "location": None, **m}
 
 
+def following_feed():
+    """The people you follow, newest first: 30 posts over two weeks, with an
+    ad and a suggestions unit mixed in."""
+    authors = ["1001", "1002", "1003", "1004", "1005"]
+    edges = []
+    for i in range(30):
+        pk = authors[i % len(authors)]
+        m = nulls(media(str(700 + i), pk, f"following post {i}", 3600 * 2 + i * 11 * 3600, w=1080, h=1080))
+        m["organic_tracking_token"] = f"tok{700 + i}"
+        edges.append({"node": {"__typename": "XDTFeedItem", "media": m, "ad": None, "end_of_feed_demarcator": None}, "cursor": str(i)})
+        if i == 3:
+            edges.append({"node": {"__typename": "XDTFeedItem", "media": None, "ad": {"ad_id": "1"}}, "cursor": "ad"})
+        if i == 5:
+            edges.append({"node": {"__typename": "XDTFeedItem", "media": None, "ad": None, "suggested_users": {"suggestions": []}}, "cursor": "su"})
+    return edges
+
+
 def web_answer(name, v):
     pv = {k: x for k, x in v.items() if k.startswith("__relay_internal__pv__")}
+    if name == "PolarisFeedTimelineRootV2Query":
+        d = v.get("data") or {}
+        if v.get("variant") != "following" or d.get("pagination_source") != "following" or not d.get("device_id"):
+            return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675030}], "data": None}
+        edges = following_feed()
+        start = int(v["after"]) if v.get("after") else 0
+        page = edges[start:start + v["first"]]
+        more = start + v["first"] < len(edges)
+        return {"data": {"xdt_api__v1__feed__timeline__connection": {"pagination_source": "following", "edges": page,
+                "page_info": {"end_cursor": str(start + v["first"]) if more else None, "has_next_page": more,
+                              "has_previous_page": start > 0, "start_cursor": str(start)}}}}
     if name == "PolarisProfilePageContentQuery":
         u = dict(USERS.get(str(v["id"]), USERS["1001"]))
         u.update({"pk": str(u["pk"]), "id": str(u["pk"]), "biography": "Photos, mountains & coffee ☕\nBologna 🇮🇹 (GraphQL)",
@@ -406,13 +450,17 @@ def web_answer(name, v):
             "page_info": {"end_cursor": "12" if more else None, "has_next_page": more, "has_previous_page": False, "start_cursor": None}},
             "xdt_viewer": {"user": {"id": ME}}}}
     if name == "PolarisStoriesV3ReelPageStandaloneQuery":
-        reels = [{**reel(i), "id": str(i), "items": [nulls(x) for x in story_items(i, 3)], "cover_media": None, "title": None} for i in v["reel_ids_arr"] if i in USERS]
+        reels = [{**reel(i), "id": str(i), "items": [nulls(x) for x in story_items(i, 5)], "cover_media": None, "title": None} for i in v["reel_ids_arr"] if i in USERS]
         return {"data": {"xdt_api__v1__feed__reels_media": {"reels_media": reels, "unviewable_authors_infos": []}, "xdt_viewer": {"user": {"id": ME}}}}
     if name.startswith("usePolarisLikeMedia"):
-        if set(v) != {"media_id"}:
-            return {"errors": [{"message": "Variables not declared", "severity": "CRITICAL", "code": 1675030}], "data": None}
-        LIKES[v["media_id"]] = "XIGLike" in name
-        return {"data": {"xdt_mark_media_like" if "XIGLike" in name else "xdt_mark_media_unlike": {"__typename": "XDTEmptyResponse", "success": True}}}
+        like = "XIGLike" in name
+        i = v.get("input") or {}
+        want = {"container_module", "media_id", "tracking_token"} if like else {"media_id", "tracking_token"}
+        if set(v) != {"input"} or set(i) != want or not i.get("media_id"):
+            return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        LIKES[i["media_id"]] = like
+        field = "xig_media_like" if like else "xig_media_unlike"
+        return {"data": {field: {"media": {"id": i["media_id"], "has_liked": like}}}}
 
 
 def mqtt_string(b, i):
@@ -608,6 +656,17 @@ class Handler(BaseHTTPRequestHandler):
             f.write(f"{method} :{PORT}{path} q={dict(q)} body={body} cookie={self.headers.get('Cookie')} csrf={self.headers.get('X-CSRFToken')} app={self.headers.get('X-IG-App-ID')} xhr={self.headers.get('X-Requested-With')} origin={self.headers.get('Origin')} ua={self.headers.get('User-Agent')}\n")
         if path.startswith("/img/"):
             return self.serve_image(path[5:])
+        if path.startswith("/vid/") and path[5:] in VIDEOS:
+            body = open(os.path.join(os.environ["FINSTA_MOCK_VIDEOS"], path[5:]), "rb").read()
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         if path.startswith("/rsrc.php/"):
             js = script(path.rsplit("/", 1)[1]).encode()
             self.send_response(200)
@@ -696,6 +755,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"user": u, "status": "ok"})
         if re.match(r"friendships/\d+/following/", p):
             return self.send_json({"users": [USERS[k] for k in ["1001", "1002", "1003", "1004", "1005"]], "status": "ok"})
+        if p == "feed/timeline/" and OFFMSYS:
+            items = [{"media_or_ad": media("599", "1003", "the only unseen post", 3 * 86400)},
+                     {"end_of_feed_demarcator": {"title": "You're all caught up"}},
+                     {"media_or_ad": media("902", "2002", "suggested post after demarcator", 3600)}]
+            return self.send_json({"feed_items": items, "more_available": True, "next_max_id": "page2", "status": "ok"})
         if p == "feed/timeline/":
             if body.get("max_id"):
                 return self.send_json({"feed_items": [], "more_available": False, "status": "ok"})

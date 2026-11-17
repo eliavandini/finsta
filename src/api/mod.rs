@@ -125,9 +125,81 @@ pub struct TimelinePage {
     pub posts: Vec<Media>,
     pub next_max_id: Option<String>,
     pub more_available: bool,
-    /// Instagram's "You're all caught up" marker was reached. Everything after
-    /// it is suggested content from accounts you don't follow, so we stop there.
+    /// The end: posts older than `FEED_DAYS` were reached, or Instagram's
+    /// "You're all caught up" marker (after which it only suggests content
+    /// from accounts you don't follow). Finsta stops there.
     pub caught_up: bool,
+}
+
+/// How far back the home feed goes. It shows the people you follow in
+/// order, newest first, so it needs a fixed end to stay finite.
+pub const FEED_DAYS: i64 = 7;
+
+/// Cursors from the GraphQL feed are tagged, so that a page is never
+/// continued on the other route.
+const FEED_CURSOR: &str = "gql:";
+
+fn chrono_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// What a feed page held, for the log (counts and ages only).
+#[derive(Default)]
+struct FeedStats {
+    items: usize,
+    posts: usize,
+    ads: usize,
+    unreadable: usize,
+    too_old: usize,
+    marker: bool,
+    other: std::collections::BTreeMap<String, usize>,
+    newest: Option<i64>,
+    oldest: Option<i64>,
+}
+
+impl FeedStats {
+    /// Take a post into the page unless it's an ad or older than the feed goes.
+    fn add(&mut self, media: Option<Media>, cutoff: i64, page: &mut TimelinePage) {
+        let Some(media) = media.filter(|m| m.user.is_some()) else {
+            self.unreadable += 1;
+            return;
+        };
+        if media.is_ad() {
+            self.ads += 1;
+            return;
+        }
+        if media.taken_at > 0 {
+            self.newest = Some(self.newest.map_or(media.taken_at, |n| n.max(media.taken_at)));
+            self.oldest = Some(self.oldest.map_or(media.taken_at, |o| o.min(media.taken_at)));
+            if media.taken_at < cutoff {
+                self.too_old += 1;
+                page.caught_up = true;
+                return;
+            }
+        }
+        self.posts += 1;
+        page.posts.push(media);
+    }
+
+    fn log(&self, what: &str, page: &TimelinePage) {
+        let hours = |t: Option<i64>| t.map(|t| format!("{}h", (chrono_now() - t) / 3600)).unwrap_or_else(|| "-".into());
+        eprintln!(
+            "finsta: feed: {what}: {} items -> {} posts kept, {} older than {FEED_DAYS} days, {} ads, {} unreadable, other {:?}; newest {} old, oldest {}; end marker {}, more {}",
+            self.items,
+            self.posts,
+            self.too_old,
+            self.ads,
+            self.unreadable,
+            self.other,
+            hours(self.newest),
+            hours(self.oldest),
+            self.marker,
+            page.more_available,
+        );
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -625,11 +697,85 @@ impl Client {
 
     // ----- Home feed -----------------------------------------------------
 
+    fn feed_device_id(&self) -> String {
+        let s = self.inner.session.read().unwrap();
+        s.cookies.get("ig_did").cloned().unwrap_or_else(|| s.device_uuid.clone())
+    }
+
+    /// The home feed: instagram.com's "Following" feed (the people you
+    /// follow, newest first, nothing suggested), back to `FEED_DAYS` days.
+    /// The older ranked route is the fallback.
     pub async fn timeline(&self, max_id: Option<String>, refresh: bool) -> Result<TimelinePage> {
-        let device_id = {
-            let s = self.inner.session.read().unwrap();
-            s.cookies.get("ig_did").cloned().unwrap_or_else(|| s.device_uuid.clone())
-        };
+        match max_id.as_deref().map(|m| m.strip_prefix(FEED_CURSOR)) {
+            Some(Some(cursor)) => return self.web_timeline(Some(cursor.to_string())).await,
+            Some(None) => return self.rest_timeline(max_id, refresh).await,
+            None => {}
+        }
+        match self.web_timeline(None).await {
+            Ok(page) => Ok(page),
+            Err(e) if is_login_required(&e) || is_rate_limited(&e) => Err(e),
+            Err(e) => {
+                eprintln!("finsta: feed query failed ({e}); trying the older route");
+                self.rest_timeline(None, refresh).await
+            }
+        }
+    }
+
+    async fn web_timeline(&self, after: Option<String>) -> Result<TimelinePage> {
+        let vars = json!({
+            "data": {
+                "pagination_source": "following",
+                "device_id": self.feed_device_id(),
+                "is_async_ads_double_request": "0",
+                "is_async_ads_in_headload_enabled": "0",
+                "is_async_ads_rti": "0",
+                "rti_delivery_backend": "0",
+            },
+            "first": 12,
+            "after": after,
+            "before": null,
+            "last": null,
+            "variant": "following",
+        });
+        let data = self.web_query("PolarisFeedTimelineRootV2Query", vars, WEB_REFERER).await?;
+        let conn = &data["xdt_api__v1__feed__timeline__connection"];
+        if !conn.is_object() {
+            bail!("Instagram didn't send the feed");
+        }
+        let cutoff = chrono_now() - FEED_DAYS * 86400;
+        let mut page = TimelinePage::default();
+        let mut stats = FeedStats::default();
+        for e in conn["edges"].as_array().into_iter().flatten() {
+            let node = &e["node"];
+            stats.items += 1;
+            if node["end_of_feed_demarcator"].is_object() {
+                stats.marker = true;
+                page.caught_up = true;
+                break;
+            }
+            if node["ad"].is_object() {
+                stats.ads += 1;
+                continue;
+            }
+            if !node["media"].is_object() {
+                let kind = node
+                    .as_object()
+                    .and_then(|o| o.iter().find(|(k, v)| v.is_object() && *k != "media").map(|(k, _)| k.clone()))
+                    .unwrap_or_else(|| "empty".into());
+                *stats.other.entry(kind).or_default() += 1;
+                continue;
+            }
+            stats.add(parse::<Media>(&node["media"]), cutoff, &mut page);
+        }
+        let next = conn["page_info"]["end_cursor"].as_str().filter(|c| !c.is_empty());
+        page.more_available = conn["page_info"]["has_next_page"].as_bool().unwrap_or(false) && next.is_some();
+        page.next_max_id = next.map(|c| format!("{FEED_CURSOR}{c}"));
+        stats.log("following feed", &page);
+        Ok(page)
+    }
+
+    async fn rest_timeline(&self, max_id: Option<String>, refresh: bool) -> Result<TimelinePage> {
+        let device_id = self.feed_device_id();
         let mut form: Vec<(&str, String)> = vec![
             ("device_id", device_id),
             ("is_async_ads_double_request", "0".into()),
@@ -661,8 +807,12 @@ impl Client {
             .as_array()
             .or_else(|| v["items"].as_array())
             .unwrap_or(&empty);
+        let cutoff = chrono_now() - FEED_DAYS * 86400;
+        let mut stats = FeedStats::default();
         for item in items {
+            stats.items += 1;
             if item.get("end_of_feed_demarcator").is_some() {
+                stats.marker = true;
                 page.caught_up = true;
                 break;
             }
@@ -671,25 +821,42 @@ impl Client {
             } else if item.get("media_type").is_some() {
                 item
             } else {
-                continue; // suggested users, netego units, ...
+                // suggested users, netego units, ...
+                let kind = item.as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_else(|| "empty".into());
+                *stats.other.entry(kind).or_default() += 1;
+                continue;
             };
-            if let Some(media) = parse::<Media>(raw)
-                && !media.is_ad()
-                && media.user.is_some()
-            {
-                page.posts.push(media);
-            }
+            stats.add(parse::<Media>(raw), cutoff, &mut page);
         }
+        stats.log("ranked feed (older route)", &page);
         Ok(page)
     }
 
-    /// Like or unlike a post, the way instagram.com does it now; the older
-    /// route only if the website's operation can't be used.
-    pub async fn like(&self, media_id: &str, like: bool) -> Result<()> {
-        let name = if like { "usePolarisLikeMediaXIGLikeMutation" } else { "usePolarisLikeMediaXIGUnlikeMutation" };
-        let vars = json!({"media_id": media_pk(media_id), "container_module": "feed_timeline"});
-        match self.web_query(name, vars, WEB_REFERER).await {
-            Ok(_) => return Ok(()),
+    /// Like or unlike a post, the way instagram.com does it now (inputs as
+    /// in the website's usePolarisLikeMedia); the older route only if the
+    /// website's operation can't be used.
+    pub async fn like(&self, media_id: &str, tracking_token: Option<&str>, like: bool) -> Result<()> {
+        let (name, input) = if like {
+            (
+                "usePolarisLikeMediaXIGLikeMutation",
+                json!({"container_module": "feed_timeline", "media_id": media_pk(media_id), "tracking_token": tracking_token}),
+            )
+        } else {
+            (
+                "usePolarisLikeMediaXIGUnlikeMutation",
+                json!({"media_id": media_pk(media_id), "tracking_token": tracking_token}),
+            )
+        };
+        match self.web_query(name, json!({"input": input}), WEB_REFERER).await {
+            Ok(data) => {
+                let liked = data["xig_media_like"]["media"]["has_liked"]
+                    .as_bool()
+                    .or(data["xig_media_unlike"]["media"]["has_liked"].as_bool());
+                if liked.is_some_and(|l| l != like) {
+                    eprintln!("finsta: like: Instagram reports the post as {}", if like { "not liked" } else { "still liked" });
+                }
+                return Ok(());
+            }
             Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
             Err(e) => eprintln!("finsta: like query failed ({e}); trying the older route"),
         }

@@ -5,12 +5,13 @@ use std::rc::{Rc, Weak};
 use std::time::Duration;
 
 use adw::prelude::*;
-use gtk::{gdk, gio, glib};
+use gtk::{gdk, glib};
 
 use crate::api::Reel;
 use crate::rt;
-use crate::ui::{images, util};
+use crate::ui::story_player::StoryPlayer;
 use crate::ui::window::Main;
+use crate::ui::{images, util};
 
 const PHOTO_SECONDS: f64 = 6.0;
 const TICK_MS: u64 = 50;
@@ -25,7 +26,10 @@ struct Viewer {
     bars: RefCell<Vec<gtk::ProgressBar>>,
     stack: gtk::Stack,
     picture: gtk::Picture,
-    video: gtk::Video,
+    /// Shared story video player (None: videos show their cover image).
+    player: Option<Rc<StoryPlayer>>,
+    /// Whether the current item is a video playing in `player`.
+    playing_video: Cell<bool>,
     avatar_slot: gtk::Box,
     name: gtk::Label,
     time: gtk::Label,
@@ -34,7 +38,6 @@ struct Viewer {
     elapsed: Cell<f64>,
     ready: Cell<bool>,
     token: Cell<u64>,
-    media: RefCell<Option<gtk::MediaFile>>,
 }
 
 pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
@@ -45,7 +48,14 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
         .content_fit(gtk::ContentFit::Contain)
         .can_shrink(true)
         .build();
-    let video = gtk::Video::builder().autoplay(false).build();
+    let player = StoryPlayer::get();
+    let video = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Contain)
+        .can_shrink(true)
+        .build();
+    if let Some(p) = &player {
+        video.set_paintable(Some(p.paintable()));
+    }
     let stack = gtk::Stack::builder()
         .transition_type(gtk::StackTransitionType::Crossfade)
         .vexpand(true)
@@ -134,7 +144,8 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
         bars: RefCell::new(Vec::new()),
         stack,
         picture,
-        video,
+        player,
+        playing_video: Cell::new(false),
         avatar_slot,
         name,
         time,
@@ -143,7 +154,6 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
         elapsed: Cell::new(0.0),
         ready: Cell::new(false),
         token: Cell::new(0),
-        media: RefCell::new(None),
     });
 
     let weak = Rc::downgrade(&viewer);
@@ -225,13 +235,30 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     dialog.present(Some(&main.window));
 }
 
+/// Describe a person's stories once per run (counts only), to check that
+/// what Instagram sends is what the viewer can show.
+fn log_items(items: &[crate::api::Media], can_play: bool) {
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let videos = items.iter().filter(|i| i.is_video()).count();
+    let playable = items.iter().filter(|i| i.is_video() && i.video_url().is_some()).count();
+    let images = items.iter().filter(|i| i.image_url(1080).is_some()).count();
+    eprintln!(
+        "finsta: stories: {} items, {videos} videos ({playable} with an address), {images} with an image; videos {}",
+        items.len(),
+        if can_play { "play" } else { "show their cover image" }
+    );
+}
+
 impl Viewer {
     fn stop_media(&self) {
-        if let Some(media) = self.media.take() {
-            media.pause();
-            media.set_file(gio::File::NONE);
+        if self.playing_video.replace(false)
+            && let Some(player) = &self.player
+        {
+            player.stop();
         }
-        self.video.set_media_stream(gtk::MediaStream::NONE);
     }
 
     fn show(self: &Rc<Self>, reel_index: usize, item_index: usize) {
@@ -268,6 +295,7 @@ impl Viewer {
                 match res {
                     Ok(mut map) => {
                         let items = map.remove(&id).map(|r| r.items).unwrap_or_default();
+                        log_items(&items, v.player.is_some());
                         if items.is_empty() {
                             // Expired or hidden; move on to the next person.
                             v.show_next_reel();
@@ -301,14 +329,14 @@ impl Viewer {
             home.reel_viewed(&reel);
         }
 
-        if let Some(url) = item.video_url().filter(|_| item.is_video()) {
-            let media = gtk::MediaFile::for_file(&gio::File::for_uri(&url));
-            self.video.set_media_stream(Some(&media));
-            media.set_playing(!self.paused.get());
-            self.media.replace(Some(media));
+        let video = item.video_url().filter(|_| item.is_video());
+        if let (Some(url), Some(player)) = (&video, &self.player) {
+            player.load(url, !self.paused.get());
+            self.playing_video.set(true);
             self.stack.set_visible_child_name("video");
             self.ready.set(true);
         } else {
+            // A photo, or a video's cover image when videos can't play.
             self.picture.set_paintable(gdk::Paintable::NONE);
             self.stack.set_visible_child_name("loading");
             let url = item.image_url(1080);
@@ -355,13 +383,12 @@ impl Viewer {
         if !self.ready.get() || self.paused.get() {
             return;
         }
-        let fraction = if let Some(media) = self.media.borrow().as_ref() {
-            if media.is_ended() {
+        let fraction = if let Some(player) = self.player.as_ref().filter(|_| self.playing_video.get()) {
+            if player.failed() {
+                // Unplayable (expired, or a format that isn't supported): move on.
                 1.0
-            } else if media.duration() > 0 {
-                media.timestamp() as f64 / media.duration() as f64
             } else {
-                0.0
+                player.progress().unwrap_or(0.0)
             }
         } else {
             self.elapsed.set(self.elapsed.get() + TICK_MS as f64 / 1000.0);
@@ -378,8 +405,8 @@ impl Viewer {
     fn toggle_pause(&self) {
         let paused = !self.paused.get();
         self.paused.set(paused);
-        if let Some(media) = self.media.borrow().as_ref() {
-            media.set_playing(!paused);
+        if let Some(player) = self.player.as_ref().filter(|_| self.playing_video.get()) {
+            player.set_playing(!paused);
         }
         self.pause_button.set_icon_name(if paused {
             "media-playback-start-symbolic"

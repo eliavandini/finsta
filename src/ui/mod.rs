@@ -10,6 +10,7 @@ pub mod ratio_bin;
 pub mod search;
 pub mod sidebar;
 pub mod stories;
+pub mod story_player;
 pub mod util;
 #[cfg(feature = "webkit")]
 pub mod weblogin;

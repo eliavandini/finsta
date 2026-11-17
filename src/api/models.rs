@@ -194,6 +194,9 @@ pub struct Media {
     pub ad_action: Option<Value>,
     #[serde(default)]
     pub location: Option<Location>,
+    /// Sent back with likes, as the website does.
+    #[serde(default, deserialize_with = "de_opt_string")]
+    pub organic_tracking_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
