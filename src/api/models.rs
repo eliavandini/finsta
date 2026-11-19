@@ -535,6 +535,8 @@ impl Reel {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Comment {
+    #[serde(default, deserialize_with = "de_id")]
+    pub pk: String,
     #[serde(default, deserialize_with = "de_string")]
     pub text: String,
     #[serde(default)]
@@ -543,6 +545,11 @@ pub struct Comment {
     pub created_at: i64,
     #[serde(default, deserialize_with = "de_i64")]
     pub comment_like_count: i64,
+    /// Replies to it: how many, and the few that come with it.
+    #[serde(default, deserialize_with = "de_i64")]
+    pub child_comment_count: i64,
+    #[serde(default, deserialize_with = "de_or_default")]
+    pub preview_child_comments: Vec<Comment>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1037,6 +1044,18 @@ impl DmContent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn comment_replies() {
+        let list: Vec<Comment> = parse(&json!([
+            {"pk": 17, "text": "hi", "child_comment_count": 2, "preview_child_comments": [{"pk": "18", "text": "hey"}]},
+            {"pk": 19, "text": "no replies", "preview_child_comments": null},
+        ]))
+        .unwrap();
+        assert_eq!((list[0].pk.as_str(), list[0].child_comment_count), ("17", 2));
+        assert_eq!(list[0].preview_child_comments[0].pk, "18");
+        assert!(list[1].preview_child_comments.is_empty());
+    }
 
     /// A song's audio and the part of it a post or story plays.
     #[test]

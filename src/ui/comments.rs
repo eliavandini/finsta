@@ -12,9 +12,9 @@ use crate::rt;
 use crate::ui::util;
 use crate::ui::window::Main;
 
-fn comment_row(c: &Comment) -> gtk::Widget {
+fn comment_row(c: &Comment, avatar_size: i32) -> gtk::Widget {
     let row = gtk::Box::builder().spacing(10).build();
-    let avatar = util::avatar(&c.user, 32);
+    let avatar = util::avatar(&c.user, avatar_size);
     avatar.set_valign(gtk::Align::Start);
     row.append(&avatar);
     let col = gtk::Box::builder()
@@ -46,6 +46,86 @@ fn comment_row(c: &Comment) -> gtk::Widget {
     col.append(&meta);
     row.append(&col);
     row.upcast()
+}
+
+/// A comment and, below it, its replies: those that came with it, and a
+/// button that loads all of them, a page at a time.
+fn comment_thread(main: &Weak<Main>, media_id: &str, c: &Comment) -> gtk::Widget {
+    let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).build();
+    column.append(&comment_row(c, 32));
+    let shown = c.preview_child_comments.len() as i64;
+    if c.child_comment_count.max(shown) == 0 {
+        return column.upcast();
+    }
+    // Lined up with the comment's text.
+    let replies = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .margin_start(42)
+        .build();
+    for r in &c.preview_child_comments {
+        replies.append(&comment_row(r, 24));
+    }
+    column.append(&replies);
+    let hidden = c.child_comment_count - shown;
+    if hidden <= 0 || c.pk.is_empty() {
+        return column.upcast();
+    }
+    let label = match (shown, hidden) {
+        (0, 1) => "View 1 reply".to_string(),
+        (0, n) => format!("View {n} replies"),
+        _ => format!("View all {} replies", c.child_comment_count),
+    };
+    let more = gtk::Button::builder()
+        .label(label)
+        .halign(gtk::Align::Start)
+        .css_classes(["flat", "caption"])
+        .build();
+    replies.append(&more);
+    // None: nothing loaded yet (the first page replaces the replies shown).
+    let cursor: Rc<std::cell::RefCell<Option<String>>> = Rc::default();
+    let (main, media_id, pk) = (main.clone(), media_id.to_string(), c.pk.clone());
+    let list = replies.downgrade();
+    more.connect_clicked(move |button| {
+        let Some(client) = main.upgrade().map(|m| m.client.clone()) else { return };
+        button.set_sensitive(false);
+        let (media_id, pk, after) = (media_id.clone(), pk.clone(), cursor.borrow().clone());
+        let (main, cursor, list, button) = (main.clone(), cursor.clone(), list.clone(), button.downgrade());
+        glib::spawn_future_local(async move {
+            let first = after.is_none();
+            let res = rt::bg(async move { client.comment_replies(&media_id, &pk, after.as_deref()).await }).await;
+            let (Some(list), Some(button)) = (list.upgrade(), button.upgrade()) else { return };
+            button.set_sensitive(true);
+            match res {
+                Ok((page, _)) if page.is_empty() => button.set_label("Couldn't load the replies. Try again"),
+                Ok((page, next)) => {
+                    // The button goes back after them, if there's more.
+                    if first {
+                        util::clear_box(&list);
+                    } else {
+                        list.remove(&button);
+                    }
+                    for r in &page {
+                        list.append(&comment_row(r, 24));
+                    }
+                    if let Some(next) = next {
+                        cursor.replace(Some(next));
+                        button.set_label("View more replies");
+                        list.append(&button);
+                    }
+                }
+                Err(e) => {
+                    button.set_label("Couldn't load the replies. Try again");
+                    if let Some(main) = main.upgrade()
+                        && crate::api::is_login_required(&e)
+                    {
+                        main.handle_error(&e);
+                    }
+                }
+            }
+        });
+    });
+    column.upcast()
 }
 
 fn note(text: &str) -> gtk::Label {
@@ -144,7 +224,7 @@ impl Panel {
                 Ok(comments) if comments.is_empty() => p.list.append(&note("No comments yet")),
                 Ok(comments) => {
                     for c in &comments {
-                        p.list.append(&comment_row(c));
+                        p.list.append(&comment_thread(&p.main, &p.media_id, c));
                     }
                 }
                 Err(e) => {
@@ -182,7 +262,7 @@ impl Panel {
                     {
                         p.list.remove(&first);
                     }
-                    p.list.append(&comment_row(&comment));
+                    p.list.append(&comment_row(&comment, 32));
                 }
                 Err(e) => {
                     if let Some(main) = p.main.upgrade() {

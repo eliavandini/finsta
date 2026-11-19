@@ -54,6 +54,12 @@ def img(name, w=1080, h=1080):
     return f"{BASE}/img/{name}_{w}x{h}.jpg"
 
 
+def reply(parent, i):
+    """The i-th reply (from 0) to comment `parent`."""
+    return {"pk": parent * 1000 + i, "text": f"@someone reply {i + 1} to comment {parent}", "user": USERS["1004" if i % 2 else "1005"],
+            "created_at": NOW - 3000 + 60 * i, "parent_comment_id": parent}
+
+
 def anim(name, w=200, h=200):
     """An animated WebP (a ball going round, see-through around it), like GIFs and stickers."""
     return f"{BASE}/anim/{name}_{w}x{h}.webp"
@@ -1112,10 +1118,19 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"id": "9001", "text": body.get("comment_text", [""])[0], "created_time": NOW, "from": {"id": ME, "username": me["username"], "full_name": me["full_name"], "profile_picture": me["profile_pic_url"]}, "status": "ok"})
         if p == "web/accounts/logout/ajax/":
             return self.send_json({"status": "ok"})
+        if m := re.match(r"media/.+/comments/(\d+)/child_comments/", p):
+            # Comment 1 has 3 replies, comment 3 has 25; 10 a page, oldest first.
+            total, start = {1: 3, 3: 25}.get(int(m.group(1)), 0), int(q.get("max_id", ["0"])[0])
+            more = start + 10 < total
+            return self.send_json({"child_comments": [reply(int(m.group(1)), i) for i in range(start, min(start + 10, total))],
+                                   "has_more_tail_child_comments": more, "next_max_child_cursor": str(start + 10) if more else None, "status": "ok"})
         if re.match(r"media/.+/comments/", p):
             return self.send_json({"comments": [
-                {"pk": 1, "text": "Wow, stunning! 😍", "user": USERS["1002"], "created_at": NOW - 5000, "comment_like_count": 3},
-                {"pk": 2, "text": "Where is this?", "user": USERS["1004"], "created_at": NOW - 4000},
+                {"pk": 1, "text": "Wow, stunning! 😍", "user": USERS["1002"], "created_at": NOW - 5000, "comment_like_count": 3,
+                 "child_comment_count": 3, "preview_child_comments": [reply(1, 0)]},
+                {"pk": 2, "text": "Where is this?", "user": USERS["1004"], "created_at": NOW - 4000, "preview_child_comments": None},
+                {"pk": 3, "text": "Which camera do you use?", "user": USERS["1005"], "created_at": NOW - 3900, "child_comment_count": 25,
+                 "preview_child_comments": []},
             ], "status": "ok"})
         if re.match(r"media/.+/(like|unlike)/", p):
             return self.send_json({"status": "ok"})

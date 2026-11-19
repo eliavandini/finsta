@@ -932,6 +932,23 @@ impl Client {
         Ok(parse(&v["comments"]).unwrap_or_default())
     }
 
+    /// Replies to a comment, oldest first, a page at a time; with the next
+    /// page's cursor, if there's more.
+    pub async fn comment_replies(&self, media_id: &str, comment_pk: &str, cursor: Option<&str>) -> Result<(Vec<Comment>, Option<String>)> {
+        if comment_pk.is_empty() || !comment_pk.bytes().all(|c| c.is_ascii_digit()) {
+            bail!("Can't find the replies to this comment");
+        }
+        let query: Vec<(&str, String)> = cursor.map(|c| ("max_id", c.to_string())).into_iter().collect();
+        let v = self
+            .get(&format!("media/{}/comments/{comment_pk}/child_comments/", media_pk(media_id)), &query)
+            .await?;
+        let next = v["next_max_child_cursor"]
+            .as_str()
+            .filter(|c| !c.is_empty() && v["has_more_tail_child_comments"].as_bool() == Some(true))
+            .map(str::to_string);
+        Ok((parse(&v["child_comments"]).unwrap_or_default(), next))
+    }
+
     pub async fn add_comment(&self, media_id: &str, text: &str) -> Result<Comment> {
         let v = self
             .post(
