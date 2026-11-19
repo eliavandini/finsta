@@ -168,6 +168,15 @@ pub fn page(main: &Rc<Main>, user: User) -> adw::NavigationPage {
         }
     ));
 
+    let weak = Rc::downgrade(&profile);
+    profile.counts.connect_activate_link(move |_, uri| {
+        if let Some(p) = weak.upgrade()
+            && let Some(main) = p.main.upgrade()
+        {
+            follow_list(&main, &p.user.borrow(), uri == "followers");
+        }
+        glib::Propagation::Stop
+    });
     profile.render_info();
     profile.render_actions();
     profile.load();
@@ -182,8 +191,9 @@ impl Profile {
         self.name.set_label(&user.full_name);
         self.name.set_visible(!user.full_name.is_empty());
         if user.media_count > 0 || user.follower_count > 0 {
-            self.counts.set_label(&format!(
-                "{}  ·  {}  ·  {} following",
+            // Followers and following open their lists.
+            self.counts.set_markup(&format!(
+                "{}  ·  <a href=\"followers\">{}</a>  ·  <a href=\"following\">{} following</a>",
                 util::plural(user.media_count, "post", "posts"),
                 util::plural(user.follower_count, "follower", "followers"),
                 util::count(user.following_count),
@@ -499,4 +509,95 @@ pub fn thumbnail(media: &Media) -> gtk::FlowBoxChild {
         child.set_tooltip_text(Some(&caption));
     }
     child
+}
+
+/// A window listing who follows `user` (`followers`) or whom they follow,
+/// loading more as you scroll; a row opens that profile.
+fn follow_list(main: &Rc<Main>, user: &User, followers: bool) {
+    let list = gtk::ListBox::builder().css_classes(["boxed-list"]).selection_mode(gtk::SelectionMode::None).valign(gtk::Align::Start).build();
+    let status = gtk::Label::builder().wrap(true).css_classes(["dim-label"]).margin_top(12).visible(false).build();
+    let spinner = util::spinner_box();
+    let content = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(12).margin_top(12).margin_bottom(12).margin_start(12).margin_end(12).build();
+    content.append(&list);
+    content.append(&status);
+    content.append(&spinner);
+    let scroller = gtk::ScrolledWindow::builder().hscrollbar_policy(gtk::PolicyType::Never).vexpand(true).child(&content).build();
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(&scroller));
+    let dialog = adw::Dialog::builder()
+        .title(if followers { "Followers" } else { "Following" })
+        .content_width(420)
+        .content_height(600)
+        .child(&toolbar)
+        .build();
+
+    let users: Rc<RefCell<Vec<User>>> = Rc::default();
+    let w = Rc::downgrade(main);
+    let (u, d) = (users.clone(), dialog.downgrade());
+    list.connect_row_activated(move |_, row| {
+        let (Some(main), Some(user)) = (w.upgrade(), u.borrow().get(row.index() as usize).cloned()) else { return };
+        if let Some(d) = d.upgrade() {
+            d.force_close();
+        }
+        main.open_profile(user);
+    });
+
+    // None: the first page; Some(None): no more.
+    let cursor: Rc<RefCell<Option<Option<String>>>> = Rc::default();
+    let loading = Rc::new(Cell::new(false));
+    let load: Rc<dyn Fn()> = {
+        let (w, pk) = (Rc::downgrade(main), user.pk.clone());
+        let (list, status, spinner) = (list.downgrade(), status.downgrade(), spinner.downgrade());
+        Rc::new(move || {
+            let Some(main) = w.upgrade() else { return };
+            let after = match cursor.borrow().clone() {
+                Some(None) => return,
+                Some(Some(c)) => Some(c),
+                None => None,
+            };
+            if loading.replace(true) {
+                return;
+            }
+            let (client, pk, w) = (main.client.clone(), pk.clone(), w.clone());
+            let (cursor, loading, users) = (cursor.clone(), loading.clone(), users.clone());
+            let (list, status, spinner) = (list.clone(), status.clone(), spinner.clone());
+            glib::spawn_future_local(async move {
+                let first = after.is_none();
+                let res = rt::bg(async move { client.follow_list(&pk, followers, after.as_deref()).await }).await;
+                loading.set(false);
+                let (Some(list), Some(status), Some(spinner), Some(main)) = (list.upgrade(), status.upgrade(), spinner.upgrade(), w.upgrade()) else { return };
+                match res {
+                    Ok((page, next)) => {
+                        for u in &page {
+                            list.append(&crate::ui::search::person_row(&main, u));
+                        }
+                        users.borrow_mut().extend(page);
+                        spinner.set_visible(next.is_some());
+                        if first && users.borrow().is_empty() {
+                            status.set_label(if followers { "No followers to show" } else { "Not following anyone you can see" });
+                            status.set_visible(true);
+                        }
+                        cursor.replace(Some(next));
+                    }
+                    Err(e) => {
+                        spinner.set_visible(false);
+                        status.set_label(&format!("Couldn't load the list: {e}"));
+                        status.set_visible(true);
+                        if crate::api::is_login_required(&e) {
+                            main.handle_error(&e);
+                        }
+                    }
+                }
+            });
+        })
+    };
+    let l = load.clone();
+    scroller.connect_edge_reached(move |_, edge| {
+        if edge == gtk::PositionType::Bottom {
+            l();
+        }
+    });
+    load();
+    dialog.present(Some(&main.window));
 }

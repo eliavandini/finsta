@@ -609,6 +609,25 @@ impl Client {
         Ok(users)
     }
 
+    /// Who follows `pk` (`followers`) or whom it follows, a page at a time
+    /// (as instagram.com's follow lists ask), with the next page's cursor.
+    pub async fn follow_list(&self, pk: &str, followers: bool, max_id: Option<&str>) -> Result<(Vec<User>, Option<String>)> {
+        if pk.is_empty() || !pk.bytes().all(|c| c.is_ascii_digit()) {
+            bail!("Can't find this account");
+        }
+        let kind = if followers { "followers" } else { "following" };
+        let mut q = vec![("count", "25".to_string()), ("search_surface", "follow_list_page".to_string())];
+        if let Some(m) = max_id {
+            q.push(("max_id", m.to_string()));
+        }
+        let v = self.get(&format!("friendships/{pk}/{kind}/"), &q).await?;
+        let users: Vec<User> = parse(&v["users"]).unwrap_or_default();
+        let next = parse::<Value>(&v["next_max_id"])
+            .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+            .filter(|m| !m.is_empty());
+        Ok((users, next))
+    }
+
     /// The ids of every account the signed-in user follows.
     pub async fn following_ids(&self) -> Result<HashSet<String>> {
         let me = self.user_id();

@@ -60,7 +60,7 @@ fn status_stack(results: &impl IsA<gtk::Widget>, empty: &str) -> gtk::Stack {
     stack
 }
 
-fn person_row(main: &Main, u: &User) -> adw::ActionRow {
+pub fn person_row(main: &Main, u: &User) -> adw::ActionRow {
     let mut subtitle = format!("@{}", u.username);
     if main.is_followed(u) && u.pk != main.client.user_id() {
         subtitle.push_str(" · Following");

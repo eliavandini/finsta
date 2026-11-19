@@ -41,7 +41,7 @@ There are no reels, no explore page, no suggested posts and no ads.
   Groups), your Profile, and your Saved posts (the bookmark button).
 - **Content**: home feed with stories (the tray spans the whole page),
   conversations, profiles and posts. On narrow windows the sidebar folds
-  away.
+  away. On a profile, click the followers or following count to list them.
 - **Saved** (the bookmark button next to your profile): your folders across
   the top, All Posts, each folder you made on Instagram, and Songs, with
   the chosen folder's posts filling the page below.

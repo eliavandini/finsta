@@ -1041,6 +1041,11 @@ class Handler(BaseHTTPRequestHandler):
             u = dict(USERS.get(m.group(1), USERS["1001"]))
             u.update({"biography": "Photos, mountains & coffee ☕\nBologna 🇮🇹", "external_url": "https://example.com", "follower_count": 1234, "following_count": 321, "media_count": 15})
             return self.send_json({"user": u, "status": "ok"})
+        if re.match(r"friendships/\d+/followers/", p):
+            # 60 followers, 25 a page.
+            start = int(q.get("max_id", ["0"])[0])
+            users = [{**USERS["1001"], "pk": str(5000 + i), "username": f"follower{i}", "full_name": f"Follower {i}"} for i in range(start, min(start + 25, 60))]
+            return self.send_json({"users": users, "next_max_id": str(start + 25) if start + 25 < 60 else None, "status": "ok"})
         if re.match(r"friendships/\d+/following/", p):
             return self.send_json({"users": [USERS[k] for k in ["1001", "1002", "1003", "1004", "1005"]], "status": "ok"})
         if p == "feed/timeline/" and OFFMSYS:
