@@ -1,5 +1,6 @@
 //! How the home feed shows posts (columns, size, comments beside posts),
-//! saved in ~/.config/finsta/settings.json.
+//! saved in ~/.config/finsta/settings.json (which also holds the app's
+//! preferences, see prefs.rs).
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -75,11 +76,11 @@ impl FeedLayout {
     }
 }
 
-fn path() -> Option<PathBuf> {
+pub(crate) fn path() -> Option<PathBuf> {
     Some(dirs::config_dir()?.join("finsta").join("settings.json"))
 }
 
-fn read_all() -> Value {
+pub(crate) fn read_all() -> Value {
     path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str(&s).ok())
@@ -103,14 +104,19 @@ pub fn feed() -> FeedLayout {
 
 pub fn set_feed(layout: FeedLayout) {
     FEED.set(Some(layout));
+    write_key("feed", serde_json::to_value(layout).unwrap_or_default());
+}
+
+/// Save one part of settings.json, keeping the rest.
+pub(crate) fn write_key(key: &str, value: Value) {
     let Some(path) = path() else { return };
     let mut all = read_all();
-    all["feed"] = serde_json::to_value(layout).unwrap_or_default();
+    all[key] = value;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&all).unwrap_or_default()) {
-        eprintln!("finsta: couldn't save the layout settings ({})", e.kind());
+        eprintln!("finsta: couldn't save the settings ({})", e.kind());
     }
 }
 

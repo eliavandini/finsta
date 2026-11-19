@@ -48,6 +48,8 @@ pub(super) struct SlideState {
     viewer_fbid: Option<String>,
     /// Message id -> its time (ms), for marking as read.
     message_times: HashMap<String, i64>,
+    /// Message id -> the id the website's reactions use (SlideMessage.id).
+    reaction_ids: HashMap<String, String>,
     /// Content type names seen so far (for logging new ones once).
     content_types: BTreeSet<String>,
     logged: HashSet<String>,
@@ -163,6 +165,7 @@ impl SlideState {
     fn item(&self, t: &Value, m: &Value, viewer_pk: &str) -> Value {
         let message_id = s(&m["message_id"]);
         let mut v = json!({
+            "slide_id": s(&m["id"]),
             "item_id": if message_id.is_empty() { s(&m["id"]) } else { message_id },
             "user_id": self.sender(t, &s(&m["sender_fbid"]), viewer_pk),
             "timestamp": n(&m["timestamp_ms"]) * 1000,
@@ -326,6 +329,7 @@ impl SlideState {
             "thread_id": id,
             "thread_title": if is_group { title } else { String::new() },
             "is_group": is_group,
+            "muted": t["is_muted"].as_bool().unwrap_or(false),
             "users": users,
             "items": items,
             "last_activity_at": last_activity * 1000,
@@ -504,6 +508,9 @@ impl Client {
         items.sort_by_key(|i| -n(&i["timestamp"]));
         for i in &items {
             st.slide.message_times.insert(s(&i["item_id"]), n(&i["timestamp"]) / 1000);
+            if !s(&i["slide_id"]).is_empty() {
+                st.slide.reaction_ids.insert(s(&i["item_id"]), s(&i["slide_id"]));
+            }
         }
 
         let types: BTreeSet<String> = nodes.iter().map(|m| s(&m["content"]["__typename"])).collect();
@@ -544,18 +551,36 @@ impl Client {
         parse(&st.slide.thread(&id, &viewer_pk, items, false, None))
     }
 
-    pub(super) async fn slide_react(&self, st: &mut DmState, thread_id: &str, message_id: &str, emoji: Option<&str>) -> Result<()> {
-        let igid = s(&st.slide.threads.get(thread_id).cloned().unwrap_or_default()["thread_id"]);
-        if igid.is_empty() {
-            bail!("Couldn't find this conversation's id. Reopen it and try again.");
+    /// React to a message (or take your reaction back: `on` false, with the
+    /// emoji you reacted with), with the inputs instagram.com's
+    /// IGDMAPISendReaction builds.
+    pub(super) async fn slide_react(&self, st: &mut DmState, thread_id: &str, item_id: &str, emoji: &str, on: bool) -> Result<()> {
+        let t = st.slide.threads.get(thread_id).cloned().unwrap_or_default();
+        let fbid = [&t["thread_fbid"], &t["thread_key"]]
+            .into_iter()
+            .map(s)
+            .find(|x| !x.is_empty())
+            .unwrap_or_else(|| thread_id.to_string());
+        let message_id = st.slide.reaction_ids.get(item_id).cloned().unwrap_or_else(|| item_id.to_string());
+        if st.slide.logged.insert("react ids".into()) {
+            eprintln!(
+                "finsta: dm: reaction: conversation id from {}, message id {}",
+                if !s(&t["thread_fbid"]).is_empty() {
+                    "thread_fbid"
+                } else if !s(&t["thread_key"]).is_empty() {
+                    "thread_key"
+                } else {
+                    "the app's id"
+                },
+                if message_id == item_id { "same as the item's" } else { "from the message's own id" }
+            );
         }
         let input = json!({
-            "ig_thread_igid": igid,
-            "item_id": message_id,
-            "emoji": emoji.unwrap_or(""),
-            "reaction_status": if emoji.is_some() { "created" } else { "deleted" },
-            "reaction_type": "like",
-            "offline_threading_id": time_id().to_string(),
+            "emoji": emoji,
+            "item_id": "",
+            "message_id": message_id,
+            "reaction_status": if on { "created" } else { "deleted" },
+            "thread_id": fbid,
         });
         let data = self.slide_op(st, REACT, json!({"input": input})).await?;
         if data["xig_direct_reaction_send_with_slide_messaging_response"]["success"] == false {

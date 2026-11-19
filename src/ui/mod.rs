@@ -6,7 +6,10 @@ pub mod images;
 pub mod layout;
 pub mod login;
 pub mod media_viewer;
+pub mod menu;
+pub mod notify;
 pub mod post;
+pub mod prefs;
 pub mod profile;
 pub mod ratio_bin;
 pub mod saved;
@@ -15,6 +18,7 @@ pub mod share;
 pub mod search;
 pub mod sidebar;
 pub mod stories;
+pub mod story_stage;
 pub mod video;
 pub mod util;
 #[cfg(feature = "webkit")]

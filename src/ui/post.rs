@@ -11,6 +11,7 @@ use gtk::glib;
 use crate::api::{Media, Song};
 use crate::rt;
 use crate::ui::layout::SIDE_WIDTH;
+use crate::ui::menu::{self, Menu};
 use crate::ui::ratio_bin::RatioBin;
 use crate::ui::util;
 use crate::ui::window::Main;
@@ -39,19 +40,105 @@ struct Parts {
     aspect: f64,
     /// The buttons and the like count.
     actions: gtk::Widget,
+    buttons: Buttons,
     caption: Option<gtk::Widget>,
+}
+
+/// A post's buttons, which its menu presses too (so both stay in step).
+#[derive(Clone)]
+pub struct Buttons {
+    like: gtk::Button,
+    save: gtk::Button,
 }
 
 type Action = Rc<dyn Fn()>;
 
 fn parts(main: &Rc<Main>, media: &Media, on_comment: Action) -> Parts {
+    let (actions, buttons) = actions(main, media, on_comment);
     Parts {
         header: header(main, media),
-        media: media_content(media),
+        media: with_song(main, media, media_content(media)),
         aspect: media.aspect(),
-        actions: actions(main, media, on_comment),
+        actions,
+        buttons,
         caption: caption(media),
     }
+}
+
+/// The right-click menu of a post. `buttons`: the post's own buttons, when
+/// it's shown with them; `open`: offer to open it on its own page.
+pub fn menu(main: &Rc<Main>, media: &Media, buttons: Option<&Buttons>, on_comment: Option<Action>, open: bool) -> Menu {
+    let mut m = Menu::new();
+    let what = if media.product_type == "clips" { share::Kind::Reel } else { share::Kind::Post };
+    if open {
+        let (weak, media) = (Rc::downgrade(main), media.clone());
+        m.item(if what == share::Kind::Reel { "Open Reel" } else { "Open Post" }, move || {
+            if let Some(main) = weak.upgrade() {
+                main.open_post(media.clone());
+            }
+        });
+    }
+    if let Some(b) = buttons {
+        let like = b.like.clone();
+        let label = like.tooltip_text().map(|t| t.to_string()).unwrap_or_else(|| "Like".into());
+        m.item(label, move || like.emit_clicked());
+    }
+    if let Some(comment) = on_comment.filter(|_| !media.comments_disabled) {
+        m.item("Comment", move || comment());
+    }
+    m.section();
+    if let Some(url) = media.web_url() {
+        let weak = Rc::downgrade(main);
+        m.item("Share…", move || {
+            if let Some(main) = weak.upgrade() {
+                share::open(&main, share::Shared { url: url.clone(), kind: what }, None, None);
+            }
+        });
+    }
+    match buttons {
+        Some(b) => {
+            let save = b.save.clone();
+            let label = save.tooltip_text().map(|t| t.to_string()).unwrap_or_else(|| "Save".into());
+            m.item(label, move || save.emit_clicked());
+        }
+        None => {
+            let (weak, media, saved) = (Rc::downgrade(main), media.clone(), media.has_viewer_saved);
+            m.item(if saved { "Remove from Saved" } else { "Save" }, move || {
+                if let Some(main) = weak.upgrade() {
+                    saving::set_saved(&main, &media, !saved, |_| {});
+                }
+            });
+        }
+    }
+    let (weak, m2) = (Rc::downgrade(main), media.clone());
+    m.item("Add to Folder…", move || {
+        if let Some(main) = weak.upgrade() {
+            saving::choose_folder(&main, &m2);
+        }
+    });
+    let (weak, m2) = (Rc::downgrade(main), media.clone());
+    m.item("Download", move || {
+        if let Some(main) = weak.upgrade() {
+            let owner = m2.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+            download::save(&main, &m2, &owner, None);
+        }
+    });
+    m.section();
+    if let Some(url) = media.web_url() {
+        menu::add_link(&mut m, main, &url);
+    }
+    m.section();
+    if let Some(user) = &media.user {
+        menu::add_person(&mut m, main, user, true, true);
+    }
+    m
+}
+
+/// A post's menu on a thumbnail (profile, saved and search grids).
+pub fn attach_menu(main: &Rc<Main>, widget: &impl IsA<gtk::Widget>, media: &Media) {
+    let weak = Rc::downgrade(main);
+    let media = media.clone();
+    menu::attach(widget, move || Some(menu(&weak.upgrade()?, &media, None, None, true)));
 }
 
 fn header(main: &Rc<Main>, media: &Media) -> gtk::Widget {
@@ -148,7 +235,7 @@ pub fn music_label(main: &Rc<Main>, song: &Song, from: Option<String>, notify: O
     b.upcast()
 }
 
-fn actions(main: &Rc<Main>, media: &Media, on_comment: Action) -> gtk::Widget {
+fn actions(main: &Rc<Main>, media: &Media, on_comment: Action) -> (gtk::Widget, Buttons) {
     let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).build();
     let row = gtk::Box::builder()
         .spacing(2)
@@ -238,10 +325,11 @@ fn actions(main: &Rc<Main>, media: &Media, on_comment: Action) -> gtk::Widget {
     row.append(&gtk::Box::builder().hexpand(true).build());
     let owner = media.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
     row.append(&download::button(main, media, &owner));
-    row.append(&saving::post_button(main, media));
+    let save_button = saving::post_button(main, media);
+    row.append(&save_button);
     column.append(&row);
     column.append(&likes_label);
-    column.upcast()
+    (column.upcast(), Buttons { like: like_button, save: save_button })
 }
 
 fn caption(media: &Media) -> Option<gtk::Widget> {
@@ -313,6 +401,12 @@ fn focus_entry(panel: &Rc<comments::Panel>) -> Action {
     })
 }
 
+fn attach_card_menu(main: &Rc<Main>, card: &impl IsA<gtk::Widget>, media: &Media, buttons: &Buttons, on_comment: Action, open: bool) {
+    let weak = Rc::downgrade(main);
+    let (media, buttons) = (media.clone(), buttons.clone());
+    menu::attach(card, move || Some(menu(&weak.upgrade()?, &media, Some(&buttons), Some(on_comment.clone()), open)));
+}
+
 /// A post for the home feed.
 pub fn card(main: &Rc<Main>, media: &Media, style: Style) -> gtk::Widget {
     if style.side {
@@ -324,6 +418,7 @@ pub fn card(main: &Rc<Main>, media: &Media, style: Style) -> gtk::Widget {
         .overflow(gtk::Overflow::Hidden)
         .build();
     let p = parts(main, media, open_comments(main, media));
+    attach_card_menu(main, &card, media, &p.buttons, open_comments(main, media), true);
     card.append(&p.header);
     card.append(&RatioBin::new(p.aspect, style.width, &p.media));
     card.append(&p.actions);
@@ -361,6 +456,7 @@ fn side_card(main: &Rc<Main>, media: &Media, width: i32) -> gtk::Widget {
         .css_classes(["card", "post", "side-post"])
         .overflow(gtk::Overflow::Hidden)
         .build();
+    attach_card_menu(main, &card, media, &p.buttons, focus_entry(&panel), true);
     let ratio = RatioBin::new(p.aspect, width, &p.media);
     ratio.set_valign(gtk::Align::Center);
     ratio.set_vexpand(true);
@@ -433,6 +529,7 @@ fn detach(w: &gtk::Widget) {
 pub fn page(main: &Rc<Main>, media: &Media) -> adw::NavigationPage {
     let panel = comments::panel(main, media);
     let p = parts(main, media, focus_entry(&panel));
+    attach_card_menu(main, &p.media, media, &p.buttons, focus_entry(&panel), false);
     let comments_title = gtk::Label::builder()
         .label("Comments")
         .xalign(0.0)
@@ -579,6 +676,47 @@ pub fn page(main: &Rc<Main>, media: &Media) -> adw::NavigationPage {
         .title(format!("Post by @{owner}"))
         .child(&bin)
         .build()
+}
+
+/// A photo post with music plays its song (while the sound is on and it's
+/// on screen), with the sound button videos have.
+fn with_song(main: &Rc<Main>, media: &Media, content: gtk::Widget) -> gtk::Widget {
+    if media.is_video() || media.song().is_none() {
+        return content;
+    }
+    let overlay = gtk::Overlay::builder().child(&content).build();
+    let mute = video::mute_button();
+    mute.set_valign(gtk::Align::End);
+    mute.set_halign(gtk::Align::Start);
+    mute.set_margin_start(10);
+    overlay.add_overlay(&mute);
+    let weak = Rc::downgrade(main);
+    let media = media.clone();
+    video::autoplay_song(&overlay, move |ready| {
+        let Some(main) = weak.upgrade() else { return ready(None) };
+        let client = main.client.clone();
+        let media = media.clone();
+        glib::spawn_future_local(async move {
+            let res = rt::bg(async move { client.song_clip(&media).await }).await;
+            ready(match res {
+                Ok(Some(clip)) => Some((clip.url, segment(clip.start_ms, clip.duration_ms))),
+                Ok(None) => None,
+                Err(e) => {
+                    eprintln!("finsta: music: couldn't load a post's song: {e}");
+                    None
+                }
+            });
+        });
+    });
+    overlay.upcast()
+}
+
+/// The part of a song a post or story plays.
+pub fn segment(start_ms: u64, duration_ms: Option<u64>) -> video::Segment {
+    video::Segment {
+        start: std::time::Duration::from_millis(start_ms),
+        length: duration_ms.map(std::time::Duration::from_millis),
+    }
 }
 
 /// The photo, video or carousel of a post, filling whatever size it's given.

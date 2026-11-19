@@ -257,6 +257,40 @@ fn text_of(v: &Value) -> String {
     }
 }
 
+/// The part of a song a photo post or a photo story plays.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clip {
+    pub url: String,
+    pub start_ms: u64,
+    pub duration_ms: Option<u64>,
+}
+
+/// The first non-empty value under `key`, anywhere in `v` (a few levels deep).
+fn find_key<'a>(v: &'a Value, key: &str, depth: u32) -> Option<&'a Value> {
+    match v {
+        Value::Object(o) => o
+            .get(key)
+            .filter(|x| !x.is_null() && x.as_str() != Some(""))
+            .or_else(|| (depth > 0).then(|| o.values().find_map(|x| find_key(x, key, depth - 1))).flatten()),
+        Value::Array(a) if depth > 0 => a.iter().find_map(|x| find_key(x, key, depth - 1)),
+        _ => None,
+    }
+}
+
+fn clip_in(music: &Value) -> Option<Clip> {
+    let url = ["progressive_download_url", "fast_start_progressive_download_url", "web_30s_preview_download_url"]
+        .into_iter()
+        .filter_map(|k| find_key(music, k, 4))
+        .map(text_of)
+        .find(|u| u.starts_with("http"))?;
+    let ms = |k: &str| find_key(music, k, 4).map(value_i64).filter(|n| *n >= 0).map(|n| n as u64);
+    Some(Clip {
+        url,
+        start_ms: ms("audio_asset_start_time_in_ms").unwrap_or(0),
+        duration_ms: ms("overlap_duration_in_ms").filter(|n| *n > 0),
+    })
+}
+
 fn licensed_song(info: &Value) -> Option<Song> {
     let song = Song {
         id: [&info["audio_cluster_id"], &info["audio_asset_id"], &info["id"]]
@@ -275,6 +309,46 @@ fn licensed_song(info: &Value) -> Option<Song> {
 }
 
 impl Media {
+    /// The audio of a photo post's or photo story's song, if Instagram sent
+    /// it (videos carry their sound themselves).
+    pub fn song_clip(&self) -> Option<Clip> {
+        [&self.story_music_stickers, &self.music_metadata]
+            .into_iter()
+            .flatten()
+            .find_map(clip_in)
+    }
+
+    /// The field names under a post's music (for the log; no values).
+    pub fn music_fields(&self) -> Vec<String> {
+        let mut out = std::collections::BTreeSet::new();
+        fn walk(v: &Value, prefix: &str, out: &mut std::collections::BTreeSet<String>, depth: u32) {
+            match v {
+                Value::Object(o) if depth > 0 => {
+                    for (k, x) in o {
+                        let name = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                        if x.is_object() || x.is_array() {
+                            walk(x, &name, out, depth - 1);
+                        } else if !x.is_null() {
+                            out.insert(name);
+                        }
+                    }
+                }
+                Value::Array(a) if depth > 0 => {
+                    if let Some(first) = a.first() {
+                        walk(first, &format!("{prefix}[0]"), out, depth - 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (name, v) in [("stickers", &self.story_music_stickers), ("music", &self.music_metadata)] {
+            if let Some(v) = v {
+                walk(v, name, &mut out, 4);
+            }
+        }
+        out.into_iter().collect()
+    }
+
     /// The song or sound a reel or story uses.
     pub fn song(&self) -> Option<Song> {
         let null = Value::Null;
@@ -494,6 +568,9 @@ pub struct Thread {
     pub last_seen_at: Value,
     #[serde(default, deserialize_with = "de_i64")]
     pub read_state: i64,
+    /// Notifications turned off for it on Instagram.
+    #[serde(default, deserialize_with = "de_bool")]
+    pub muted: bool,
 }
 
 impl Thread {
@@ -955,6 +1032,28 @@ impl DmContent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A song's audio and the part of it a post or story plays.
+    #[test]
+    fn song_clips() {
+        let base = json!({"pk": "1", "id": "1_2", "media_type": 1, "user": {"pk": "2", "username": "x"}});
+        let mut post = base.clone();
+        post["music_metadata"] = json!({"music_info": {
+            "music_asset_info": {"title": "t", "progressive_download_url": "https://a/song.m4a"},
+            "music_consumption_info": {"audio_asset_start_time_in_ms": 2000, "overlap_duration_in_ms": 8000}}});
+        let clip = serde_json::from_value::<Media>(post).unwrap().song_clip().unwrap();
+        assert_eq!((clip.url.as_str(), clip.start_ms, clip.duration_ms), ("https://a/song.m4a", 2000, Some(8000)));
+
+        let mut story = base.clone();
+        story["story_music_stickers"] = json!([{"music_asset_info": {"web_30s_preview_download_url": "https://a/p.m4a"}}]);
+        let clip = serde_json::from_value::<Media>(story).unwrap().song_clip().unwrap();
+        assert_eq!((clip.url.as_str(), clip.start_ms, clip.duration_ms), ("https://a/p.m4a", 0, None));
+
+        // instagram.com's own answers name the song but not its audio.
+        let mut named = base;
+        named["music_metadata"] = json!({"music_info": {"music_asset_info": {"title": "t"}}});
+        assert!(serde_json::from_value::<Media>(named).unwrap().song_clip().is_none());
+    }
 
     /// instagram.com's GraphQL answers spell out absent fields as null.
     #[test]

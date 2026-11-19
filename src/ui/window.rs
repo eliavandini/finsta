@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::glib;
+use gtk::{gio, glib};
 
 use crate::api::{self, Client, Media, Reel, Session, Thread, User};
 use crate::rt;
@@ -33,7 +33,8 @@ pub struct Main {
     limit_toast: Cell<Option<std::time::Instant>>,
 }
 
-pub fn build(app: &adw::Application) {
+/// The main window; `show` false starts it hidden (in the background).
+pub fn build(app: &adw::Application, show: bool) {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Finsta")
@@ -44,11 +45,35 @@ pub fn build(app: &adw::Application) {
         .build();
     let toasts = adw::ToastOverlay::new();
     window.set_content(Some(&toasts));
-    match Session::load() {
+    // With "Run in Background" on, closing only hides the window.
+    window.connect_close_request(|w| {
+        if crate::ui::prefs::get().run_in_background {
+            to_background(w);
+            return glib::Propagation::Stop;
+        }
+        glib::Propagation::Proceed
+    });
+    let session = Session::load();
+    let signed_in = session.is_some();
+    match session {
         Some(session) => show_main(&window, &toasts, session),
         None => show_login(&window, &toasts),
     }
-    window.present();
+    // Signing in needs the window.
+    if show || !signed_in {
+        window.present();
+    } else {
+        eprintln!("finsta: started in the background");
+    }
+}
+
+fn to_background(window: &adw::ApplicationWindow) {
+    if let Some(dialog) = window.visible_dialog() {
+        dialog.force_close();
+    }
+    crate::ui::video::stop_all();
+    window.set_visible(false);
+    eprintln!("finsta: window closed; still running in the background");
 }
 
 fn show_login(window: &adw::ApplicationWindow, toasts: &adw::ToastOverlay) {
@@ -89,6 +114,17 @@ impl Main {
             .build();
 
         let header = adw::HeaderBar::new();
+        let app_menu = gio::Menu::new();
+        app_menu.append(Some("Preferences"), Some("win.preferences"));
+        app_menu.append(Some("Quit"), Some("app.quit"));
+        header.pack_end(
+            &gtk::MenuButton::builder()
+                .icon_name("open-menu-symbolic")
+                .tooltip_text("Main Menu")
+                .menu_model(&app_menu)
+                .primary(true)
+                .build(),
+        );
         let sidebar_button = gtk::ToggleButton::builder()
             .icon_name("sidebar-show-symbolic")
             .tooltip_text("Toggle Sidebar")
@@ -171,6 +207,30 @@ impl Main {
 
     fn connect_signals(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
+        // Replaced each time someone signs in.
+        let preferences = gio::SimpleAction::new("preferences", None);
+        let w = weak.clone();
+        preferences.connect_activate(move |_, _| {
+            if let Some(main) = w.upgrade() {
+                crate::ui::prefs::dialog(&main);
+            }
+        });
+        self.window.add_action(&preferences);
+        // A message notification was clicked.
+        if let Some(app) = self.window.application() {
+            let open = gio::SimpleAction::new("open-thread", Some(glib::VariantTy::STRING));
+            let w = weak.clone();
+            open.connect_activate(move |_, id| {
+                let Some(main) = w.upgrade() else { return };
+                main.window.present();
+                let Some(id) = id.and_then(|v| v.get::<String>()) else { return };
+                match main.sidebar.get().and_then(|s| s.thread(&id)) {
+                    Some(thread) => main.open_thread(thread, true),
+                    None => main.toast("Couldn't find that conversation"),
+                }
+            });
+            app.add_action(&open);
+        }
         self.back_button.connect_clicked(glib::clone!(
             #[strong]
             weak,
@@ -355,6 +415,7 @@ impl Main {
     /// Open a conversation. From the sidebar it replaces the current content;
     /// from elsewhere (e.g. a profile) it is pushed so Back returns there.
     pub fn open_thread(self: &Rc<Self>, thread: Thread, from_sidebar: bool) {
+        crate::ui::notify::withdraw(self, &thread.thread_id);
         let tag = format!("thread:{}", thread.thread_id);
         if !from_sidebar && self.in_stack(&tag) {
             self.nav.pop_to_tag(&tag);
@@ -509,6 +570,12 @@ impl Main {
     }
 
     // ----- Feedback ------------------------------------------------------
+
+    /// Put `text` on the clipboard and say so.
+    pub fn copy(&self, text: &str, done: &str) {
+        self.window.clipboard().set_text(text);
+        self.toast(done);
+    }
 
     pub fn toast(&self, message: &str) {
         let toast = adw::Toast::new(message);

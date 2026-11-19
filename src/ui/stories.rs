@@ -1,6 +1,7 @@
 //! Story viewer: plays the stories of the accounts in the home feed's tray.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
@@ -9,11 +10,15 @@ use gtk::{gdk, glib};
 
 use crate::api::{Media, Reel, StoryReply, User};
 use crate::rt;
+use crate::ui::menu::Menu;
+use crate::ui::story_stage::StoryStage;
 use crate::ui::video::{self, Opts, Player};
 use crate::ui::window::Main;
-use crate::ui::{download, images, post, share, util};
+use crate::ui::{download, images, menu, post, share, util};
 
 const PHOTO_SECONDS: f64 = 6.0;
+/// A photo story with music lasts as long as its part of the song, up to this.
+const SONG_SECONDS: f64 = 15.0;
 const TICK_MS: u64 = 50;
 /// Item index meaning "the first story you haven't watched yet".
 const FIRST_UNSEEN: usize = usize::MAX;
@@ -40,6 +45,16 @@ struct Viewer {
     exclusive: RefCell<Option<video::Exclusive>>,
     /// The current item's video, if one is playing (0: none).
     ticket: Cell<u64>,
+    /// A photo story's song, if one is playing (0: none).
+    song_ticket: Cell<u64>,
+    /// How long the current photo shows.
+    photo_seconds: Cell<f64>,
+    /// The story in the middle, the people before and after on the sides.
+    stage: StoryStage,
+    /// Which person the side cards were drawn for.
+    sides_for: Cell<Option<usize>>,
+    /// People whose stories were asked for already.
+    requested: RefCell<HashSet<String>>,
     avatar_slot: gtk::Box,
     name: gtk::Label,
     time: gtk::Label,
@@ -68,6 +83,17 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     if reels.is_empty() {
         return;
     }
+    // Opened on someone with new stories: go on only through people with
+    // new stories (each starts at their first one you haven't watched).
+    let (reels, start) = if reels.get(start).is_some_and(Reel::has_unseen) {
+        let id = reels[start].id.clone();
+        let kept: Vec<Reel> = reels.into_iter().filter(Reel::has_unseen).collect();
+        let start = kept.iter().position(|r| r.id == id).unwrap_or(0);
+        (kept, start)
+    } else {
+        let last = reels.len() - 1;
+        (reels, start.min(last))
+    };
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Contain)
         .can_shrink(true)
@@ -202,11 +228,14 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     overlay.add_overlay(&extras);
     overlay.add_overlay(&notice);
 
+    let stage = StoryStage::new(&overlay);
+    // As big as the window: the story in the middle, people on the sides.
     let dialog = adw::Dialog::builder()
-        .content_width(440)
-        .content_height(800)
-        .child(&overlay)
+        .content_width(main.window.width().max(440))
+        .content_height(main.window.height().max(600))
+        .child(&stage)
         .title("Stories")
+        .css_classes(["story-dialog"])
         .build();
 
     let viewer = Rc::new(Viewer {
@@ -224,6 +253,11 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
         exclusive: RefCell::new(player.as_ref().map(|p| p.exclusive())),
         player,
         ticket: Cell::new(0),
+        song_ticket: Cell::new(0),
+        photo_seconds: Cell::new(PHOTO_SECONDS),
+        stage,
+        sides_for: Cell::new(None),
+        requested: RefCell::new(HashSet::new()),
         avatar_slot,
         name,
         time,
@@ -278,6 +312,8 @@ pub fn open(main: &Rc<Main>, reels: Vec<Reel>, start: usize) {
     viewer.share_button.connect_clicked(move |_| f());
     let f = with(|v| v.send_reply());
     viewer.reply.connect_activate(move |_| f());
+    let weak = Rc::downgrade(&viewer);
+    menu::attach(&overlay, move || weak.upgrade().map(|v| v.menu()));
 
     // Typing a reply pauses the story.
     let focus = gtk::EventControllerFocus::new();
@@ -366,11 +402,12 @@ fn show_liked(button: &gtk::Button, liked: bool) {
 
 impl Viewer {
     fn stop_media(&self) {
-        let ticket = self.ticket.replace(0);
-        if ticket != 0
-            && let Some(player) = &self.player
-        {
-            player.release(ticket);
+        for ticket in [self.ticket.replace(0), self.song_ticket.replace(0)] {
+            if ticket != 0
+                && let Some(player) = &self.player
+            {
+                player.release(ticket);
+            }
         }
     }
 
@@ -387,6 +424,7 @@ impl Viewer {
         self.stop_media();
         self.ready.set(false);
         self.elapsed.set(0.0);
+        self.photo_seconds.set(PHOTO_SECONDS);
         self.reel.set(reel_index);
         self.item.set(0);
 
@@ -394,6 +432,7 @@ impl Viewer {
             self.close();
             return;
         };
+        self.render_sides(false);
         util::clear_box(&self.avatar_slot);
         util::clear_box(&self.details);
         util::clear_box(&self.extras);
@@ -411,11 +450,17 @@ impl Viewer {
             let Some(main) = self.main.upgrade() else { return };
             let client = main.client.clone();
             let id = reel.id.clone();
+            // The people next to this one in the same request.
+            let near = self.missing_near(reel_index);
             let weak = Rc::downgrade(self);
             glib::spawn_future_local(async move {
-                let ids = vec![id.clone()];
+                let mut ids = vec![id.clone()];
+                ids.extend(near.iter().map(|(_, id)| id.clone()));
                 let res = rt::bg(async move { client.reels_media(&ids).await }).await;
                 let Some(v) = weak.upgrade() else { return };
+                if let Ok(map) = &res {
+                    v.fill(map, &near);
+                }
                 if v.token.get() != token {
                     return;
                 }
@@ -432,6 +477,7 @@ impl Viewer {
                             r.seen = r.seen.max(fetched.seen);
                             log_items(r, v.player.is_some());
                         }
+                        v.render_sides(true);
                         v.show(reel_index, item_index);
                     }
                     Err(e) => {
@@ -457,6 +503,7 @@ impl Viewer {
         show_liked(&self.like_button, item.has_liked);
         self.render_details(item);
         self.mark_seen(reel_index, item_index);
+        self.prefetch(reel_index);
 
         let video = item.video_url().filter(|_| item.is_video());
         if let (Some(url), Some(player)) = (&video, &self.player) {
@@ -501,6 +548,7 @@ impl Viewer {
                         v.picture.set_paintable(Some(&tex));
                         v.stack.set_visible_child_name("picture");
                         v.ready.set(true);
+                        v.play_song(token);
                     }
                     None => {
                         v.stack.set_visible_child_name("error");
@@ -792,7 +840,7 @@ impl Viewer {
             Some(player) => player.progress(ticket).unwrap_or(0.0),
             None => {
                 self.elapsed.set(self.elapsed.get() + TICK_MS as f64 / 1000.0);
-                self.elapsed.get() / PHOTO_SECONDS
+                self.elapsed.get() / self.photo_seconds.get()
             }
         };
         if let Some(bar) = self.bars.borrow().get(self.item.get()) {
@@ -808,6 +856,7 @@ impl Viewer {
         self.paused.set(paused);
         if let Some(player) = &self.player {
             player.set_playing(self.ticket.get(), !paused);
+            player.set_playing(self.song_ticket.get(), !paused);
         }
         self.pause_button.set_icon_name(if paused {
             "media-playback-start-symbolic"
@@ -823,6 +872,7 @@ impl Viewer {
         MUTED.set(muted);
         if let Some(player) = &self.player {
             player.set_muted(self.ticket.get(), muted);
+            player.set_muted(self.song_ticket.get(), muted);
         }
         video::show_muted(&self.mute_button, muted);
     }
@@ -859,6 +909,201 @@ impl Viewer {
         }
     }
 
+    /// Draw the cards of the people before and after the current one (only
+    /// when that person changed, unless `force`).
+    fn render_sides(self: &Rc<Self>, force: bool) {
+        let current = self.reel.get();
+        if !force && self.sides_for.get() == Some(current) {
+            return;
+        }
+        self.sides_for.set(Some(current));
+        let reels = self.reels.borrow();
+        let mut cards = Vec::new();
+        for slot in [-2i32, -1, 1, 2] {
+            let Some(index) = current.checked_add_signed(slot as isize).filter(|i| *i < reels.len()) else {
+                continue;
+            };
+            let card = side_card(&reels[index], &self.me);
+            let weak = Rc::downgrade(self);
+            card.connect_clicked(move |_| {
+                if let Some(v) = weak.upgrade() {
+                    v.show(index, FIRST_UNSEEN);
+                }
+            });
+            cards.push((card.upcast(), slot));
+        }
+        drop(reels);
+        self.stage.set_cards(cards);
+    }
+
+    /// The people next to `index` whose stories aren't loaded or asked for
+    /// yet (now marked as asked for).
+    fn missing_near(&self, index: usize) -> Vec<(usize, String)> {
+        let reels = self.reels.borrow();
+        let mut requested = self.requested.borrow_mut();
+        let last = reels.len().saturating_sub(1);
+        (index.saturating_sub(2)..=(index + 2).min(last))
+            .filter(|i| *i != index)
+            .filter_map(|i| {
+                let r = &reels[i];
+                (r.items.is_empty() && requested.insert(r.id.clone())).then(|| (i, r.id.clone()))
+            })
+            .collect()
+    }
+
+    /// Take in the stories fetched for `wanted` (index, id).
+    fn fill(&self, fetched: &HashMap<String, Reel>, wanted: &[(usize, String)]) {
+        let mut reels = self.reels.borrow_mut();
+        for (i, id) in wanted {
+            if let (Some(f), Some(r)) = (fetched.get(id), reels.get_mut(*i))
+                && r.id == *id
+                && r.items.is_empty()
+            {
+                r.items = f.items.clone();
+                r.seen = r.seen.max(f.seen);
+            }
+        }
+    }
+
+    /// Load the stories of the people beside `index`, for their cards and
+    /// so moving on to them is quick (one request).
+    fn prefetch(self: &Rc<Self>, index: usize) {
+        let near = self.missing_near(index);
+        if near.is_empty() {
+            return;
+        }
+        let Some(main) = self.main.upgrade() else { return };
+        let client = main.client.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let ids: Vec<String> = near.iter().map(|(_, id)| id.clone()).collect();
+            let res = rt::bg(async move { client.reels_media(&ids).await }).await;
+            let Some(v) = weak.upgrade() else { return };
+            match res {
+                Ok(map) => {
+                    v.fill(&map, &near);
+                    v.render_sides(true);
+                }
+                Err(e) => {
+                    let mut requested = v.requested.borrow_mut();
+                    for (_, id) in &near {
+                        requested.remove(id);
+                    }
+                    eprintln!("finsta: stories: couldn't load the people nearby: {e}");
+                }
+            }
+        });
+    }
+
+    /// A photo story with music plays its part of the song.
+    fn play_song(self: &Rc<Self>, token: u64) {
+        let Some((_, item)) = self.current() else { return };
+        if item.is_video() || item.song().is_none() || self.player.is_none() {
+            return;
+        }
+        let Some(main) = self.main.upgrade() else { return };
+        let client = main.client.clone();
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let res = rt::bg(async move { client.song_clip(&item).await }).await;
+            let Some(v) = weak.upgrade() else { return };
+            if v.token.get() != token {
+                return;
+            }
+            match res {
+                Ok(Some(clip)) => {
+                    let Some(player) = &v.player else { return };
+                    let opts = Opts { muted: MUTED.get(), looping: true, playing: !v.paused.get() };
+                    let seg = post::segment(clip.start_ms, clip.duration_ms);
+                    v.song_ticket.set(player.play_part(None, &clip.url, opts, Some(seg)));
+                    v.mute_button.set_visible(true);
+                    if let Some(ms) = clip.duration_ms {
+                        v.photo_seconds.set((ms as f64 / 1000.0).clamp(PHOTO_SECONDS, SONG_SECONDS));
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => eprintln!("finsta: music: couldn't load a story's song: {e}"),
+            }
+        });
+    }
+
+    /// The right-click menu of the story on screen. The story waits while
+    /// it's open.
+    fn menu(self: &Rc<Self>) -> Menu {
+        let mut m = Menu::new();
+        let Some((reel, item)) = self.current() else { return m };
+        let paused_here = !self.paused.get();
+        if paused_here {
+            self.toggle_pause();
+        }
+        let weak = Rc::downgrade(self);
+        let w = weak.clone();
+        m.on_closed(move || {
+            if paused_here
+                && let Some(v) = w.upgrade()
+                && v.paused.get()
+            {
+                v.toggle_pause();
+            }
+        });
+        let action = |f: fn(&Rc<Viewer>)| {
+            let weak = weak.clone();
+            move || {
+                if let Some(v) = weak.upgrade() {
+                    f(&v);
+                }
+            }
+        };
+        m.item(if paused_here { "Pause" } else { "Play" }, action(|v| v.toggle_pause()));
+        if self.mute_button.is_visible() {
+            m.item(if MUTED.get() { "Unmute" } else { "Mute" }, action(|v| v.toggle_mute()));
+        }
+        if reel.user.pk != self.me {
+            m.item(if item.has_liked { "Unlike" } else { "Like" }, action(|v| v.toggle_like()));
+        }
+        m.section();
+        m.item("Share…", action(|v| v.share()));
+        let url = story_url(&reel, &item);
+        let (w, u) = (weak.clone(), url.clone());
+        m.item("Copy Link", move || {
+            if let Some(v) = w.upgrade() {
+                v.notice.clipboard().set_text(&u);
+                v.show_notice("Link copied");
+            }
+        });
+        m.item("Download", action(|v| v.download()));
+        m.section();
+        let user = reel.user.clone();
+        let name = format!("@{}", user.username);
+        let (w, u) = (weak.clone(), user.clone());
+        m.item(format!("View {name}'s Profile"), move || {
+            if let Some(v) = w.upgrade()
+                && let Some(main) = v.main.upgrade()
+            {
+                v.close();
+                main.open_profile(u.clone());
+            }
+        });
+        if user.pk != self.me {
+            let (w, u) = (weak.clone(), user.clone());
+            m.item(format!("Message {name}"), move || {
+                if let Some(v) = w.upgrade()
+                    && let Some(main) = v.main.upgrade()
+                {
+                    v.close();
+                    main.open_chat_with_user(u.clone());
+                }
+            });
+        }
+        let w = weak.clone();
+        m.item("Open on instagram.com", move || {
+            if let Some(v) = w.upgrade() {
+                util::open_uri(&v.notice, &url);
+            }
+        });
+        m
+    }
+
     fn close(&self) {
         self.token.set(self.token.get() + 1);
         self.stop_media();
@@ -873,4 +1118,52 @@ impl Viewer {
 fn story_url(reel: &Reel, item: &Media) -> String {
     let pk = item.id.split('_').next().unwrap_or(&item.id);
     format!("https://www.instagram.com/stories/{}/{pk}/", reel.user.username)
+}
+
+/// The card for someone before or after the story on screen: their next
+/// story, dimmed, with their picture and name on top.
+fn side_card(reel: &Reel, me: &str) -> gtk::Button {
+    let picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Cover)
+        .can_shrink(true)
+        .build();
+    let preview = reel.items.iter().find(|i| i.taken_at > reel.seen).or(reel.items.first());
+    if let Some(item) = preview {
+        images::load_picture(&picture, item.image_url(480));
+    }
+    let overlay = gtk::Overlay::builder().child(&picture).build();
+    overlay.add_overlay(&gtk::Box::builder().css_classes(["story-card-shade"]).build());
+    let info = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    info.append(&util::avatar(&reel.user, 52));
+    let name = if reel.user.pk == me { "Your story".to_string() } else { reel.user.username.clone() };
+    info.append(
+        &gtk::Label::builder()
+            .label(&name)
+            .css_classes(["heading"])
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(14)
+            .build(),
+    );
+    let newest = reel.items.iter().map(|i| i.taken_at).max().unwrap_or(reel.latest_reel_media);
+    if newest > 0 {
+        info.append(&gtk::Label::builder().label(util::relative_time(newest)).css_classes(["caption"]).build());
+    }
+    overlay.add_overlay(&info);
+    let button = gtk::Button::builder()
+        .child(&overlay)
+        .css_classes(["story-card"])
+        .overflow(gtk::Overflow::Hidden)
+        .tooltip_text(format!("{name}'s stories"))
+        .build();
+    if reel.has_unseen() {
+        button.add_css_class("unseen");
+    }
+    button
 }

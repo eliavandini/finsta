@@ -288,7 +288,10 @@ impl SearchPage {
                     Ok(users) => {
                         let users: Vec<User> = users.into_iter().take(20).collect();
                         for u in &users {
-                            s.people_list.append(&person_row(&main, u));
+                            let row = person_row(&main, u);
+                            let (weak, user) = (Rc::downgrade(&main), u.clone());
+                            crate::ui::menu::attach(&row, move || Some(crate::ui::menu::person(&weak.upgrade()?, &user)));
+                            s.people_list.append(&row);
                         }
                         s.people_status
                             .set_visible_child_name(if users.is_empty() { "empty" } else { "results" });
@@ -355,7 +358,11 @@ impl SearchPage {
                 match res {
                     Ok(posts) => {
                         for m in &posts {
-                            s.posts_grid.append(&thumbnail(m));
+                            let child = thumbnail(m);
+                            if let Some(main) = s.main.upgrade() {
+                                crate::ui::post::attach_menu(&main, &child, m);
+                            }
+                            s.posts_grid.append(&child);
                         }
                         s.posts_status
                             .set_visible_child_name(if posts.is_empty() { "empty" } else { "results" });

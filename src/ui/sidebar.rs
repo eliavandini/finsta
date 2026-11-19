@@ -1,6 +1,7 @@
 //! Sidebar: Home, the list of conversations (people and groups), Profile.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
@@ -9,8 +10,9 @@ use serde_json::json;
 
 use crate::api::{Thread, User};
 use crate::rt;
-use crate::ui::util;
+use crate::ui::menu::{self, Menu};
 use crate::ui::window::Main;
+use crate::ui::{notify, prefs, util};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Filter {
@@ -38,6 +40,12 @@ pub struct Sidebar {
     loaded: Cell<bool>,
     selected_tag: RefCell<String>,
     viewer_id: String,
+    /// The time of each conversation's newest message seen so far, to
+    /// notice new ones.
+    newest: RefCell<HashMap<String, i64>>,
+    /// The first list has loaded (messages before it aren't new).
+    primed: Cell<bool>,
+    started: i64,
 }
 
 fn nav_row(icon: &gtk::Widget, label: &gtk::Label) -> gtk::ListBoxRow {
@@ -175,6 +183,9 @@ impl Sidebar {
             loaded: Cell::new(false),
             selected_tag: RefCell::new("home".into()),
             viewer_id: main.client.user_id(),
+            newest: RefCell::new(HashMap::new()),
+            primed: Cell::new(false),
+            started: chrono::Utc::now().timestamp(),
         });
 
         let weak = Rc::downgrade(&sidebar);
@@ -259,15 +270,47 @@ impl Sidebar {
 
     pub fn start(self: &Rc<Self>) {
         self.refresh(false);
-        // Keep unread state fresh without a push connection.
+        // Keep unread state fresh without a push connection: every minute,
+        // or every half minute while new messages would notify you.
         let weak = Rc::downgrade(self);
-        glib::timeout_add_seconds_local(60, move || match weak.upgrade() {
-            Some(s) => {
+        let last = Cell::new(std::time::Instant::now());
+        glib::timeout_add_seconds_local(15, move || {
+            let Some(s) = weak.upgrade() else { return glib::ControlFlow::Break };
+            let Some(main) = s.main.upgrade() else { return glib::ControlFlow::Break };
+            let notifying = prefs::get().notify_messages && !main.window.is_active();
+            let wait = if notifying { 30 } else { 60 };
+            if last.get().elapsed().as_secs() + 1 >= wait {
+                last.set(std::time::Instant::now());
                 s.refresh(true);
-                glib::ControlFlow::Continue
             }
-            None => glib::ControlFlow::Break,
+            glib::ControlFlow::Continue
         });
+    }
+
+    /// Remember the newest message of `thread`, and notify about it if it's
+    /// new (from someone else, unread, since Finsta started).
+    fn note(&self, thread: &Thread, may_notify: bool) {
+        let Some(last) = thread.last_item() else { return };
+        let before = self.newest.borrow_mut().insert(thread.thread_id.clone(), last.timestamp);
+        if !may_notify
+            || last.user_id == self.viewer_id
+            || before.is_some_and(|b| last.timestamp <= b)
+            || last.timestamp_secs() < self.started
+            || !thread.is_unread(&self.viewer_id)
+        {
+            return;
+        }
+        let Some(main) = self.main.upgrade() else { return };
+        if !notify::wanted(&main, thread) {
+            return;
+        }
+        let mut t = thread.clone();
+        if t.users.is_empty()
+            && let Some(known) = self.thread(&t.thread_id)
+        {
+            t.users = known.users;
+        }
+        notify::message(&main, &t, last);
     }
 
     pub fn set_me(&self, user: &User) {
@@ -312,7 +355,9 @@ impl Sidebar {
                         s.oldest_cursor.replace(page.oldest_cursor);
                         s.has_older.set(page.has_older);
                     }
+                    let primed = s.primed.replace(true);
                     for thread in page.threads {
+                        s.note(&thread, primed);
                         s.merge(thread);
                     }
                     s.render();
@@ -350,6 +395,7 @@ impl Sidebar {
                     s.oldest_cursor.replace(page.oldest_cursor);
                     s.has_older.set(page.has_older);
                     for thread in page.threads {
+                        s.note(&thread, false);
                         s.merge(thread);
                     }
                     s.render();
@@ -386,6 +432,7 @@ impl Sidebar {
         if thread.thread_id.is_empty() {
             return;
         }
+        self.note(&thread, self.primed.get());
         self.merge(thread);
         self.render();
     }
@@ -523,6 +570,8 @@ impl Sidebar {
 
         let row = gtk::ListBoxRow::builder().child(&row_box).build();
         row.set_tooltip_text(Some(&thread.title()));
+        let (weak, t) = (self.main.clone(), thread.clone());
+        menu::attach(&row, move || Some(thread_menu(&weak.upgrade()?, &t)));
         row
     }
 
@@ -543,4 +592,35 @@ impl Sidebar {
                 .select_row(self.threads_list.row_at_index(index as i32).as_ref());
         }
     }
+}
+
+/// The right-click menu of a conversation in the list.
+fn thread_menu(main: &Rc<Main>, thread: &Thread) -> Menu {
+    let mut m = Menu::new();
+    let (weak, t) = (Rc::downgrade(main), thread.clone());
+    m.item("Open Conversation", move || {
+        let Some(main) = weak.upgrade() else { return };
+        if let Some(s) = main.sidebar.get() {
+            s.mark_read_local(&t.thread_id);
+        }
+        main.open_thread(t.clone(), true);
+    });
+    if !thread.muted {
+        let id = thread.thread_id.clone();
+        let quiet = prefs::is_quiet(&id);
+        let weak = Rc::downgrade(main);
+        m.item(if quiet { "Turn On Notifications" } else { "Turn Off Notifications" }, move || {
+            prefs::set_quiet(&id, !quiet);
+            if let Some(main) = weak.upgrade() {
+                main.toast(if quiet { "Notifications on for this conversation" } else { "Notifications off for this conversation" });
+            }
+        });
+    }
+    if let [user] = thread.users.as_slice()
+        && !thread.is_group_chat()
+    {
+        m.section();
+        menu::add_person(&mut m, main, user, true, false);
+    }
+    m
 }

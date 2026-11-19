@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use super::{Client, Media, Page, User, WEB_REFERER, is_login_required, is_rate_limited, media_pk, parse};
+use super::{Client, Clip, Media, Page, User, WEB_REFERER, is_login_required, is_rate_limited, media_pk, parse};
 
 /// A folder of saved posts.
 #[derive(Debug, Clone, Default)]
@@ -169,6 +169,24 @@ impl Client {
         parse::<Media>(&v["items"][0]).ok_or_else(|| anyhow!("This post isn't available"))
     }
 
+    /// The audio of a photo post's or photo story's song. instagram.com's
+    /// queries leave it out, so it comes from the post's details.
+    pub async fn song_clip(&self, media: &Media) -> Result<Option<Clip>> {
+        if let Some(clip) = media.song_clip() {
+            return Ok(Some(clip));
+        }
+        let v = self.get(&format!("media/{}/info/", media_pk(&media.id)), &[]).await?;
+        let full = parse::<Media>(&v["items"][0]);
+        let clip = full.as_ref().and_then(Media::song_clip);
+        if clip.is_none() {
+            eprintln!(
+                "finsta: music: the post's details have no audio for its song (fields {:?})",
+                full.as_ref().map(Media::music_fields).unwrap_or_default()
+            );
+        }
+        Ok(clip)
+    }
+
     /// Your saved posts, a page at a time: all of them, or one folder's.
     pub async fn saved_posts(&self, folder: Option<&str>, max_id: Option<String>) -> Result<Page<Media>> {
         let mut query = Vec::new();
@@ -304,7 +322,22 @@ impl Client {
     /// list. (instagram.com's search results page for words is gone.)
     pub async fn search_posts(&self, query: &str) -> Result<Vec<Media>> {
         let Some(tag) = hashtag(query) else { return Ok(Vec::new()) };
-        let v = self.get("tags/web_info/", &[("tag_name", tag)]).await?;
+        // instagram.com's hashtag page query hasn't been seen yet (the scan
+        // looks for it); until then, the app's hashtag routes.
+        let form = [
+            ("tab", "top".to_string()),
+            ("surface", "grid".to_string()),
+            ("include_persistent", "0".to_string()),
+            ("page", "0".to_string()),
+        ];
+        let v = match self.post(&format!("tags/{tag}/sections/"), &form).await {
+            Ok(v) => v,
+            Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+            Err(e) => {
+                eprintln!("finsta: search: hashtag sections failed ({e}); trying the hashtag feed");
+                self.get(&format!("feed/tag/{tag}/"), &[]).await?
+            }
+        };
         let mut posts = Vec::new();
         collect_media(&v, &mut HashSet::new(), &mut posts);
         posts.retain(|m| !m.is_ad());

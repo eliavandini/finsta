@@ -671,7 +671,7 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 9;
+const META_SCANNER: u64 = 10;
 
 /// How a story reply was delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -721,6 +721,10 @@ const CALLER_NEEDLES: &[&str] = &[
     "usePolarisSaveMediaSaveMutation",
     "usePolarisMediaSaveToCollectionAddMediaMutation",
     "PolarisAPIEditCollectionAddMediaMutation",
+    // The hashtag page.
+    "PolarisTagPage",
+    "PolarisHashtag",
+    "explore/tags/",
 ];
 
 /// Places in the website's own code worth quoting in the log while working
@@ -854,7 +858,7 @@ fn interesting_op(name: &str) -> bool {
         "IGD", "useIGD", "IGDirect", "PolarisDirect", "PolarisProfile", "PolarisStor", "PolarisFeed", "PolarisPost",
         "PolarisUser", "PolarisMedia", "PolarisTimeline", "usePolarisLikeMedia", "usePolarisStor", "usePolarisReel",
         "PolarisAPI", "PolarisReel", "PolarisSearch", "usePolarisSave", "PolarisSaved", "usePolarisComment",
-        "usePolarisMediaSaveToCollection", "PolarisShareSheet",
+        "usePolarisMediaSaveToCollection", "PolarisShareSheet", "PolarisTagPage", "PolarisHashtag",
     ]
     .iter()
     .any(|p| name.starts_with(p))
@@ -1902,8 +1906,9 @@ impl Client {
         self.dm_tasks(&mut st, "mark read", vec![task("21", read, key.to_string())]).await
     }
 
-    /// React to a message with an emoji (None removes your reaction).
-    pub async fn react(&self, thread_id: &str, item_id: &str, emoji: Option<&str>) -> Result<()> {
+    /// React to a message with an emoji, or take back your reaction (`on`
+    /// false, with the emoji you had reacted with).
+    pub async fn react(&self, thread_id: &str, item_id: &str, emoji: &str, on: bool) -> Result<()> {
         let mut st = self.inner.dm.lock().await;
         if st.config.is_none() {
             self.dm_load_page(&mut st).await?;
@@ -1911,7 +1916,7 @@ impl Client {
         if !Self::slide_mode(&st) {
             bail!("Reactions aren't available for this account in Finsta yet.");
         }
-        self.slide_react(&mut st, thread_id, item_id, emoji).await
+        self.slide_react(&mut st, thread_id, item_id, emoji, on).await
     }
 
     /// Reply to someone's story; the reply arrives in your conversation with them.

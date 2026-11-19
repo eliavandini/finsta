@@ -19,6 +19,10 @@ instagram.com did for web sessions in November 2026.
 
 Sign in with the session cookie "1000%3Aabc%3A1". Needs Pillow for the
 generated placeholder images.
+
+Songs on photo posts and photo stories play the audio file in
+FINSTA_MOCK_AUDIO, if set. GET /mock/incoming?key=30001&text=Hi makes a new
+message arrive in that conversation (30002, the group, is muted).
 """
 import base64
 import hashlib
@@ -104,6 +108,25 @@ def timeline():
 
 
 VIDEOS = sorted(os.listdir(os.environ["FINSTA_MOCK_VIDEOS"])) if os.environ.get("FINSTA_MOCK_VIDEOS") else []
+AUDIO = os.environ.get("FINSTA_MOCK_AUDIO")
+MUTED_CONVOS = {30002}
+
+
+def with_song_audio(m):
+    """What the app's API adds to a photo's music: where its audio is, and
+    which part plays (instagram.com's queries leave this out)."""
+    m = json.loads(json.dumps(m))
+    music = m.get("music_metadata") or {}
+    stickers = m.get("story_music_stickers") or []
+    info = (music.get("music_info") or {}).get("music_asset_info") if music else (stickers[0]["music_asset_info"] if stickers else None)
+    if info is not None and AUDIO:
+        info["progressive_download_url"] = f"{BASE}/aud/song.ogg"
+        part = {"audio_asset_start_time_in_ms": 2000, "overlap_duration_in_ms": 8000}
+        if music:
+            music["music_info"]["music_consumption_info"] = part
+        else:
+            stickers[0]["music_consumption_info"] = part
+    return m
 
 
 STORY_LIKES = {}
@@ -384,7 +407,7 @@ def slide_thread(key, convos):
         "is_group": kind == 2, "thread_title": name, "thread_image_url": None,
         "last_activity_timestamp_ms": str(msgs[-1]["ts"]), "users": [slide_user(c) for c in members],
         "viewer": {"id": ME, "interop_messaging_user_fbid": str(ME_CHAT), "profile_pic_url": USERS[ME]["profile_pic_url"]},
-        "marked_as_unread": False, "is_muted": False,
+        "marked_as_unread": False, "is_muted": key in MUTED_CONVOS,
         "slide_read_receipts": [{"participant_fbid": str(ME_CHAT), "watermark_timestamp_ms": str(read)}],
         "slide_messages": {"edges": [{"node": slide_message(m), "cursor": m["mid"]} for m in reversed(msgs[-2:])],
                            "page_info": {"end_cursor": None, "has_next_page": False}}}}, "cursor": f"c{key}"}
@@ -419,14 +442,19 @@ def slide_answer(op, v):
                 "page_info": {"end_cursor": str(start + v["first"]) if more else None, "has_next_page": more,
                               "has_previous_page": start > 0, "start_cursor": str(start)}}}}}}
     if op == "react":
+        # As instagram.com's IGDMAPISendReaction builds it.
         i = v.get("input") or {}
-        key = next((k for k in MESSAGES if f"34028236684171030{k}" == i.get("ig_thread_igid")), None)
-        m = next((m for m in MESSAGES.get(key, []) if m["mid"] == i.get("item_id")), None)
-        if set(v) != {"input"} or m is None or i.get("reaction_status") not in ("created", "deleted"):
-            return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        key = int(i["thread_id"]) if str(i.get("thread_id", "")).isdigit() and int(i["thread_id"]) in MESSAGES else None
+        m = next((m for m in MESSAGES.get(key, []) if "node" + m["mid"] == i.get("message_id")), None)
+        mine = next((e for e, who in (m or {}).get("reactions", []) if who == ME_CHAT), None)
+        if set(v) != {"input"} or set(i) != {"emoji", "item_id", "message_id", "reaction_status", "thread_id"} or m is None \
+                or i["item_id"] != "" or not i.get("emoji") or i["reaction_status"] not in ("created", "deleted") \
+                or (i["reaction_status"] == "deleted" and i["emoji"] != mine):
+            return {"errors": [{"message": "A server error field_exception occured.", "severity": "CRITICAL", "code": 1675030}],
+                    "data": {"xig_direct_reaction_send_with_slide_messaging_response": None}}
         m["reactions"] = [r for r in m.get("reactions", []) if r[1] != ME_CHAT]
         if i["reaction_status"] == "created":
-            m["reactions"].append((i.get("emoji") or "❤️", ME_CHAT))
+            m["reactions"].append((i["emoji"], ME_CHAT))
         return {"data": {"xig_direct_reaction_send_with_slide_messaging_response": {"success": True}}}
     if op == "story reply":
         if REPLY_FAILS:
@@ -479,6 +507,9 @@ def following_feed():
         pk = authors[i % len(authors)]
         m = nulls(media(str(700 + i), pk, f"following post {i}", 3600 * 2 + i * 11 * 3600, w=1080, h=1080))
         m["organic_tracking_token"] = f"tok{700 + i}"
+        if i == 2:  # a photo with music, like instagram.com sends it (no audio address)
+            m["music_metadata"] = {"music_info": {"music_asset_info": {"audio_cluster_id": "5550002", "title": "Morning Light",
+                                   "display_artist": "Paper Boats", "cover_artwork_thumbnail_uri": img("cover2", 200, 200)}}}
         if i == 1:
             m["product_type"] = "clips"
             m["clips_metadata"] = {"music_info": {"music_asset_info": {"audio_cluster_id": "5550001", "title": "Night Drive",
@@ -791,6 +822,32 @@ class Handler(BaseHTTPRequestHandler):
             f.write(f"{method} :{PORT}{path} q={dict(q)} body={body} cookie={self.headers.get('Cookie')} csrf={self.headers.get('X-CSRFToken')} app={self.headers.get('X-IG-App-ID')} xhr={self.headers.get('X-Requested-With')} origin={self.headers.get('Origin')} ua={self.headers.get('User-Agent')}\n")
         if path.startswith("/img/"):
             return self.serve_image(path[5:])
+        if path == "/aud/song.ogg" and AUDIO:
+            # Like a CDN, this one can send part of the file.
+            body = open(AUDIO, "rb").read()
+            rng = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+            if rng and "--no-ranges" not in sys.argv:
+                a = int(rng.group(1))
+                b = int(rng.group(2)) if rng.group(2) else len(body) - 1
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {a}-{b}/{len(body)}")
+                body = body[a:b + 1]
+            else:
+                self.send_response(200)
+            self.send_header("Accept-Ranges", "none" if "--no-ranges" in sys.argv else "bytes")
+            self.send_header("Content-Type", "audio/ogg")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if path == "/mock/incoming":
+            key = int(q.get("key", ["30001"])[0])
+            sender = CONVOS[key][2][0]
+            MESSAGES[key].append(msg(f"in{time.time_ns()}", sender, NOW - int(time.time()), q.get("text", ["Hello?"])[0]))
+            return self.send_json({"status": "ok"})
         if path.startswith("/vid/") and path[5:] in VIDEOS:
             body = open(os.path.join(os.environ["FINSTA_MOCK_VIDEOS"], path[5:]), "rb").read()
             self.send_response(200)
@@ -937,11 +994,16 @@ class Handler(BaseHTTPRequestHandler):
             for fid in json.loads(body.get("added_collection_ids", ["[]"])[0]):
                 FOLDERS[str(fid)][1].add(m.group(1))
             return self.send_json({"status": "ok"})
-        if p == "tags/web_info/":
-            tag = q.get("tag_name", [""])[0]
+        if p == "tags/web_info/":  # gone, as on instagram.com in November 2026
+            return self.send_json({"message": "We're sorry, but something went wrong. Please try again.", "status": "fail"}, 404)
+        if (m := re.match(r"tags/(\w+)/sections/", p)) and method == "POST":
+            tag = m.group(1)
+            if body.get("tab", [""])[0] != "top":
+                return self.send_json({"status": "fail", "message": "mock: tab"}, 400)
             medias = [{"media": media(str(850 + i), ["1002", "1004"][i % 2], f"#{tag} number {i}", 86400 * (i + 1), w=1080, h=1080)} for i in range(7)]
-            return self.send_json({"data": {"top": {"sections": [{"layout_type": "media_grid", "layout_content": {"medias": medias[:3]}},
-                                                                {"layout_type": "media_grid", "layout_content": {"medias": medias[3:]}}]}}, "status": "ok"})
+            return self.send_json({"sections": [{"layout_type": "media_grid", "layout_content": {"medias": medias[:3]}},
+                                                {"layout_type": "media_grid", "layout_content": {"medias": medias[3:]}}],
+                                   "more_available": True, "status": "ok"})
         if p == "fbsearch/web/top_serp/":
             word = q.get("query", [""])[0]
             medias = [{"media": media(str(850 + i), ["1002", "1004"][i % 2], f"a post about {word} #{i}", 86400 * (i + 1), w=1080, h=1080)} for i in range(7)]
@@ -953,7 +1015,11 @@ class Handler(BaseHTTPRequestHandler):
                 ok = False
             return self.send_json({"status": "ok" if ok else "fail", "message": None if ok else "mock: bad reply"}, 200 if ok else 400)
         if m := re.match(r"media/(\d+)/info/", p):
-            return self.send_json({"items": [media_by_code(f"C{m.group(1)}xyz")], "status": "ok"})
+            pk = m.group(1)
+            found = next((e["node"]["media"] for e in following_feed() if (e["node"]["media"] or {}).get("pk") == int(pk)), None)
+            if found is None and pk.startswith("9") and pk[1:5] in USERS:
+                found = next((x for x in story_items(pk[1:5], 5) if str(x["pk"]) == pk), None)
+            return self.send_json({"items": [with_song_audio(found or media_by_code(f"C{pk}xyz"))], "status": "ok"})
         if p == "web/search/topsearch/":
             return self.send_json({"users": [{"position": i, "user": USERS[k]} for i, k in enumerate(["1001", "1005", "2002"])], "places": [], "hashtags": [], "status": "ok"})
         if m := re.match(r"friendships/(create|destroy)/(\d+)/", p):

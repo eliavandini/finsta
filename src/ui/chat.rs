@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::api::{Disappearing, DmContent, DmItem, Media, Recipient, Thread, User};
 use crate::rt;
+use crate::ui::menu::{self, Menu};
 use crate::ui::ratio_bin::RatioBin;
 use crate::ui::util;
 use crate::ui::window::Main;
@@ -55,10 +56,24 @@ struct Chat {
     stick_to_bottom: Cell<bool>,
     keep_distance_from_bottom: Cell<Option<f64>>,
     last_marked: RefCell<String>,
+    /// New messages arrived while you weren't looking: mark them read when
+    /// you are (so they still notify you and show as unread).
+    seen_pending: Cell<bool>,
+    active_handler: RefCell<Option<glib::SignalHandlerId>>,
+    /// When the newest messages were last asked for.
+    fetched: Cell<Option<std::time::Instant>>,
     /// Disappearing messages opened in this session: item id -> times opened.
     /// Guards against showing them again before Instagram's state catches up.
     local_views: RefCell<HashMap<String, u32>>,
     opening: Cell<bool>,
+}
+
+impl Drop for Chat {
+    fn drop(&mut self) {
+        if let (Some(id), Some(main)) = (self.active_handler.take(), self.main.upgrade()) {
+            main.window.disconnect(id);
+        }
+    }
 }
 
 enum VisualState {
@@ -205,6 +220,9 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
         stick_to_bottom: Cell::new(true),
         keep_distance_from_bottom: Cell::new(None),
         last_marked: RefCell::new(String::new()),
+        seen_pending: Cell::new(false),
+        active_handler: RefCell::new(None),
+        fetched: Cell::new(None),
         local_views: RefCell::new(HashMap::new()),
         opening: Cell::new(false),
     });
@@ -227,6 +245,15 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
 impl Chat {
     fn connect(self: &Rc<Self>, refresh: &gtk::Button) {
         let weak = Rc::downgrade(self);
+        if let Some(main) = self.main.upgrade() {
+            let w = weak.clone();
+            let id = main.window.connect_is_active_notify(move |_| {
+                if let Some(c) = w.upgrade() {
+                    c.back_in_view();
+                }
+            });
+            self.active_handler.replace(Some(id));
+        }
         refresh.connect_clicked(glib::clone!(
             #[strong]
             weak,
@@ -281,10 +308,19 @@ impl Chat {
             weak,
             move |adj| {
                 let Some(c) = weak.upgrade() else { return };
+                let before = adj.value();
                 if let Some(distance) = c.keep_distance_from_bottom.take() {
                     adj.set_value(adj.upper() - adj.page_size() - distance);
                 } else if c.stick_to_bottom.get() {
                     adj.set_value(adj.upper() - adj.page_size());
+                }
+                // This runs after the list was placed for the old position,
+                // and a new placement asked for now gets lost: ask again
+                // once this layout pass is over.
+                if adj.value() != before
+                    && let Some(viewport) = c.scroller.child()
+                {
+                    glib::idle_add_local_once(move || viewport.queue_allocate());
                 }
             }
         ));
@@ -295,6 +331,7 @@ impl Chat {
                 move |_| {
                     if let Some(c) = weak.upgrade() {
                         c.entry.grab_focus();
+                        c.back_in_view();
                     }
                 }
             ));
@@ -430,14 +467,47 @@ impl Chat {
             self.pending.borrow_mut().clear();
             self.render();
         }
-        self.mark_seen();
         if let Some(sidebar) = self.main.upgrade().and_then(|m| m.sidebar.get().cloned()) {
             let mut summary = meta;
             summary.items = self.items.borrow().iter().rev().take(5).cloned().collect();
             sidebar.update_thread(summary);
-            if let Some(id) = self.thread_id.borrow().as_deref() {
-                sidebar.mark_read_local(id);
-            }
+        }
+        if self.in_view() {
+            self.seen_now();
+        } else {
+            self.seen_pending.set(true);
+        }
+    }
+
+    /// You're looking at the conversation again: mark what came meanwhile
+    /// read, and ask for newer messages if it's been a while (it only asks
+    /// every 15 seconds while on screen, and not at all while hidden).
+    fn back_in_view(self: &Rc<Self>) {
+        if !self.in_view() {
+            return;
+        }
+        if self.seen_pending.get() {
+            self.seen_now();
+        }
+        if self.fetched.get().is_some_and(|t| t.elapsed() >= std::time::Duration::from_secs(10)) {
+            self.load_latest(false);
+        }
+    }
+
+    /// The conversation is on screen in the window you're using.
+    fn in_view(&self) -> bool {
+        let active = self.main.upgrade().is_some_and(|m| m.window.is_active());
+        active && self.page.upgrade().is_some_and(|p| p.is_mapped())
+    }
+
+    /// Mark the newest messages read, here and on Instagram.
+    fn seen_now(self: &Rc<Self>) {
+        self.seen_pending.set(false);
+        self.mark_seen();
+        if let Some(sidebar) = self.main.upgrade().and_then(|m| m.sidebar.get().cloned())
+            && let Some(id) = self.thread_id.borrow().as_deref()
+        {
+            sidebar.mark_read_local(id);
         }
     }
 
@@ -547,6 +617,7 @@ impl Chat {
         if self.loading.replace(true) {
             return;
         }
+        self.fetched.set(Some(std::time::Instant::now()));
         let Some(main) = self.main.upgrade() else { return };
         let client = main.client.clone();
         let weak = Rc::downgrade(self);
@@ -692,6 +763,7 @@ impl Chat {
         });
     }
 
+    /// React with `emoji`, or take your reaction back (None).
     fn react(self: &Rc<Self>, item_id: &str, emoji: Option<&'static str>) {
         let before = {
             let mut items = self.items.borrow_mut();
@@ -708,9 +780,15 @@ impl Chat {
         let client = main.client.clone();
         let item_id = item_id.to_string();
         let weak = Rc::downgrade(self);
+        // Taking a reaction back names the emoji it was.
+        let (sent, on) = match (emoji, before.clone()) {
+            (Some(e), _) => (e.to_string(), true),
+            (None, Some(b)) => (b, false),
+            (None, None) => return,
+        };
         glib::spawn_future_local(async move {
             let id = item_id.clone();
-            let res = rt::bg(async move { client.react(&thread_id, &id, emoji).await }).await;
+            let res = rt::bg(async move { client.react(&thread_id, &id, &sent, on).await }).await;
             let Some(chat) = weak.upgrade() else { return };
             if let Err(e) = res {
                 eprintln!("finsta: reaction failed: {e}");
@@ -790,48 +868,37 @@ impl Chat {
 
 const REACTIONS: [&str; 6] = ["❤️", "😂", "😮", "😢", "😡", "👍"];
 
-/// Right-click or long-press a message to react to it.
-fn react_on_press(chat: &Rc<Chat>, bubble: &gtk::Widget, item: &DmItem) {
+/// Right-click or long-press a message: react to it, and the usual
+/// actions for what it holds.
+fn message_menu(chat: &Rc<Chat>, bubble: &gtk::Widget, item: &DmItem) {
     let item_id = item.item_id.clone();
     if item_id.is_empty() || item_id.starts_with("snippet:") {
         return;
     }
-    let mine = item.reaction_by(&chat.viewer_id);
-    let text = match item.content() {
-        DmContent::Text(t) | DmContent::Link { text: t } if !t.is_empty() => Some(t),
-        _ => None,
-    };
+    bubble.set_tooltip_text(Some(&format!(
+        "{} · right-click for reactions and more",
+        bubble.tooltip_text().map(|t| t.to_string()).unwrap_or_else(|| util::full_time(item.timestamp_secs()))
+    )));
     let weak = Rc::downgrade(chat);
-    let open = Rc::new(move |widget: &gtk::Widget| {
-        let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).build();
-        let row = gtk::Box::builder().spacing(2).build();
-        column.append(&row);
-        let popover = gtk::Popover::builder().child(&column).build();
-        if let Some(text) = text.clone() {
-            let copy = gtk::Button::builder().label("Copy Text").css_classes(["flat"]).build();
-            let p = popover.downgrade();
-            copy.connect_clicked(move |b| {
-                b.clipboard().set_text(&text);
-                if let Some(p) = p.upgrade() {
-                    p.popdown();
-                }
-            });
-            column.append(&copy);
-        }
+    let item = item.clone();
+    // Before the text inside gets the click (it has its own menu).
+    menu::attach_with(bubble, true, move || {
+        let chat = weak.upgrade()?;
+        let main = chat.main.upgrade()?;
+        let mut m = Menu::new();
+        let mine = item.reaction_by(&chat.viewer_id);
+        let row = gtk::Box::builder().spacing(2).margin_start(6).margin_end(6).build();
         for emoji in REACTIONS {
             let b = gtk::Button::builder().label(emoji).css_classes(["flat", "reaction-choice"]).build();
-            if mine.as_deref() == Some(emoji) {
-                b.add_css_class("suggested-action");
+            let remove = mine.as_deref() == Some(emoji);
+            if remove {
+                b.add_css_class("mine");
                 b.set_tooltip_text(Some("Remove your reaction"));
             }
-            let weak = weak.clone();
-            let item_id = item_id.clone();
-            let remove = mine.as_deref() == Some(emoji);
-            let popover = popover.downgrade();
-            b.connect_clicked(move |_| {
-                if let Some(p) = popover.upgrade() {
-                    p.popdown();
-                }
+            let weak = Rc::downgrade(&chat);
+            let item_id = item.item_id.clone();
+            b.connect_clicked(move |b| {
+                menu::close_from(b);
                 // Once the menu is gone (redrawing the list removes the
                 // message it points at).
                 let weak = weak.clone();
@@ -844,38 +911,52 @@ fn react_on_press(chat: &Rc<Chat>, bubble: &gtk::Widget, item: &DmItem) {
             });
             row.append(&b);
         }
-        popover.set_parent(widget);
-        popover.connect_closed(|p| {
-            let p = p.clone();
-            glib::idle_add_local_once(move || p.unparent());
-        });
-        popover.popup();
-    });
-    // Before the text inside gets the click (it has its own menu).
-    let right = gtk::GestureClick::builder()
-        .button(3)
-        .propagation_phase(gtk::PropagationPhase::Capture)
-        .build();
-    let f = open.clone();
-    right.connect_pressed(move |g, _, _, _| {
-        g.set_state(gtk::EventSequenceState::Claimed);
-        if let Some(w) = g.widget() {
-            f(&w);
+        m.top(&row);
+        match item.content() {
+            DmContent::Text(t) | DmContent::Link { text: t } if !t.is_empty() => {
+                let w = Rc::downgrade(&main);
+                m.item("Copy Text", move || {
+                    if let Some(main) = w.upgrade() {
+                        main.copy(&t, "Copied");
+                    }
+                });
+            }
+            DmContent::Post(media) => {
+                let (w, media2) = (Rc::downgrade(&main), media.clone());
+                m.item(if media.product_type == "clips" { "Open Reel" } else { "Open Post" }, move || {
+                    if let Some(main) = w.upgrade() {
+                        main.open_post((*media2).clone());
+                    }
+                });
+                if let Some(url) = media.web_url() {
+                    menu::add_link(&mut m, &main, &url);
+                }
+            }
+            DmContent::Shared { url: Some(url), .. } => {
+                let (w, u) = (Rc::downgrade(&main), url.clone());
+                m.item("Open", move || {
+                    if let Some(main) = w.upgrade() {
+                        main.open_link(&u);
+                    }
+                });
+                let (w, u) = (Rc::downgrade(&main), url);
+                m.item("Copy Link", move || {
+                    if let Some(main) = w.upgrade() {
+                        main.copy(&u, "Link copied");
+                    }
+                });
+            }
+            _ => {}
         }
-    });
-    bubble.add_controller(right);
-    let long = gtk::GestureLongPress::builder().touch_only(true).build();
-    long.connect_pressed(move |g, _, _| {
-        g.set_state(gtk::EventSequenceState::Claimed);
-        if let Some(w) = g.widget() {
-            open(&w);
+        let thread = chat.thread.borrow().clone();
+        if item.user_id != chat.viewer_id
+            && let Some(sender) = thread.user(&item.user_id)
+        {
+            m.section();
+            menu::add_person(&mut m, &main, sender, true, thread.is_group_chat());
         }
+        Some(m)
     });
-    bubble.add_controller(long);
-    bubble.set_tooltip_text(Some(&format!(
-        "{} · right-click to react",
-        bubble.tooltip_text().map(|t| t.to_string()).unwrap_or_else(|| util::full_time(item.timestamp_secs()))
-    )));
 }
 
 fn clickable(widget: &impl IsA<gtk::Widget>, f: impl Fn() + 'static) {
@@ -1252,7 +1333,7 @@ fn message_widget(
     }
     column.append(&bubble);
     if !pending {
-        react_on_press(chat, &bubble, item);
+        message_menu(chat, &bubble, item);
     }
 
     let reactions = item.reactions();

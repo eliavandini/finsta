@@ -83,7 +83,7 @@ impl HomePage {
         top.append(&refresh);
         outer.append(&top);
 
-        let stories_box = gtk::Box::builder().spacing(6).margin_start(12).margin_end(12).build();
+        let stories_box = gtk::Box::builder().halign(gtk::Align::Center).spacing(6).margin_start(12).margin_end(12).build();
         let stories_scroller = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Automatic)
             .vscrollbar_policy(gtk::PolicyType::Never)
@@ -631,6 +631,25 @@ impl HomePage {
                 let Some(main) = home.main.upgrade() else { return };
                 let reels = home.reels.borrow().clone();
                 main.open_stories(reels, index);
+            });
+            let weak = Rc::downgrade(self);
+            let (user, unseen) = (reel.user.clone(), reel.has_unseen());
+            crate::ui::menu::attach(&button, move || {
+                let home = weak.upgrade()?;
+                let main = home.main.upgrade()?;
+                let mut m = crate::ui::menu::Menu::new();
+                let w = Rc::downgrade(&home);
+                m.item(if unseen { "View New Stories" } else { "View Stories" }, move || {
+                    if let Some(home) = w.upgrade()
+                        && let Some(main) = home.main.upgrade()
+                    {
+                        let reels = home.reels.borrow().clone();
+                        main.open_stories(reels, index);
+                    }
+                });
+                m.section();
+                crate::ui::menu::add_person(&mut m, &main, &user, true, true);
+                Some(m)
             });
             self.stories_box.append(&button);
         }

@@ -30,6 +30,14 @@ pub struct Opts {
     pub playing: bool,
 }
 
+/// Play only part of the file: from `start`, for `length` (to the end if
+/// None). Used for the part of a song a post or story plays.
+#[derive(Clone, Copy, PartialEq)]
+pub struct Segment {
+    pub start: Duration,
+    pub length: Option<Duration>,
+}
+
 struct Target {
     ticket: u64,
     picture: Option<glib::WeakRef<gtk::Picture>>,
@@ -54,6 +62,11 @@ pub struct Player {
     loop_restart: Cell<bool>,
     ended: Cell<bool>,
     failed: Cell<bool>,
+    /// The part being played, if not the whole file.
+    segment: Cell<Option<Segment>>,
+    /// Jump to the segment once the file is ready, then play if wanted.
+    segment_pending: Cell<bool>,
+    want_playing: Cell<bool>,
     has_frame: Rc<Cell<bool>>,
     exclusive: Cell<u32>,
     watch: RefCell<Option<gst::bus::BusWatchGuard>>,
@@ -106,6 +119,9 @@ impl Player {
             loop_restart: Cell::new(false),
             ended: Cell::new(false),
             failed: Cell::new(false),
+            segment: Cell::new(None),
+            segment_pending: Cell::new(false),
+            want_playing: Cell::new(false),
             has_frame: Rc::new(Cell::new(false)),
             exclusive: Cell::new(0),
             watch: RefCell::new(None),
@@ -124,18 +140,51 @@ impl Player {
         Ok(player)
     }
 
+    /// Jump to the start of the segment (or of the file), keeping its end.
+    fn seek_to_start(&self) -> bool {
+        match self.segment.get() {
+            Some(seg) => {
+                let start = gst::ClockTime::from_nseconds(seg.start.as_nanos() as u64);
+                let (stop_type, stop) = match seg.length {
+                    Some(len) => (gst::SeekType::Set, Some(start + gst::ClockTime::from_nseconds(len.as_nanos() as u64))),
+                    None => (gst::SeekType::None, gst::ClockTime::NONE),
+                };
+                self.playbin
+                    .seek(1.0, gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE, gst::SeekType::Set, Some(start), stop_type, stop)
+                    .is_ok()
+            }
+            None => self
+                .playbin
+                .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, gst::ClockTime::ZERO)
+                .is_ok(),
+        }
+    }
+
     fn on_message(&self, msg: &gst::Message) {
         match msg.view() {
+            gst::MessageView::AsyncDone(_) if self.segment_pending.replace(false) => {
+                if !self.seek_to_start() {
+                    eprintln!("finsta: music: couldn't jump to the song's part; playing from the start");
+                }
+                if self.want_playing.get() {
+                    let _ = self.playbin.set_state(gst::State::Playing);
+                }
+            }
+            gst::MessageView::Error(_) if self.segment.get().is_some() && !self.loop_seek.get() => {
+                // Most likely the server can't jump into the file (the
+                // error can come after the jump seemed to work): play it
+                // from the start, once.
+                eprintln!("finsta: music: the server can't jump to the song's part; playing from the start");
+                self.segment.set(None);
+                self.failed.set(false);
+                self.restart();
+            }
             gst::MessageView::Eos(_) => {
                 if self.looping.get() && self.loop_restart.get() {
                     self.restart();
                 } else if self.looping.get() {
                     self.loop_seek.set(true);
-                    if self
-                        .playbin
-                        .seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, gst::ClockTime::ZERO)
-                        .is_err()
-                    {
+                    if !self.seek_to_start() {
                         self.loop_restart.set(true);
                         self.restart();
                     }
@@ -150,6 +199,7 @@ impl Player {
             gst::MessageView::Error(_) if self.loop_seek.replace(false) => {
                 // The server couldn't jump back to the start.
                 self.loop_restart.set(true);
+                self.segment.set(None);
                 self.restart();
             }
             gst::MessageView::Error(e) => {
@@ -178,13 +228,26 @@ impl Player {
         if let Some(bus) = self.playbin.bus() {
             while bus.pop().is_some() {}
         }
-        let _ = self.playbin.set_state(gst::State::Playing);
+        if self.segment.get().is_some() {
+            self.segment_pending.set(true);
+            let _ = self.playbin.set_state(gst::State::Paused);
+        } else {
+            let _ = self.playbin.set_state(gst::State::Playing);
+        }
     }
 
     /// Play `url`, showing it in `picture` (None: sound only). Whoever had
     /// the player loses it. Returns a ticket for the other calls.
     pub fn play(&self, picture: Option<&gtk::Picture>, url: &str, opts: Opts) -> u64 {
+        self.play_part(picture, url, opts, None)
+    }
+
+    /// Like `play`, for part of the file only.
+    pub fn play_part(&self, picture: Option<&gtk::Picture>, url: &str, opts: Opts, segment: Option<Segment>) -> u64 {
         self.detach(true);
+        self.segment.set(segment.filter(|s| !s.start.is_zero() || s.length.is_some()));
+        self.segment_pending.set(self.segment.get().is_some());
+        self.want_playing.set(opts.playing);
         let ticket = self.tickets.get() + 1;
         self.tickets.set(ticket);
         self.ended.set(false);
@@ -200,7 +263,8 @@ impl Player {
         }
         self.playbin.set_property("uri", url);
         self.playbin.set_property("mute", opts.muted);
-        let state = if opts.playing { gst::State::Playing } else { gst::State::Paused };
+        // A segment starts paused, jumps to its start, then plays.
+        let state = if opts.playing && !self.segment_pending.get() { gst::State::Playing } else { gst::State::Paused };
         if self.playbin.set_state(state).is_err() {
             self.failed.set(true);
         }
@@ -283,6 +347,10 @@ impl Player {
 
     pub fn set_playing(&self, ticket: u64, playing: bool) {
         if self.owns(ticket) {
+            self.want_playing.set(playing);
+            if self.segment_pending.get() {
+                return;
+            }
             let _ = self.playbin.set_state(if playing { gst::State::Playing } else { gst::State::Paused });
         }
     }
@@ -302,6 +370,12 @@ impl Player {
             return Some(1.0);
         }
         let position = self.playbin.query_position::<gst::ClockTime>()?;
+        if let Some(seg) = self.segment.get()
+            && let Some(len) = seg.length
+        {
+            let into = position.nseconds().saturating_sub(seg.start.as_nanos() as u64);
+            return (!len.is_zero()).then(|| into as f64 / len.as_nanos() as f64);
+        }
         let duration = self.playbin.query_duration::<gst::ClockTime>()?;
         (duration.nseconds() > 0).then(|| position.nseconds() as f64 / duration.nseconds() as f64)
     }
@@ -320,6 +394,15 @@ impl Player {
         self.exclusive.set(self.exclusive.get() + 1);
         Exclusive(self.clone())
     }
+}
+
+/// Stop whatever is playing (the window is going away).
+pub fn stop_all() {
+    if let Some(player) = PLAYER.with(|p| p.borrow().clone().flatten()) {
+        player.detach(true);
+        let _ = player.playbin.set_state(gst::State::Ready);
+    }
+    CURRENT.set(None);
 }
 
 /// While alive, feed videos don't start playing.
@@ -356,10 +439,28 @@ fn next_frame(sink: &gst::Element, first: bool) -> Option<gdk::Texture> {
 
 // ----- Autoplay in the feed and on posts --------------------------------------
 
+/// Where a song's audio is, once known.
+pub type SongReady = Box<dyn FnOnce(Option<(String, Segment)>)>;
+
+enum SongState {
+    Unknown,
+    Finding,
+    Ready(String, Segment),
+    Failed,
+}
+
+enum Source {
+    /// A video, drawn in the slot's picture.
+    Video(String),
+    /// A photo post's song: sound only, found when first needed.
+    Song { state: Rc<RefCell<SongState>>, find: Rc<dyn Fn(SongReady)> },
+}
+
 struct Slot {
     id: u64,
-    picture: glib::WeakRef<gtk::Picture>,
-    url: String,
+    /// What has to be on screen (for a video, the picture it's drawn in).
+    widget: glib::WeakRef<gtk::Widget>,
+    source: Source,
 }
 
 thread_local! {
@@ -373,33 +474,57 @@ thread_local! {
     static MUTE_BUTTONS: RefCell<Vec<glib::WeakRef<gtk::Button>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Starts playing (muted, looping) when most of it is on screen, and stops
-/// when it scrolls away. Only the most visible video plays.
-pub fn autoplay(picture: &gtk::Picture, url: String) {
+fn add_slot(widget: &gtk::Widget, source: Source) {
     let id = NEXT_SLOT.with(|n| {
         n.set(n.get() + 1);
         n.get()
     });
-    SLOTS.with(|s| s.borrow_mut().push(Slot { id, picture: picture.downgrade(), url }));
+    SLOTS.with(|s| s.borrow_mut().push(Slot { id, widget: widget.downgrade(), source }));
     if !POLLING.with(|p| p.replace(true)) {
         glib::timeout_add_local(Duration::from_millis(250), || {
             poll();
             glib::ControlFlow::Continue
         });
     }
-    picture.connect_map(|_| poll());
+    widget.connect_map(|_| poll());
+}
+
+/// Starts playing (muted, looping) when most of it is on screen, and stops
+/// when it scrolls away. Only the most visible video plays.
+pub fn autoplay(picture: &gtk::Picture, url: String) {
+    add_slot(picture.upcast_ref(), Source::Video(url));
+}
+
+/// A photo post's song: plays (looping) while `widget` is the most visible
+/// thing on screen and the sound is on. `find` looks up its audio the first
+/// time it's needed.
+pub fn autoplay_song(widget: &impl IsA<gtk::Widget>, find: impl Fn(SongReady) + 'static) {
+    add_slot(widget.as_ref(), Source::Song { state: Rc::new(RefCell::new(SongState::Unknown)), find: Rc::new(find) });
+}
+
+/// What a slot would play now, if it's chosen.
+enum Playable {
+    Video(gtk::Picture, String),
+    Song(String, Segment),
 }
 
 fn poll() {
-    SLOTS.with(|s| s.borrow_mut().retain(|x| x.picture.upgrade().is_some()));
+    SLOTS.with(|s| s.borrow_mut().retain(|x| x.widget.upgrade().is_some()));
     let Some(player) = Player::get() else { return };
     let mut current = CURRENT.get().filter(|(_, t)| player.owns(*t));
     if let Some((slot, ticket)) = current
         && player.failed(ticket)
     {
-        if let Some(url) = SLOTS.with(|s| s.borrow().iter().find(|x| x.id == slot).map(|x| x.url.clone())) {
-            FAILED.with(|f| f.borrow_mut().insert(url));
-        }
+        SLOTS.with(|s| {
+            if let Some(x) = s.borrow().iter().find(|x| x.id == slot) {
+                match &x.source {
+                    Source::Video(url) => {
+                        FAILED.with(|f| f.borrow_mut().insert(url.clone()));
+                    }
+                    Source::Song { state, .. } => *state.borrow_mut() = SongState::Failed,
+                }
+            }
+        });
         player.release(ticket);
         current = None;
     }
@@ -407,30 +532,72 @@ fn poll() {
     if player.exclusive.get() > 0 {
         return;
     }
-    let visible: Vec<(u64, gtk::Picture, String, f32)> = SLOTS.with(|s| {
+    let muted = MUTED.get();
+    // Visible slots that could play, and songs still to look up.
+    let mut to_find = Vec::new();
+    let visible: Vec<(u64, Playable, f32)> = SLOTS.with(|s| {
         s.borrow()
             .iter()
-            .filter_map(|x| Some((x.id, x.picture.upgrade()?, x.url.clone())))
-            .filter(|(_, _, url)| !FAILED.with(|f| f.borrow().contains(url)))
-            .map(|(id, p, url)| {
-                let f = crate::ui::util::visible_fraction(&p);
-                (id, p, url, f)
+            .filter_map(|x| {
+                let widget = x.widget.upgrade()?;
+                let f = crate::ui::util::visible_fraction(&widget);
+                let playable = match &x.source {
+                    Source::Video(url) if FAILED.with(|f| f.borrow().contains(url)) => return None,
+                    Source::Video(url) => Playable::Video(widget.downcast().ok()?, url.clone()),
+                    // Silent songs aren't worth loading.
+                    Source::Song { .. } if muted => return None,
+                    Source::Song { state, find } => match &*state.borrow() {
+                        SongState::Ready(url, seg) => Playable::Song(url.clone(), *seg),
+                        SongState::Unknown if f >= 0.6 => {
+                            to_find.push((state.clone(), find.clone()));
+                            return None;
+                        }
+                        _ => return None,
+                    },
+                };
+                Some((x.id, playable, f))
             })
             .collect()
     });
-    if let Some((slot, _)) = current
-        && visible.iter().any(|(id, _, _, f)| *id == slot && *f >= 0.35)
-    {
-        return;
+    for (state, find) in to_find {
+        *state.borrow_mut() = SongState::Finding;
+        find(Box::new(move |found| {
+            *state.borrow_mut() = match found {
+                Some((url, seg)) => SongState::Ready(url, seg),
+                None => SongState::Failed,
+            };
+            poll();
+        }));
     }
     let best = visible
         .into_iter()
-        .filter(|(_, _, _, f)| *f >= 0.6)
-        .max_by(|a, b| a.3.total_cmp(&b.3));
+        .filter(|(_, _, f)| *f >= 0.6)
+        .max_by(|a, b| a.2.total_cmp(&b.2));
+    // What's playing keeps playing while a good part of it shows, unless
+    // something else is fully on screen and it isn't.
+    if let Some((slot, _)) = current
+        && let Some(f) = SLOTS.with(|s| {
+            s.borrow()
+                .iter()
+                .find(|x| x.id == slot)
+                .and_then(|x| x.widget.upgrade())
+                .map(|w| crate::ui::util::visible_fraction(&w))
+        })
+        && f >= 0.35
+        && !best.as_ref().is_some_and(|(id, _, bf)| *id != slot && *bf >= 0.95 && f < 0.75)
+    {
+        return;
+    }
     match best {
-        Some((id, picture, url, _)) if current.is_some() || player.is_idle() => {
-            let opts = Opts { muted: MUTED.get(), looping: true, playing: true };
-            let ticket = player.play(Some(&picture), &url, opts);
+        Some((id, playable, _)) if current.is_some() || player.is_idle() => {
+            let ticket = match playable {
+                Playable::Video(picture, url) => {
+                    player.play(Some(&picture), &url, Opts { muted, looping: true, playing: true })
+                }
+                Playable::Song(url, seg) => {
+                    player.play_part(None, &url, Opts { muted: false, looping: true, playing: true }, Some(seg))
+                }
+            };
             CURRENT.set(Some((id, ticket)));
         }
         Some(_) => {}
@@ -441,6 +608,10 @@ fn poll() {
             }
         }
     }
+}
+
+fn is_song_slot(id: u64) -> bool {
+    SLOTS.with(|s| s.borrow().iter().any(|x| x.id == id && matches!(x.source, Source::Song { .. })))
 }
 
 /// How much of `p` is on screen, from 0 to 1.
@@ -457,8 +628,14 @@ pub fn mute_button() -> gtk::Button {
     button.connect_clicked(|_| {
         let muted = !MUTED.get();
         MUTED.set(muted);
-        if let (Some(player), Some((_, ticket))) = (Player::get(), CURRENT.get()) {
-            player.set_muted(ticket, muted);
+        if let (Some(player), Some((slot, ticket))) = (Player::get(), CURRENT.get()) {
+            if muted && is_song_slot(slot) {
+                // A muted song is just silence: stop it.
+                player.release(ticket);
+                CURRENT.set(None);
+            } else {
+                player.set_muted(ticket, muted);
+            }
         }
         MUTE_BUTTONS.with(|b| {
             b.borrow_mut().retain(|w| w.upgrade().is_some());
@@ -466,6 +643,8 @@ pub fn mute_button() -> gtk::Button {
                 show_muted(&w, muted);
             }
         });
+        // Sound on: a song on screen can start.
+        poll();
     });
     MUTE_BUTTONS.with(|b| b.borrow_mut().push(button.downgrade()));
     button

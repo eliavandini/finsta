@@ -26,7 +26,8 @@ There are no reels, no explore page, no suggested posts and no ads.
   comments, so a conversation can't turn into a reel feed.
 - **Videos play by themselves while they're on screen**, muted and one at a
   time, and stop when you scroll past them. The speaker button turns the
-  sound on for all of them. Stories play with sound.
+  sound on for all of them, and also plays the song of a photo post that
+  has music. Stories play with sound, songs on photo stories included.
 
 ## Layout
 
@@ -54,10 +55,27 @@ There are no reels, no explore page, no suggested posts and no ads.
   optional message, or copies the link.
 - **Songs**: the bookmark next to the song on a post, reel or story saves
   it to Saved › Songs, with a button to get back to what it was on.
-- **Stories** show their music, who a reshared story is from, a button to
-  open the post or reel it shares, links and mentions.
-- **Messages**: right-click a message (or long-press on a touchscreen) to
-  react with an emoji; reactions show under the message.
+- **Stories** play in the middle, with cards for the people before and
+  after on either side (click one to jump to them). Opening someone with new
+  stories starts at their first unwatched one and only goes on to other
+  people with new stories; opening someone you've watched shows everyone.
+  Stories show their music, who a reshared story is from, a button to open
+  the post or reel it shares, links and mentions.
+- **Right-click menus** (or long-press on a touchscreen) on posts, grid
+  thumbnails, stories, the story tray, conversations, messages and people,
+  with the usual actions: open, like, comment, share, save, download, copy
+  the link, view the profile, send a message.
+- **Messages**: right-click a message to react with an emoji (pick yours
+  again to take it back), copy its text or open what it shares; reactions
+  show under the message.
+- **Preferences** (main menu, <kbd>Ctrl</kbd>+<kbd>,</kbd>): run in the
+  background (closing the window keeps Finsta running; Quit is in the main
+  menu, <kbd>Ctrl</kbd>+<kbd>Q</kbd>), start at login, and notifications.
+- **Notifications**: a new message notifies you while Finsta isn't the
+  window you're using; clicking it opens the conversation. Conversations
+  muted on Instagram don't notify, and any conversation's right-click menu
+  turns its notifications off in Finsta. Messages that arrive while you're
+  away aren't marked read until you come back to the window.
 - **Downloads**: the download button on posts, reels and stories saves
   them, every photo of a carousel included, to `Downloads/Finsta`.
 
@@ -141,7 +159,9 @@ iPhone app, which Instagram now rejects.) That means:
   sending anything but text. They show a note to use instagram.com
   instead.
 - Open conversations refresh every 15 seconds and the conversation list
-  every minute. When Instagram rate limits an endpoint, Finsta pauses that
+  every minute (every 30 seconds while Finsta is in the background with
+  notifications on), so a notification can come up to that long after the
+  message. When Instagram rate limits an endpoint, Finsta pauses that
   endpoint until Instagram says to retry.
 - Instagram itself dropped end-to-end encrypted chats on 8 May 2026, so all
   remaining conversations work through the normal message system.

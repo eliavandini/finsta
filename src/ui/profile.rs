@@ -353,7 +353,11 @@ impl Profile {
 
     fn add_posts(&self, items: Vec<Media>) {
         for media in items {
-            self.grid.append(&thumbnail(&media));
+            let child = thumbnail(&media);
+            if let Some(main) = self.main.upgrade() {
+                crate::ui::post::attach_menu(&main, &child, &media);
+            }
+            self.grid.append(&child);
             self.posts.borrow_mut().push(media);
         }
     }

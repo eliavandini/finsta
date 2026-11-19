@@ -21,6 +21,39 @@ fn set_bookmark(button: &gtk::Button, on: bool, save: &str, unsave: &str) {
     button.set_tooltip_text(Some(if on { unsave } else { save }));
 }
 
+/// Save a post to (or remove it from) your saved posts on Instagram, with
+/// a toast saying how it went (after saving, it offers a folder). `done`
+/// gets whether it worked.
+pub fn set_saved(main: &Rc<Main>, media: &Media, save: bool, done: impl FnOnce(bool) + 'static) {
+    let weak = Rc::downgrade(main);
+    let client = main.client.clone();
+    let media = media.clone();
+    glib::spawn_future_local(async move {
+        let m = media.clone();
+        let res = rt::bg(async move { client.save_post(&m, save, None).await }).await;
+        let Some(main) = weak.upgrade() else { return done(res.is_ok()) };
+        match &res {
+            Ok(()) if save => {
+                let toast = adw::Toast::builder().title("Saved").button_label("Add to Folder").build();
+                let weak = Rc::downgrade(&main);
+                toast.connect_button_clicked(move |_| {
+                    if let Some(main) = weak.upgrade() {
+                        choose_folder(&main, &media);
+                    }
+                });
+                main.toasts.add_toast(toast);
+            }
+            Ok(()) => main.toast("Removed from Saved"),
+            Err(e) if api::is_login_required(e) => main.handle_error(e),
+            Err(e) => {
+                eprintln!("finsta: save failed: {e}");
+                main.toast(if save { "Couldn't save this post" } else { "Couldn't remove this post from Saved" });
+            }
+        }
+        done(res.is_ok());
+    });
+}
+
 /// The bookmark button on a post: saves it to (or removes it from) your
 /// saved posts on Instagram, then offers to put it in a folder.
 pub fn post_button(main: &Rc<Main>, media: &Media) -> gtk::Button {
@@ -35,43 +68,14 @@ pub fn post_button(main: &Rc<Main>, media: &Media) -> gtk::Button {
         saved.set(now);
         set_bookmark(b, now, "Save", "Remove from Saved");
         b.set_sensitive(false);
-        let client = main.client.clone();
-        let m = media.clone();
-        let media = media.clone();
-        let weak = weak.clone();
         let saved = saved.clone();
         let b = b.downgrade();
-        glib::spawn_future_local(async move {
-            let res = rt::bg(async move { client.save_post(&m, now, None).await }).await;
-            let button = b.upgrade();
-            if let Some(b) = &button {
-                b.set_sensitive(true);
-            }
-            let Some(main) = weak.upgrade() else { return };
-            match res {
-                Ok(()) if now => {
-                    let toast = adw::Toast::builder().title("Saved").button_label("Add to Folder").build();
-                    let weak = Rc::downgrade(&main);
-                    toast.connect_button_clicked(move |_| {
-                        if let Some(main) = weak.upgrade() {
-                            choose_folder(&main, &media);
-                        }
-                    });
-                    main.toasts.add_toast(toast);
-                }
-                Ok(()) => main.toast("Removed from Saved"),
-                Err(e) => {
-                    saved.set(!now);
-                    if let Some(b) = &button {
-                        set_bookmark(b, !now, "Save", "Remove from Saved");
-                    }
-                    if api::is_login_required(&e) {
-                        main.handle_error(&e);
-                    } else {
-                        eprintln!("finsta: save failed: {e}");
-                        main.toast(if now { "Couldn't save this post" } else { "Couldn't remove this post from Saved" });
-                    }
-                }
+        set_saved(&main, &media, now, move |ok| {
+            let Some(b) = b.upgrade() else { return };
+            b.set_sensitive(true);
+            if !ok {
+                saved.set(!now);
+                set_bookmark(&b, !now, "Save", "Remove from Saved");
             }
         });
     });

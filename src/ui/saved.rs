@@ -280,7 +280,11 @@ impl Saved {
                 Ok(page) => {
                     let first = s.posts.borrow().is_empty();
                     for m in &page.items {
-                        s.grid.append(&thumbnail(m));
+                        let child = thumbnail(m);
+                        if let Some(main) = s.main.upgrade() {
+                            crate::ui::post::attach_menu(&main, &child, m);
+                        }
+                        s.grid.append(&child);
                     }
                     // "All Posts" gets the newest saved post as its cover.
                     if first
