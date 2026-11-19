@@ -115,6 +115,16 @@ WebKitGTK is only used for the sign-in window. Without it (`--no-webkit`, or
 
 To just try it from the source tree: `cargo run --release`.
 
+### Ready-made builds
+
+The Release workflow (`.github/workflows/release.yml`) builds an AppImage
+for Linux, a zip with `finsta.exe` for Windows and `Finsta.app` for macOS
+on Apple silicon. Pushing a tag like `v0.2.0` publishes them as a GitHub
+release; "Run workflow" on the Actions tab only builds them. The packaging
+steps are in `packaging/`. These builds sign in with a session cookie only
+(no WebKitGTK), and the macOS app isn't notarized: the first time, open it
+with right-click → Open.
+
 ## Signing in
 
 - **Sign In with Instagram** opens Instagram's own login page in an embedded,

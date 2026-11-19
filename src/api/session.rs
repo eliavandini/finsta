@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -93,12 +92,12 @@ impl Session {
             fs::create_dir_all(dir)?;
         }
         let tmp = path.with_extension("json.tmp");
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp)?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        // Only you can read it: it holds your session.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&tmp)?;
         file.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
         file.sync_all()?;
         fs::rename(&tmp, &path)?;

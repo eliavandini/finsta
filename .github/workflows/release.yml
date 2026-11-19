@@ -1,0 +1,89 @@
+# Builds Finsta for Linux (AppImage), Windows (a zip with finsta.exe) and
+# macOS (Finsta.app, Apple silicon). A pushed tag like v0.2.0 also publishes
+# them as a GitHub release; "Run workflow" only builds them (see the run's
+# artifacts).
+#
+# These builds sign in with a session cookie only: the embedded Instagram
+# login page needs WebKitGTK, which Windows and macOS don't have and which
+# doesn't survive being packed into an AppImage. install.sh keeps it on Linux.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    # GTK 4.18 and libadwaita 1.6 are newer than Ubuntu 24.04's.
+    container: debian:trixie
+    steps:
+      - name: Install build tools and libraries
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential pkgconf file patchelf \
+            libgtk-4-dev libadwaita-1-dev libgstreamer1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-libav \
+            glib-networking libsoup-3.0-0 webp-pixbuf-loader adwaita-icon-theme
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --no-default-features
+      - run: packaging/appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finsta-linux
+          path: build/Finsta-x86_64.AppImage
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: zip
+          pacboy: >-
+            rust:p gcc:p pkgconf:p gtk4:p libadwaita:p
+            gstreamer:p gst-plugins-base:p gst-plugins-good:p gst-libav:p
+            glib-networking:p libsoup3:p webp-pixbuf-loader:p adwaita-icon-theme:p
+      - run: cargo build --release --locked --no-default-features
+      - run: packaging/windows.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finsta-windows
+          path: build/Finsta-windows-x86_64.zip
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libraries
+        run: brew install pkgconf gtk4 libadwaita gstreamer glib-networking libsoup webp-pixbuf-loader adwaita-icon-theme librsvg dylibbundler
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --no-default-features
+      - run: packaging/macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finsta-macos
+          path: build/Finsta-macos-arm64.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [appimage, windows, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

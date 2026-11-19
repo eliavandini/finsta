@@ -1,3 +1,6 @@
+// No console window behind the app on Windows (release builds).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod api;
 mod rt;
 mod ui;
