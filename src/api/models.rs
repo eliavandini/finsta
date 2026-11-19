@@ -461,7 +461,14 @@ impl Media {
                     .and_then(|m| m.image_url(min_width));
             }
         };
-        let mut sorted: Vec<&ImageCandidate> = candidates.iter().collect();
+        // Instagram also lists square crops; keep the sizes with the photo's own shape.
+        let shape = |w: i64, h: i64| if w > 0 && h > 0 { h as f64 / w as f64 } else { 0.0 };
+        let own = shape(self.original_width, self.original_height);
+        let whole = |c: &&ImageCandidate| own == 0.0 || (shape(c.width, c.height) - own).abs() < 0.02;
+        let mut sorted: Vec<&ImageCandidate> = candidates.iter().filter(whole).collect();
+        if sorted.is_empty() {
+            sorted = candidates.iter().collect();
+        }
         sorted.sort_by_key(|c| c.width);
         sorted
             .iter()
@@ -1045,6 +1052,21 @@ impl DmContent {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn image_url_skips_square_crops() {
+        let m: Media = parse(&json!({
+            "original_width": 1080, "original_height": 1350,
+            "image_versions2": {"candidates": [
+                {"url": "full", "width": 1080, "height": 1350},
+                {"url": "square", "width": 750, "height": 750},
+                {"url": "small", "width": 640, "height": 800},
+            ]},
+        }))
+        .unwrap();
+        assert_eq!(m.image_url(750).as_deref(), Some("full"));
+        assert_eq!(m.image_url(600).as_deref(), Some("small"));
+    }
 
     #[test]
     fn comment_replies() {
