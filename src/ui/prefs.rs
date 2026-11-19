@@ -22,11 +22,13 @@ pub struct Prefs {
     pub notify_messages: bool,
     /// Conversations whose notifications are off in Finsta.
     pub quiet_threads: Vec<String>,
+    /// Your GIPHY API key, to search for GIFs to send.
+    pub giphy_key: String,
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { run_in_background: false, start_at_login: false, notify_messages: true, quiet_threads: Vec::new() }
+        Prefs { run_in_background: false, start_at_login: false, notify_messages: true, quiet_threads: Vec::new(), giphy_key: String::new() }
     }
 }
 
@@ -137,6 +139,15 @@ pub fn dialog(main: &Rc<Main>) {
     let messages = switch("New Messages", "When Finsta isn't the window you're using", prefs.notify_messages);
     notifications.add(&messages);
     page.add(&notifications);
+
+    let gifs = adw::PreferencesGroup::builder()
+        .title("GIFs")
+        .description("To search and send GIFs in messages, get a free API key at developers.giphy.com. Only your searches go to GIPHY.")
+        .build();
+    let key = adw::PasswordEntryRow::builder().title("GIPHY API Key").text(&prefs.giphy_key).build();
+    key.connect_changed(|r| update(|p| p.giphy_key = r.text().trim().to_string()));
+    gifs.add(&key);
+    page.add(&gifs);
 
     background.connect_active_notify(|r| update(|p| p.run_in_background = r.is_active()));
     messages.connect_active_notify(|r| update(|p| p.notify_messages = r.is_active()));

@@ -253,6 +253,7 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
         opening: Cell::new(false),
     });
 
+    composer_row.prepend(&gif_button(&chat));
     let weak = Rc::downgrade(&chat);
     reply_cancel.connect_clicked(move |_| {
         if let Some(c) = weak.upgrade() {
@@ -734,25 +735,52 @@ impl Chat {
 
     fn send(self: &Rc<Self>) {
         let text = self.entry.text().trim().to_string();
-        if text.is_empty() || self.sending.get() {
+        if text.is_empty() {
             return;
         }
-        let Some(main) = self.main.upgrade() else { return };
+        let mut extra = serde_json::Map::new();
+        extra.insert("text".into(), Value::String(text.clone()));
+        let t = text.clone();
+        let started = self.deliver("text", extra, text, move |client, to, reply| async move {
+            client.send_text(&to, &t, reply.as_deref()).await
+        });
+        if started {
+            self.entry.set_text("");
+        }
+    }
+
+    fn send_gif(self: &Rc<Self>, gif: crate::api::Gif) {
+        let mut extra = serde_json::Map::new();
+        extra.insert("animated_media".into(), serde_json::json!({ "images": { "fixed_height": { "url": gif.still } } }));
+        self.deliver("animated_media", extra, String::new(), move |client, to, reply| async move {
+            client.send_gif(&to, &gif, reply.as_deref()).await
+        });
+    }
+
+    /// Show a message right away (`item_type` and `extra` as Instagram sends
+    /// it back), send it with `send` (as a reply if one is chosen), then fetch
+    /// the conversation so it shows for real. If sending fails, `text` goes
+    /// back in the message box. Whether it started.
+    fn deliver<F, Fut>(self: &Rc<Self>, item_type: &str, mut extra: serde_json::Map<String, Value>, text: String, send: F) -> bool
+    where
+        F: FnOnce(crate::api::Client, Recipient, Option<String>) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Option<String>>> + Send + 'static,
+    {
+        if self.sending.get() {
+            return false;
+        }
+        let Some(main) = self.main.upgrade() else { return false };
         let recipient = match self.thread_id.borrow().clone() {
             Some(id) => Recipient::Thread(id),
             None => match self.thread.borrow().users.first() {
                 Some(u) => Recipient::User(u.pk.clone()),
-                None => return,
+                None => return false,
             },
         };
         self.sending.set(true);
         self.send_button.set_sensitive(false);
-        self.entry.set_text("");
         let reply = self.reply_to.borrow().clone();
         self.set_reply(None);
-
-        let mut extra = serde_json::Map::new();
-        extra.insert("text".into(), Value::String(text.clone()));
         if let Some((_, quote)) = &reply {
             extra.insert("replied_to_message".into(), serde_json::json!({ "text": quote }));
         }
@@ -760,18 +788,18 @@ impl Chat {
             item_id: format!("pending:{}", uuid::Uuid::new_v4()),
             user_id: self.viewer_id.clone(),
             timestamp: chrono::Utc::now().timestamp_micros(),
-            item_type: "text".into(),
+            item_type: item_type.into(),
             extra,
         });
         self.stick_to_bottom.set(true);
         self.render();
 
+        let sending = send(main.client.clone(), recipient.clone(), reply.map(|(id, _)| id));
         let client = main.client.clone();
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let t = text.clone();
             let res = rt::bg(async move {
-                let thread_id = client.send_text(&recipient, &t, reply.as_ref().map(|(id, _)| id.as_str())).await?;
+                let thread_id = sending.await?;
                 // Fetch the conversation so the sent message shows up for real.
                 let thread = match (thread_id, &recipient) {
                     (Some(id), _) => client.thread(&id, None).await.ok(),
@@ -800,7 +828,7 @@ impl Chat {
                 Err(e) => {
                     c.pending.borrow_mut().clear();
                     c.render();
-                    if c.entry.text().is_empty() {
+                    if !text.is_empty() && c.entry.text().is_empty() {
                         c.entry.set_text(&text);
                     }
                     if let Some(main) = c.main.upgrade() {
@@ -809,6 +837,7 @@ impl Chat {
                 }
             }
         });
+        true
     }
 
     /// React with `emoji`, or take your reaction back (None).
@@ -1005,6 +1034,115 @@ fn message_menu(chat: &Rc<Chat>, bubble: &gtk::Widget, item: &DmItem) {
         }
         Some(m)
     });
+}
+
+/// The GIF button: search GIPHY (with your key from Preferences) and send one.
+fn gif_button(chat: &Rc<Chat>) -> gtk::MenuButton {
+    let search = gtk::SearchEntry::builder().placeholder_text("Search GIPHY").build();
+    let status = gtk::Label::builder()
+        .wrap(true)
+        .max_width_chars(36)
+        .margin_top(24)
+        .margin_bottom(24)
+        .css_classes(["dim-label"])
+        .build();
+    let grid = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .min_children_per_line(3)
+        .max_children_per_line(3)
+        .column_spacing(4)
+        .row_spacing(4)
+        .valign(gtk::Align::Start)
+        .build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .min_content_height(340)
+        .min_content_width(360)
+        .child(&grid)
+        .build();
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    column.append(&search);
+    column.append(&status);
+    column.append(&scroller);
+    let popover = gtk::Popover::builder().child(&column).build();
+    let button = gtk::MenuButton::builder()
+        .label("GIF")
+        .tooltip_text("Send a GIF")
+        .popover(&popover)
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+
+    // Results of an older search that arrive late are dropped.
+    let generation = Rc::new(Cell::new(0u32));
+    let (weak, grid, status, popover_ref) = (Rc::downgrade(chat), grid.downgrade(), status.downgrade(), popover.downgrade());
+    let load = Rc::new(move |query: String| {
+        let (Some(c), Some(grid), Some(status)) = (weak.upgrade(), grid.upgrade(), status.upgrade()) else { return };
+        let Some(main) = c.main.upgrade() else { return };
+        while let Some(child) = grid.first_child() {
+            grid.remove(&child);
+        }
+        status.set_visible(true);
+        let key = crate::ui::prefs::get().giphy_key;
+        if key.is_empty() {
+            status.set_label("To send GIFs, add your GIPHY API key in Preferences.");
+            return;
+        }
+        status.set_label("Loading…");
+        let n = generation.get() + 1;
+        generation.set(n);
+        let (generation, weak, popover) = (generation.clone(), weak.clone(), popover_ref.clone());
+        let client = main.client.clone();
+        glib::spawn_future_local(async move {
+            let res = rt::bg(async move { client.search_gifs(&key, &query).await }).await;
+            if generation.get() != n {
+                return;
+            }
+            match res {
+                Ok(gifs) if gifs.is_empty() => status.set_label("No GIFs found"),
+                Ok(gifs) => {
+                    status.set_visible(false);
+                    for gif in gifs {
+                        let pick = gtk::Button::builder()
+                            .child(&media_thumb(Some(gif.still.clone()), gif.aspect, 110, false))
+                            .tooltip_text("Send")
+                            .css_classes(["flat"])
+                            .build();
+                        let (weak, popover) = (weak.clone(), popover.clone());
+                        pick.connect_clicked(move |_| {
+                            if let Some(p) = popover.upgrade() {
+                                p.popdown();
+                            }
+                            if let Some(c) = weak.upgrade() {
+                                c.send_gif(gif.clone());
+                            }
+                        });
+                        grid.append(&pick);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("finsta: GIF search failed: {e}");
+                    status.set_label(if e.to_string().contains("API key") {
+                        "GIPHY didn't accept your API key. Check it in Preferences."
+                    } else {
+                        "Couldn't load GIFs. Try again in a moment."
+                    });
+                }
+            }
+        });
+    });
+    let l = load.clone();
+    let s = search.clone();
+    popover.connect_show(move |_| l(s.text().to_string()));
+    search.connect_search_changed(move |s| load(s.text().to_string()));
+    // The search box takes Escape; it closes the picker.
+    let p = popover.downgrade();
+    search.connect_stop_search(move |_| {
+        if let Some(p) = p.upgrade() {
+            p.popdown();
+        }
+    });
+    button
 }
 
 /// Click to open; waits out a double-click, which replies to the message instead.

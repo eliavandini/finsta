@@ -296,8 +296,10 @@ WEB_MODULES = (
 REPLY_DOC = "24000000000000006"
 REACT_DOC = "24000000000000007"
 SHARE_DOC = "24000000000000008"
+GIF_DOC = "24000000000000009"
+GIPHY_KEY = "mockgiphykey"  # FINSTA_GIPHY_BASE=http://127.0.0.1:8765/giphy/ and this key in Preferences
 SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read", REPLY_DOC: "story reply",
-              REACT_DOC: "react", SHARE_DOC: "story share"}
+              REACT_DOC: "react", SHARE_DOC: "story share", GIF_DOC: "gif"}
 REPLY_FAILS = "--reply-fails" in sys.argv  # story replies fail natively (as on instagram.com in November 2026)
 OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
 EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
@@ -349,6 +351,7 @@ def script(name):
                 '__d("IGDirectStoryShareReplyMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + REPLY_DOC + '"}),null);'
                 '__d("IGDirectReactionSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + REACT_DOC + '"}),null);'
                 '__d("IGDirectStoryShareMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + SHARE_DOC + '"}),null);'
+                '__d("IGDirectAnimatedMediaSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + GIF_DOC + '"}),null);'
                 + "".join(f'__d("{n}_instagramRelayOperation",[],(function(a,b,c,d,e,f){{e.exports="{d}"}}),null);' for d, n in WEB_DOCS.items())
                 + WEB_MODULES +
                 '__d("IGDMaxUnreadMessagesCount.relayprovider",[],(function(t,n,r,o,a,i,l){l.get=function(){return 20}}),null);'
@@ -384,6 +387,8 @@ def slide_content(m):
     if a[0] == "blob":
         return {"__typename": "SlideMessageImageContent", "attachments": [{"attachment_fbid": "1", "preview_cdn_url": a[1], "attachment_cdn_url": a[1],
                                                                              "preview_width": 1080, "preview_height": 1350}]}
+    if a[0] == "gif":
+        return {"__typename": "SlideMessageAnimatedMediaContent", "animated_media": [{"attachment_webp_url": a[1], "preview_width": 200, "preview_height": 150}]}
     if a[0] == "raven":
         return {"__typename": "SlideMessageRavenImageContent", "attachment": {"__typename": "XFBSlideAttachment", "preview_cdn_url": img("secret", 100, 100)}}
     if a[0] == "audio":
@@ -460,6 +465,20 @@ def slide_answer(op, v):
         if i["reaction_status"] == "created":
             m["reactions"].append((i["emoji"], ME_CHAT))
         return {"data": {"xig_direct_reaction_send_with_slide_messaging_response": {"success": True}}}
+    if op == "gif":
+        # As instagram.com's IGDMAPISendThirdPartyGIF builds it.
+        d, sd = v.get("data") or {}, v.get("send_data") or {}
+        if set(d) != {"is_random", "is_sticker", "reply_to_message_id", "sticker_id"} \
+                or set(sd) != {"forwarded_from_thread_id", "is_forwarded_from_own_message", "offline_threading_id", "recipient_users", "reply_to_message_id", "send_attribution", "thread_id"}:
+            return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        key = int(sd["thread_id"]) if str(sd.get("thread_id") or "").isdigit() and int(sd["thread_id"]) in MESSAGES else None
+        if key is None or not str(d.get("sticker_id", "")).startswith("gif") or not sd.get("offline_threading_id"):
+            return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        sent = msg(f"gf{time.time_ns()}", ME_CHAT, 0, attach=("gif", img(d["sticker_id"], 200, 150)))
+        sent["ts"] = time.time_ns() // 1_000_000
+        sent["reply"] = next((m for m in MESSAGES[key] if m["mid"] == d["reply_to_message_id"]), None)
+        MESSAGES[key].append(sent)
+        return {"data": {"direct_animated_media_send": {"message_id": sent["mid"], "id": "x"}}}
     if op == "story share":
         # As instagram.com's IGDMAPISendStoryShare builds it.
         d, sd = v.get("data") or {}, v.get("send_data") or {}
@@ -846,6 +865,13 @@ class Handler(BaseHTTPRequestHandler):
             f.write(f"{method} :{PORT}{path} q={dict(q)} body={body} cookie={self.headers.get('Cookie')} csrf={self.headers.get('X-CSRFToken')} app={self.headers.get('X-IG-App-ID')} xhr={self.headers.get('X-Requested-With')} origin={self.headers.get('Origin')} ua={self.headers.get('User-Agent')}\n")
         if path.startswith("/img/"):
             return self.serve_image(path[5:])
+        if path in ("/giphy/trending", "/giphy/search"):
+            if q.get("api_key") != [GIPHY_KEY]:
+                return self.send_json({"meta": {"status": 401, "msg": "Unauthorized"}}, 401)
+            words = q.get("q", ["trending"])[0]
+            return self.send_json({"data": [{"id": f"gif{i}", "url": f"https://giphy.com/gifs/gif{i}",
+                                             "images": {"fixed_width_still": {"url": img(f"gif-{words}-{i}", 200, 150 + 20 * (i % 3)), "width": "200", "height": str(150 + 20 * (i % 3))}}}
+                                            for i in range(0 if words == "nothing" else 9)]})
         if path == "/aud/song.ogg" and AUDIO:
             # Like a CDN, this one can send part of the file.
             body = open(AUDIO, "rb").read()

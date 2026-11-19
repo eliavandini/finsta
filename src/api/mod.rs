@@ -4,6 +4,7 @@
 //! them, with the user agent of the browser that signed in.
 
 mod dm;
+mod giphy;
 mod lightspeed;
 pub mod models;
 mod mqtt;
@@ -23,6 +24,7 @@ use serde_json::{Value, json};
 pub use models::*;
 pub use session::Session;
 pub use dm::StoryReply;
+pub use giphy::Gif;
 
 const WEB_API: &str = "https://www.instagram.com/api/v1/";
 /// The page instagram.com's own GraphQL requests come from.

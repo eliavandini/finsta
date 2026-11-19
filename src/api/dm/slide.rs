@@ -30,6 +30,7 @@ const SEND_TEXT: &str = "IGDirectTextSendMutation";
 const MARK_READ: &str = "useIGDMarkThreadAsReadMutation";
 const STORY_REPLY: &str = "IGDirectStoryShareReplyMutation";
 const STORY_SHARE: &str = "IGDirectStoryShareMutation";
+const SEND_GIF: &str = "IGDirectAnimatedMediaSendMutation";
 const REACT: &str = "IGDirectReactionSendMutation";
 
 /// Values the website computes on its side ("provided variables").
@@ -628,14 +629,7 @@ impl Client {
     /// IGDMAPISendStoryShare does when forwarding one.
     pub(super) async fn slide_story_share(&self, st: &mut DmState, to: &Recipient, media_pk: &str) -> Result<()> {
         let otid = time_id().to_string();
-        let (thread, users) = match to {
-            Recipient::Thread(id) => {
-                let t = st.slide.threads.get(id).cloned().unwrap_or_default();
-                let fbid = [&t["thread_fbid"], &t["thread_key"]].into_iter().map(s).find(|x| !x.is_empty());
-                (Some(fbid.ok_or_else(|| anyhow!("Couldn't find this conversation's id"))?), None)
-            }
-            Recipient::User(pk) => (None, Some(json!([pk]).to_string())),
-        };
+        let (thread, users) = slide_target(st, to)?;
         let vars = json!({
             "data": {
                 "is_shh_mode": false,
@@ -662,6 +656,40 @@ impl Client {
             bail!("Instagram didn't confirm the story");
         }
         Ok(())
+    }
+
+    /// Send a GIF (GIPHY's id for it) the way instagram.com's
+    /// IGDMAPISendThirdPartyGIF does.
+    pub(super) async fn slide_send_gif(
+        &self,
+        st: &mut DmState,
+        to: &Recipient,
+        gif_id: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Option<String>> {
+        let otid = time_id().to_string();
+        let (thread, users) = slide_target(st, to)?;
+        let vars = json!({
+            "data": {"is_random": false, "is_sticker": false, "reply_to_message_id": reply_to, "sticker_id": gif_id},
+            "send_data": {
+                "forwarded_from_thread_id": null,
+                "is_forwarded_from_own_message": null,
+                "offline_threading_id": otid,
+                "recipient_users": users,
+                "reply_to_message_id": reply_to,
+                "send_attribution": "direct_thread",
+                "thread_id": thread,
+            },
+        });
+        let data = self.slide_op(st, SEND_GIF, vars).await?;
+        let sent = &data["direct_animated_media_send"];
+        if s(&sent["message_id"]).is_empty() && s(&sent["id"]).is_empty() {
+            bail!("Instagram didn't confirm the GIF");
+        }
+        Ok(match to {
+            Recipient::Thread(id) => Some(id.clone()),
+            Recipient::User(_) => None,
+        })
     }
 
     pub(super) async fn slide_send(
@@ -763,6 +791,19 @@ impl Client {
         }
         Ok(())
     }
+}
+
+/// Where the website's share and GIF sends go: a conversation (its fbid), or
+/// people (a JSON list of their ids).
+fn slide_target(st: &DmState, to: &Recipient) -> Result<(Option<String>, Option<String>)> {
+    Ok(match to {
+        Recipient::Thread(id) => {
+            let t = st.slide.threads.get(id).cloned().unwrap_or_default();
+            let fbid = [&t["thread_fbid"], &t["thread_key"]].into_iter().map(s).find(|x| !x.is_empty());
+            (Some(fbid.ok_or_else(|| anyhow!("Couldn't find this conversation's id"))?), None)
+        }
+        Recipient::User(pk) => (None, Some(json!([pk]).to_string())),
+    })
 }
 
 /// The heart as instagram.com shows it, and as its chat service stores it

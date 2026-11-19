@@ -671,7 +671,7 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 10;
+const META_SCANNER: u64 = 11;
 
 /// How a story reply was delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -717,6 +717,12 @@ const CALLER_NEEDLES: &[&str] = &[
     "IGDirectStoryShareMutation",
     "IGDirectReelShareMutation",
     "IGDirectLinkShareMutation",
+    // Sending photos, videos and GIFs: the upload, and the website's GIF picker.
+    "IGDirectMediaSendMutation",
+    "IGDirectAnimatedMediaSendMutation",
+    "mediaStaging",
+    "rupload",
+    "IGDComposerRichContentGifs",
     // Saving posts, and folders.
     "usePolarisSaveMediaSaveMutation",
     "usePolarisMediaSaveToCollectionAddMediaMutation",
@@ -1913,6 +1919,29 @@ impl Client {
 
     /// React to a message with an emoji, or take back your reaction (`on`
     /// false, with the emoji you had reacted with).
+    /// Send a GIF from GIPHY; as its link if Instagram turns it down.
+    pub async fn send_gif(&self, to: &Recipient, gif: &super::Gif, reply_to: Option<&str>) -> Result<Option<String>> {
+        let native = {
+            let mut st = self.inner.dm.lock().await;
+            if st.config.is_none() {
+                self.dm_load_page(&mut st).await?;
+            }
+            if Self::slide_mode(&st) {
+                self.slide_send_gif(&mut st, to, &gif.id, reply_to).await
+            } else {
+                Err(anyhow!("not available on the older chat route"))
+            }
+        };
+        match native {
+            Ok(thread) => Ok(thread),
+            Err(e) if super::is_login_required(&e) || gif.page.is_empty() => Err(e),
+            Err(e) => {
+                eprintln!("finsta: dm: GIF send failed ({e}); sending its link");
+                self.send_text(to, &gif.page, reply_to).await
+            }
+        }
+    }
+
     /// Share a story (its numeric id) as a story, not a link.
     pub async fn share_story(&self, to: &Recipient, media_pk: &str) -> Result<()> {
         let mut st = self.inner.dm.lock().await;
