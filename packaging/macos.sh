@@ -27,9 +27,9 @@ cp -RL "$brew/share/icons/Adwaita" "$brew/share/icons/hicolor" "$res/share/icons
 cp -L "$brew/opt/libsoup/lib/libsoup-3.0.0.dylib" "$c/Frameworks/"
 
 # The image loader list, with the bundle's place filled in at launch. Made
-# before the loaders are pointed at Frameworks, while they still load here.
-loaders="$res/lib/gdk-pixbuf-2.0/2.10.0/loaders"
-GDK_PIXBUF_MODULEDIR="$PWD/$loaders" gdk-pixbuf-query-loaders | sed "s#$PWD/$loaders#@LOADERS@#g" > "$res/loaders.cache.in"
+# from Homebrew's loaders (the copies only load once bundled); same names.
+loaders="$brew/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+GDK_PIXBUF_MODULEDIR="$loaders" gdk-pixbuf-query-loaders | sed "s#$loaders#@LOADERS@#g" > "$res/loaders.cache.in"
 grep -q '@LOADERS@.*svg' "$res/loaders.cache.in" || { echo "no SVG loader in the loader list" >&2; exit 1; }
 
 # Copy every Homebrew library these need into Frameworks and point them there.
