@@ -1007,11 +1007,33 @@ fn message_menu(chat: &Rc<Chat>, bubble: &gtk::Widget, item: &DmItem) {
     });
 }
 
+/// Click to open; waits out a double-click, which replies to the message instead.
 fn clickable(widget: &impl IsA<gtk::Widget>, f: impl Fn() + 'static) {
     let click = gtk::GestureClick::new();
-    click.connect_released(move |gesture, _, _, _| {
+    let f = Rc::new(f);
+    let waiting: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
+    let w = waiting.clone();
+    click.connect_pressed(move |_, presses, _, _| {
+        if presses > 1
+            && let Some(open) = w.take()
+        {
+            open.remove();
+        }
+    });
+    click.connect_released(move |gesture, presses, _, _| {
         gesture.set_state(gtk::EventSequenceState::Claimed);
-        f();
+        if presses != 1 {
+            return;
+        }
+        let wait = gesture.widget().map_or(400, |w| w.settings().gtk_double_click_time());
+        let (f, w) = (f.clone(), waiting.clone());
+        let open = glib::timeout_add_local_once(std::time::Duration::from_millis(wait.max(0) as u64), move || {
+            w.take();
+            f();
+        });
+        if let Some(old) = waiting.replace(Some(open)) {
+            old.remove();
+        }
     });
     widget.add_controller(click);
     widget.set_cursor_from_name(Some("pointer"));
@@ -1315,6 +1337,7 @@ fn message_widget(
     }
 
     let bubble_class = if is_me { "outgoing" } else { "incoming" };
+    let is_text = matches!(content, DmContent::Text(_) | DmContent::Link { .. });
     let bubble: gtk::Widget = match content {
         DmContent::Text(text) | DmContent::Link { text } => {
             let b = gtk::Box::builder()
@@ -1385,14 +1408,17 @@ fn message_widget(
     if !pending {
         message_menu(chat, &bubble, item);
         if !item.item_id.is_empty() && !item.item_id.starts_with("snippet:") {
-            // Double-click: reply to it. Seen before the text inside, which would select a word.
+            // Double-click: reply to it. Seen before what's inside: text would select a word, and
+            // a post (or photo) must see it too, to not open.
             let double = gtk::GestureClick::builder().propagation_phase(gtk::PropagationPhase::Capture).build();
             let (weak, item) = (Rc::downgrade(chat), item.clone());
             double.connect_pressed(move |gesture, presses, _, _| {
                 if presses == 2
                     && let Some(c) = weak.upgrade()
                 {
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    if is_text {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                    }
                     c.set_reply(Some(&item));
                 }
             });
