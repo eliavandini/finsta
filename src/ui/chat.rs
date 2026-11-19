@@ -66,6 +66,9 @@ struct Chat {
     active_handler: RefCell<Option<glib::SignalHandlerId>>,
     /// When the newest messages were last asked for.
     fetched: Cell<Option<std::time::Instant>>,
+    /// The last sign of a live conversation (typing, sending, a new message,
+    /// coming back to it): new messages are checked for faster after it.
+    active_at: Cell<std::time::Instant>,
     /// Disappearing messages opened in this session: item id -> times opened.
     /// Guards against showing them again before Instagram's state catches up.
     local_views: RefCell<HashMap<String, u32>>,
@@ -249,6 +252,7 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
         seen_pending: Cell::new(false),
         active_handler: RefCell::new(None),
         fetched: Cell::new(None),
+        active_at: Cell::new(std::time::Instant::now()),
         local_views: RefCell::new(HashMap::new()),
         opening: Cell::new(false),
     });
@@ -302,6 +306,15 @@ impl Chat {
             move |_| {
                 if let Some(c) = weak.upgrade() {
                     c.load_older();
+                }
+            }
+        ));
+        self.entry.connect_changed(glib::clone!(
+            #[strong]
+            weak,
+            move |_| {
+                if let Some(c) = weak.upgrade() {
+                    c.mark_active();
                 }
             }
         ));
@@ -373,18 +386,37 @@ impl Chat {
 
     fn start_polling(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
-        glib::timeout_add_seconds_local(15, move || {
+        // Ticks every second but asks Instagram only when a check is due, so
+        // coming back to the conversation or a new message speeds it up at once.
+        glib::timeout_add_seconds_local(1, move || {
             let Some(c) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
             let Some(page) = c.page.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            if page.is_mapped() && !c.loading.get() && c.thread_id.borrow().is_some() {
+            let due = c.fetched.get().is_none_or(|t| t.elapsed().as_secs() >= c.poll_delay());
+            if due && page.is_mapped() && !c.loading.get() && c.thread_id.borrow().is_some() {
                 c.load_latest(false);
             }
             glib::ControlFlow::Continue
         });
+    }
+
+    /// Seconds until the next check for new messages: often while you're in
+    /// a live conversation, less as it goes quiet or you look elsewhere.
+    fn poll_delay(&self) -> u64 {
+        let quiet = self.active_at.get().elapsed().as_secs();
+        match quiet {
+            _ if !self.in_view() => 15,
+            0..120 => 3,
+            120..600 => 8,
+            _ => 15,
+        }
+    }
+
+    fn mark_active(&self) {
+        self.active_at.set(std::time::Instant::now());
     }
 
     fn render_header(self: &Rc<Self>) {
@@ -496,6 +528,9 @@ impl Chat {
             self.render_header();
         }
         let changed = self.merge(thread.items);
+        if changed && !initial {
+            self.mark_active();
+        }
         if changed || initial || !self.pending.borrow().is_empty() {
             self.pending.borrow_mut().clear();
             self.render();
@@ -519,6 +554,7 @@ impl Chat {
         if !self.in_view() {
             return;
         }
+        self.mark_active();
         if self.seen_pending.get() {
             self.seen_now();
         }
@@ -779,6 +815,7 @@ impl Chat {
         };
         self.sending.set(true);
         self.send_button.set_sensitive(false);
+        self.mark_active();
         let reply = self.reply_to.borrow().clone();
         self.set_reply(None);
         if let Some((_, quote)) = &reply {

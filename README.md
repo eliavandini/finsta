@@ -163,7 +163,10 @@ iPhone app, which Instagram now rejects.) That means:
 - Not supported yet in messages: disappearing photos, voice messages,
   sending anything but text. They show a note to use instagram.com
   instead.
-- Open conversations refresh every 15 seconds and the conversation list
+- Open conversations check for new messages every 3 seconds while you're
+  in a live conversation (typing, sending or receiving in the last two
+  minutes), every 8 seconds for a while after, and every 15 seconds once
+  it's quiet or you're in another window. The conversation list refreshes
   every minute (every 30 seconds while Finsta is in the background with
   notifications on), so a notification can come up to that long after the
   message. When Instagram rate limits an endpoint, Finsta pauses that
