@@ -337,3 +337,13 @@ button.song-save {
   padding: 0;
   -gtk-icon-size: 12px;
 }
+
+/* A post video's seek bar and paused sign, over the video. */
+scale.video-seek {
+  border-radius: 999px;
+  padding: 2px 10px;
+}
+image.video-paused {
+  border-radius: 999px;
+  padding: 16px;
+}

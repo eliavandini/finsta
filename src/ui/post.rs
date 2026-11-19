@@ -812,5 +812,6 @@ fn single_media(media: &Media) -> gtk::Widget {
     let overlay = gtk::Overlay::builder().child(&picture).build();
     overlay.add_overlay(&video::mute_button());
     video::autoplay(&picture, video_url);
+    video::controls(&overlay, &picture);
     overlay.upcast()
 }

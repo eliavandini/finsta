@@ -28,7 +28,9 @@ There are no reels, no explore page, no suggested posts and no ads.
 - **Videos play by themselves while they're on screen**, muted and one at a
   time, and stop when you scroll past them. The speaker button turns the
   sound on for all of them, and also plays the song of a photo post that
-  has music. Stories play with sound, songs on photo stories included.
+  has music. Click a video to pause or resume it (or to play it instead of
+  the one playing), and drag the bar along its bottom to jump. Stories play
+  with sound, songs on photo stories included.
 
 ## Layout
 

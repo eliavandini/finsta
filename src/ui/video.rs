@@ -380,6 +380,19 @@ impl Player {
         (duration.nseconds() > 0).then(|| position.nseconds() as f64 / duration.nseconds() as f64)
     }
 
+    /// Jump to `fraction` (0 to 1) of `ticket`'s video.
+    pub fn seek(&self, ticket: u64, fraction: f64) {
+        if !self.owns(ticket) || self.segment.get().is_some() {
+            return;
+        }
+        let Some(duration) = self.playbin.query_duration::<gst::ClockTime>() else { return };
+        let to = gst::ClockTime::from_nseconds((duration.nseconds() as f64 * fraction.clamp(0.0, 1.0)) as u64);
+        self.ended.set(false);
+        // A paused video shows the new frame only as a fresh "preroll".
+        self.has_frame.set(false);
+        let _ = self.playbin.seek_simple(gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT, to);
+    }
+
     pub fn failed(&self, ticket: u64) -> bool {
         self.owns(ticket) && self.failed.get()
     }
@@ -416,12 +429,12 @@ impl Drop for Exclusive {
 
 /// The newest decoded frame, as a texture (None if there's no new one).
 fn next_frame(sink: &gst::Element, first: bool) -> Option<gdk::Texture> {
-    let sample = sink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&0u64]);
-    // A paused video's first frame only arrives as the "preroll".
-    let sample = match sample {
+    // A paused video's first frame (also after a jump) only arrives as the
+    // "preroll", and asking for a sample first throws it away.
+    let preroll = if first { sink.emit_by_name::<Option<gst::Sample>>("try-pull-preroll", &[&0u64]) } else { None };
+    let sample = match preroll {
         Some(s) => s,
-        None if first => sink.emit_by_name::<Option<gst::Sample>>("try-pull-preroll", &[&0u64])?,
-        None => return None,
+        None => sink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&0u64])?,
     };
     let caps = sample.caps()?;
     let s = caps.structure(0)?;
@@ -468,6 +481,8 @@ thread_local! {
     static NEXT_SLOT: Cell<u64> = const { Cell::new(0) };
     /// The slot playing now, and its ticket.
     static CURRENT: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
+    /// You paused the video that's playing now.
+    static PAUSED: Cell<bool> = const { Cell::new(false) };
     static FAILED: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     static POLLING: Cell<bool> = const { Cell::new(false) };
     static MUTED: Cell<bool> = const { Cell::new(true) };
@@ -599,6 +614,7 @@ fn poll() {
                 }
             };
             CURRENT.set(Some((id, ticket)));
+            PAUSED.set(false);
         }
         Some(_) => {}
         None => {
@@ -608,6 +624,107 @@ fn poll() {
             }
         }
     }
+}
+
+/// The ticket of the video drawn in `picture`, if it's the one playing now.
+fn ticket_of(picture: &gtk::Picture) -> Option<u64> {
+    let (slot, ticket) = CURRENT.get()?;
+    let shown = SLOTS.with(|s| {
+        s.borrow().iter().any(|x| x.id == slot && x.widget.upgrade().is_some_and(|w| &w == picture.upcast_ref::<gtk::Widget>()))
+    });
+    shown.then_some(ticket)
+}
+
+/// A post video's controls, over it in `overlay`: click it to pause or play
+/// (or to play it, if another video is playing), and a bar to seek.
+pub fn controls(overlay: &gtk::Overlay, picture: &gtk::Picture) {
+    let bar = gtk::Scale::builder()
+        .adjustment(&gtk::Adjustment::new(0.0, 0.0, 1.0, 0.01, 0.05, 0.0))
+        .draw_value(false)
+        .valign(gtk::Align::End)
+        .margin_start(10)
+        .margin_end(60)
+        .margin_bottom(14)
+        .css_classes(["osd", "video-seek"])
+        .visible(false)
+        .build();
+    let paused_icon = gtk::Image::builder()
+        .icon_name("media-playback-start-symbolic")
+        .pixel_size(32)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["osd", "video-paused"])
+        .can_target(false)
+        .visible(false)
+        .build();
+    overlay.add_overlay(&paused_icon);
+    overlay.add_overlay(&bar);
+
+    let pic = picture.downgrade();
+    bar.connect_change_value(move |_, _, value| {
+        if let (Some(player), Some(ticket)) = (Player::get(), pic.upgrade().as_ref().and_then(ticket_of)) {
+            player.seek(ticket, value);
+        }
+        glib::Propagation::Proceed
+    });
+
+    let (pic, b, icon) = (picture.downgrade(), bar.downgrade(), paused_icon.downgrade());
+    let update = move || {
+        let (Some(picture), Some(bar), Some(icon)) = (pic.upgrade(), b.upgrade(), icon.upgrade()) else { return false };
+        let ticket = ticket_of(&picture);
+        let progress = ticket.and_then(|t| Player::get()?.progress(t));
+        bar.set_visible(progress.is_some());
+        if let Some(p) = progress {
+            bar.set_value(p);
+        }
+        icon.set_visible(ticket.is_some() && PAUSED.get());
+        true
+    };
+    let update = Rc::new(update);
+    let u = update.clone();
+    glib::timeout_add_local(Duration::from_millis(250), move || {
+        if u() { glib::ControlFlow::Continue } else { glib::ControlFlow::Break }
+    });
+
+    let click = gtk::GestureClick::new();
+    let pic = picture.downgrade();
+    click.connect_released(move |gesture, presses, _, _| {
+        let (Some(picture), Some(player)) = (pic.upgrade(), Player::get()) else { return };
+        if presses != 1 || player.exclusive.get() > 0 {
+            return;
+        }
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        match ticket_of(&picture) {
+            Some(ticket) if !player.failed(ticket) => {
+                let paused = !PAUSED.get();
+                PAUSED.set(paused);
+                player.set_playing(ticket, !paused);
+            }
+            _ => play_now(&player, &picture),
+        }
+        update();
+    });
+    picture.add_controller(click);
+}
+
+/// Play the video drawn in `picture` now, instead of what's playing.
+fn play_now(player: &Player, picture: &gtk::Picture) {
+    let found = SLOTS.with(|s| {
+        s.borrow().iter().find_map(|x| match &x.source {
+            Source::Video(url) if x.widget.upgrade().is_some_and(|w| &w == picture.upcast_ref::<gtk::Widget>()) => {
+                Some((x.id, url.clone()))
+            }
+            _ => None,
+        })
+    });
+    let Some((id, url)) = found else { return };
+    if let Some((_, ticket)) = CURRENT.get() {
+        player.release(ticket);
+    }
+    FAILED.with(|f| f.borrow_mut().remove(&url));
+    let ticket = player.play(Some(picture), &url, Opts { muted: MUTED.get(), looping: true, playing: true });
+    CURRENT.set(Some((id, ticket)));
+    PAUSED.set(false);
 }
 
 fn is_song_slot(id: u64) -> bool {

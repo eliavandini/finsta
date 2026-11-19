@@ -852,6 +852,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def serve_file(self, file, ctype):
+        """Like a CDN: can send part of the file (unless --no-ranges)."""
+        body = open(file, "rb").read()
+        rng = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+        if rng and "--no-ranges" not in sys.argv:
+            a = int(rng.group(1))
+            b = int(rng.group(2)) if rng.group(2) else len(body) - 1
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {a}-{b}/{len(body)}")
+            body = body[a:b + 1]
+        else:
+            self.send_response(200)
+        self.send_header("Accept-Ranges", "none" if "--no-ranges" in sys.argv else "bytes")
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def route(self, method):
         u = urlparse(self.path)
         q = parse_qs(u.query)
@@ -873,42 +894,14 @@ class Handler(BaseHTTPRequestHandler):
                                              "images": {"fixed_width_still": {"url": img(f"gif-{words}-{i}", 200, 150 + 20 * (i % 3)), "width": "200", "height": str(150 + 20 * (i % 3))}}}
                                             for i in range(0 if words == "nothing" else 9)]})
         if path == "/aud/song.ogg" and AUDIO:
-            # Like a CDN, this one can send part of the file.
-            body = open(AUDIO, "rb").read()
-            rng = re.match(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
-            if rng and "--no-ranges" not in sys.argv:
-                a = int(rng.group(1))
-                b = int(rng.group(2)) if rng.group(2) else len(body) - 1
-                self.send_response(206)
-                self.send_header("Content-Range", f"bytes {a}-{b}/{len(body)}")
-                body = body[a:b + 1]
-            else:
-                self.send_response(200)
-            self.send_header("Accept-Ranges", "none" if "--no-ranges" in sys.argv else "bytes")
-            self.send_header("Content-Type", "audio/ogg")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            try:
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
+            return self.serve_file(AUDIO, "audio/ogg")
         if path == "/mock/incoming":
             key = int(q.get("key", ["30001"])[0])
             sender = CONVOS[key][2][0]
             MESSAGES[key].append(msg(f"in{time.time_ns()}", sender, NOW - int(time.time()), q.get("text", ["Hello?"])[0]))
             return self.send_json({"status": "ok"})
         if path.startswith("/vid/") and path[5:] in VIDEOS:
-            body = open(os.path.join(os.environ["FINSTA_MOCK_VIDEOS"], path[5:]), "rb").read()
-            self.send_response(200)
-            self.send_header("Content-Type", "video/mp4")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            try:
-                self.wfile.write(body)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            return
+            return self.serve_file(os.path.join(os.environ["FINSTA_MOCK_VIDEOS"], path[5:]), "video/mp4")
         if path.startswith("/rsrc.php/"):
             js = script(path.rsplit("/", 1)[1]).encode()
             self.send_response(200)
