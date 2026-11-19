@@ -29,7 +29,10 @@ cp -L "$brew/opt/libsoup/lib/libsoup-3.0.0.dylib" "$c/Frameworks/"
 # Copy every Homebrew library these need into Frameworks and point them there.
 modules=()
 while IFS= read -r f; do modules+=(-x "$f"); done < <(find "$res/lib" "$c/Frameworks" -name '*.so' -o -name '*.dylib')
-dylibbundler -of -cd -b -d "$c/Frameworks" -p @executable_path/../Frameworks/ -x "$c/MacOS/finsta-bin" "${modules[@]}"
+# -s: where @rpath libraries are (the SVG loader's librsvg, for one). It asks on
+# the terminal for any it can't find, so no input: fail instead of waiting.
+dylibbundler -of -cd -b -s "$brew/lib" -d "$c/Frameworks" -p @executable_path/../Frameworks/ \
+    -x "$c/MacOS/finsta-bin" "${modules[@]}" < /dev/null
 
 # The image loader list, with the bundle's place filled in at launch.
 loaders="$res/lib/gdk-pixbuf-2.0/2.10.0/loaders"
