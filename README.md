@@ -71,9 +71,10 @@ There are no reels, no explore page, no suggested posts and no ads.
 - **Messages**: right-click a message to react with an emoji (pick yours
   again to take it back), copy its text or open what it shares; reactions
   show under the message. Double-click a message to reply to it. Type `:`
-  and a name (`:pizza`) to search for an emoji while you write. The GIF
-  button next to the message box searches GIPHY and sends the GIF you pick;
-  it needs your own GIPHY API key (free at developers.giphy.com) in
+  and a name (`:pizza`) to search for an emoji while you write. GIFs and
+  stickers play while they're on screen. The GIF button next to the message
+  box searches GIPHY for GIFs or stickers and sends the one you pick; it
+  needs your own GIPHY API key (free at developers.giphy.com) in
   Preferences. Only your searches go to GIPHY.
 - **Preferences** (main menu, <kbd>Ctrl</kbd>+<kbd>,</kbd>): run in the
   background (closing the window keeps Finsta running; Quit is in the main

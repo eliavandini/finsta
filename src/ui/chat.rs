@@ -787,7 +787,8 @@ impl Chat {
 
     fn send_gif(self: &Rc<Self>, gif: crate::api::Gif) {
         let mut extra = serde_json::Map::new();
-        extra.insert("animated_media".into(), serde_json::json!({ "images": { "fixed_height": { "url": gif.still } } }));
+        let size = serde_json::json!({ "url": gif.preview, "width": 1000, "height": (1000.0 * gif.aspect) as i64 });
+        extra.insert("animated_media".into(), serde_json::json!({ "images": { "fixed_height": size }, "is_sticker": gif.sticker }));
         self.deliver("animated_media", extra, String::new(), move |client, to, reply| async move {
             client.send_gif(&to, &gif, reply.as_deref()).await
         });
@@ -1075,6 +1076,11 @@ fn message_menu(chat: &Rc<Chat>, bubble: &gtk::Widget, item: &DmItem) {
 
 /// The GIF button: search GIPHY (with your key from Preferences) and send one.
 fn gif_button(chat: &Rc<Chat>) -> gtk::MenuButton {
+    let gifs_tab = gtk::ToggleButton::builder().label("GIFs").active(true).build();
+    let stickers_tab = gtk::ToggleButton::builder().label("Stickers").group(&gifs_tab).build();
+    let tabs = gtk::Box::builder().css_classes(["linked"]).halign(gtk::Align::Center).build();
+    tabs.append(&gifs_tab);
+    tabs.append(&stickers_tab);
     let search = gtk::SearchEntry::builder().placeholder_text("Search GIPHY").build();
     let status = gtk::Label::builder()
         .wrap(true)
@@ -1098,13 +1104,14 @@ fn gif_button(chat: &Rc<Chat>) -> gtk::MenuButton {
         .child(&grid)
         .build();
     let column = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    column.append(&tabs);
     column.append(&search);
     column.append(&status);
     column.append(&scroller);
     let popover = gtk::Popover::builder().child(&column).build();
     let button = gtk::MenuButton::builder()
         .label("GIF")
-        .tooltip_text("Send a GIF")
+        .tooltip_text("Send a GIF or sticker")
         .popover(&popover)
         .valign(gtk::Align::Center)
         .css_classes(["flat"])
@@ -1113,8 +1120,12 @@ fn gif_button(chat: &Rc<Chat>) -> gtk::MenuButton {
     // Results of an older search that arrive late are dropped.
     let generation = Rc::new(Cell::new(0u32));
     let (weak, grid, status, popover_ref) = (Rc::downgrade(chat), grid.downgrade(), status.downgrade(), popover.downgrade());
+    let tab = stickers_tab.downgrade();
     let load = Rc::new(move |query: String| {
-        let (Some(c), Some(grid), Some(status)) = (weak.upgrade(), grid.upgrade(), status.upgrade()) else { return };
+        let (Some(c), Some(grid), Some(status), Some(tab)) = (weak.upgrade(), grid.upgrade(), status.upgrade(), tab.upgrade()) else {
+            return;
+        };
+        let stickers = tab.is_active();
         let Some(main) = c.main.upgrade() else { return };
         while let Some(child) = grid.first_child() {
             grid.remove(&child);
@@ -1122,7 +1133,7 @@ fn gif_button(chat: &Rc<Chat>) -> gtk::MenuButton {
         status.set_visible(true);
         let key = crate::ui::prefs::get().giphy_key;
         if key.is_empty() {
-            status.set_label("To send GIFs, add your GIPHY API key in Preferences.");
+            status.set_label("To send GIFs and stickers, add your GIPHY API key in Preferences.");
             return;
         }
         status.set_label("Loading…");
@@ -1131,17 +1142,17 @@ fn gif_button(chat: &Rc<Chat>) -> gtk::MenuButton {
         let (generation, weak, popover) = (generation.clone(), weak.clone(), popover_ref.clone());
         let client = main.client.clone();
         glib::spawn_future_local(async move {
-            let res = rt::bg(async move { client.search_gifs(&key, &query).await }).await;
+            let res = rt::bg(async move { client.search_gifs(&key, &query, stickers).await }).await;
             if generation.get() != n {
                 return;
             }
             match res {
-                Ok(gifs) if gifs.is_empty() => status.set_label("No GIFs found"),
+                Ok(gifs) if gifs.is_empty() => status.set_label(if stickers { "No stickers found" } else { "No GIFs found" }),
                 Ok(gifs) => {
                     status.set_visible(false);
                     for gif in gifs {
                         let pick = gtk::Button::builder()
-                            .child(&media_thumb(Some(gif.still.clone()), gif.aspect, 110, false))
+                            .child(&animated_thumb(Some(gif.preview.clone()), gif.aspect, 110))
                             .tooltip_text("Send")
                             .css_classes(["flat"])
                             .build();
@@ -1162,15 +1173,16 @@ fn gif_button(chat: &Rc<Chat>) -> gtk::MenuButton {
                     status.set_label(if e.to_string().contains("API key") {
                         "GIPHY didn't accept your API key. Check it in Preferences."
                     } else {
-                        "Couldn't load GIFs. Try again in a moment."
+                        "Couldn't reach GIPHY. Try again in a moment."
                     });
                 }
             }
         });
     });
-    let l = load.clone();
-    let s = search.clone();
+    let (l, s) = (load.clone(), search.clone());
     popover.connect_show(move |_| l(s.text().to_string()));
+    let (l, s) = (load.clone(), search.clone());
+    stickers_tab.connect_toggled(move |_| l(s.text().to_string()));
     search.connect_search_changed(move |s| load(s.text().to_string()));
     // The search box takes Escape; it closes the picker.
     let p = popover.downgrade();
@@ -1224,6 +1236,14 @@ fn text_label(markup: &str) -> gtk::Label {
         .selectable(true)
         .max_width_chars(52)
         .build()
+}
+
+/// A GIF or sticker, playing, at most `size` wide and tall.
+fn animated_thumb(url: Option<String>, aspect: f64, size: i32) -> gtk::Widget {
+    let picture = gtk::Picture::builder().content_fit(gtk::ContentFit::Contain).can_shrink(true).build();
+    images::load_animated(&picture, url);
+    let width = (size as f64 / aspect.max(1.0)).round() as i32;
+    RatioBin::fixed(aspect, width, &picture).upcast()
 }
 
 fn media_thumb(url: Option<String>, aspect: f64, width: i32, video: bool) -> gtk::Widget {
@@ -1562,10 +1582,12 @@ fn message_widget(
             }
             b.upcast()
         }
-        DmContent::Gif(url) => {
-            let thumb = media_thumb(url, 1.0, 180, false);
-            thumb.add_css_class("rounded");
-            thumb.set_overflow(gtk::Overflow::Hidden);
+        DmContent::Gif { url, aspect, sticker } => {
+            let thumb = animated_thumb(url, aspect, if sticker { 140 } else { 220 });
+            if !sticker {
+                thumb.add_css_class("rounded");
+                thumb.set_overflow(gtk::Overflow::Hidden);
+            }
             thumb.set_halign(align);
             thumb
         }

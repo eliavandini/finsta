@@ -671,7 +671,7 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 11;
+const META_SCANNER: u64 = 12;
 
 /// How a story reply was delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -685,6 +685,8 @@ pub enum StoryReply {
 /// Website code that calls the operations Finsta uses: saved (to
 /// webcode/callers/) to work out the inputs the website passes them.
 const CALLER_NEEDLES: &[&str] = &[
+    "IGDComposerRichContentStickersV2",
+    "IGDirectStoreStickerSendMutation",
     "PolarisProfilePostsQuery",
     "PolarisProfilePageContentQuery",
     "PolarisStoriesV3ReelPageStandaloneQuery",
@@ -1917,9 +1919,7 @@ impl Client {
         self.dm_tasks(&mut st, "mark read", vec![task("21", read, key.to_string())]).await
     }
 
-    /// React to a message with an emoji, or take back your reaction (`on`
-    /// false, with the emoji you had reacted with).
-    /// Send a GIF from GIPHY; as its link if Instagram turns it down.
+    /// Send a GIF or sticker from GIPHY; as its link if Instagram turns it down.
     pub async fn send_gif(&self, to: &Recipient, gif: &super::Gif, reply_to: Option<&str>) -> Result<Option<String>> {
         let native = {
             let mut st = self.inner.dm.lock().await;
@@ -1927,7 +1927,7 @@ impl Client {
                 self.dm_load_page(&mut st).await?;
             }
             if Self::slide_mode(&st) {
-                self.slide_send_gif(&mut st, to, &gif.id, reply_to).await
+                self.slide_send_gif(&mut st, to, gif, reply_to).await
             } else {
                 Err(anyhow!("not available on the older chat route"))
             }
@@ -1954,6 +1954,8 @@ impl Client {
         self.slide_story_share(&mut st, to, media_pk).await
     }
 
+    /// React to a message with an emoji, or take back your reaction (`on`
+    /// false, with the emoji you had reacted with).
     pub async fn react(&self, thread_id: &str, item_id: &str, emoji: &str, on: bool) -> Result<()> {
         let mut st = self.inner.dm.lock().await;
         if st.config.is_none() {

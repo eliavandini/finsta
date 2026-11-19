@@ -28,6 +28,7 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import struct
@@ -51,6 +52,11 @@ COLORS = [(232, 93, 117), (88, 140, 240), (80, 190, 140), (245, 180, 60), (150, 
 
 def img(name, w=1080, h=1080):
     return f"{BASE}/img/{name}_{w}x{h}.jpg"
+
+
+def anim(name, w=200, h=200):
+    """An animated WebP (a ball going round, see-through around it), like GIFs and stickers."""
+    return f"{BASE}/anim/{name}_{w}x{h}.webp"
 
 
 def user(pk, username, full, following=True):
@@ -189,6 +195,8 @@ MESSAGES = {
         msg("a5s", 20001, 312, attach=("xma", "https://www.instagram.com/stories/marta.rossi/910012/?utm_source=ig", None)),
         msg("a5b", 20001, 310, attach=("raven",)),
         msg("a5c", 20001, 305, attach=("audio",)),
+        msg("a5d", 20001, 304, attach=("gif", anim("hello-sticker", 200, 200), True)),
+        msg("a5e", 20001, 303, attach=("cutout", anim("cutout", 160, 200))),
         {**msg("a6", 20001, 300, "Are you coming tonight? 🍕"), "reactions": [("\u2764", ME_CHAT), ("\u2764\ufe0f", 20001)]},
     ],
     30002: [msg("g1", ME_CHAT, 4300, "Saturday works for me"), msg("g2", 20002, 4200, "Who has a car?"),
@@ -297,7 +305,7 @@ REPLY_DOC = "24000000000000006"
 REACT_DOC = "24000000000000007"
 SHARE_DOC = "24000000000000008"
 GIF_DOC = "24000000000000009"
-GIPHY_KEY = "mockgiphykey"  # FINSTA_GIPHY_BASE=http://127.0.0.1:8765/giphy/ and this key in Preferences
+GIPHY_KEY = "mockgiphykey"  # FINSTA_GIPHY_BASE=http://127.0.0.1:8765/giphy/ and this key in Preferences (GIFs and stickers)
 SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read", REPLY_DOC: "story reply",
               REACT_DOC: "react", SHARE_DOC: "story share", GIF_DOC: "gif"}
 REPLY_FAILS = "--reply-fails" in sys.argv  # story replies fail natively (as on instagram.com in November 2026)
@@ -388,7 +396,10 @@ def slide_content(m):
         return {"__typename": "SlideMessageImageContent", "attachments": [{"attachment_fbid": "1", "preview_cdn_url": a[1], "attachment_cdn_url": a[1],
                                                                              "preview_width": 1080, "preview_height": 1350}]}
     if a[0] == "gif":
-        return {"__typename": "SlideMessageAnimatedMediaContent", "animated_media": [{"attachment_webp_url": a[1], "preview_width": 200, "preview_height": 150}]}
+        return {"__typename": "SlideMessageAnimatedMediaContent", "animated_media": [{"attachment_webp_url": a[1], "preview_width": 200,
+                                                                                      "preview_height": 200 if a[2:] == (True,) else 150, "is_sticker": a[2:] == (True,)}]}
+    if a[0] == "cutout":
+        return {"__typename": "SlideMessageCutoutStickerXMAContent", "preview_url": a[1], "preview_width": 160, "preview_height": 200}
     if a[0] == "raven":
         return {"__typename": "SlideMessageRavenImageContent", "attachment": {"__typename": "XFBSlideAttachment", "preview_cdn_url": img("secret", 100, 100)}}
     if a[0] == "audio":
@@ -472,9 +483,9 @@ def slide_answer(op, v):
                 or set(sd) != {"forwarded_from_thread_id", "is_forwarded_from_own_message", "offline_threading_id", "recipient_users", "reply_to_message_id", "send_attribution", "thread_id"}:
             return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
         key = int(sd["thread_id"]) if str(sd.get("thread_id") or "").isdigit() and int(sd["thread_id"]) in MESSAGES else None
-        if key is None or not str(d.get("sticker_id", "")).startswith("gif") or not sd.get("offline_threading_id"):
+        if key is None or not str(d.get("sticker_id", "")).startswith("stk" if d["is_sticker"] else "gif") or not sd.get("offline_threading_id"):
             return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
-        sent = msg(f"gf{time.time_ns()}", ME_CHAT, 0, attach=("gif", img(d["sticker_id"], 200, 150)))
+        sent = msg(f"gf{time.time_ns()}", ME_CHAT, 0, attach=("gif", anim(d["sticker_id"], 200, 200 if d["is_sticker"] else 150), d["is_sticker"]))
         sent["ts"] = time.time_ns() // 1_000_000
         sent["reply"] = next((m for m in MESSAGES[key] if m["mid"] == d["reply_to_message_id"]), None)
         MESSAGES[key].append(sent)
@@ -833,6 +844,27 @@ class Handler(BaseHTTPRequestHandler):
         MESSAGES[key].append(reply)
         self.publish("/ls_resp", json.dumps({"request_id": None, "payload": ls_program(message_calls(key, [reply])), "sp": ["insertMessage"]}))
 
+    def serve_anim(self, name):
+        m = re.match(r"(.+)_(\d+)x(\d+)\.webp", name)
+        label, w, h = m.group(1), int(m.group(2)), int(m.group(3))
+        color = COLORS[hash(label) % len(COLORS)]
+        frames = []
+        for i in range(8):
+            im = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(im)
+            x, y = w // 2 + int(w / 4 * math.cos(i * math.pi / 4)), h // 2 + int(h / 4 * math.sin(i * math.pi / 4))
+            d.ellipse([x - w // 6, y - w // 6, x + w // 6, y + w // 6], fill=color + (255,))
+            d.text((4, 4), label, fill=(255, 255, 255, 255))
+            frames.append(im)
+        buf = io.BytesIO()
+        frames[0].save(buf, "WEBP", save_all=True, append_images=frames[1:], duration=120, loop=0, lossless=True)
+        body = buf.getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/webp")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def serve_image(self, name):
         m = re.match(r"(.+)_(\d+)x(\d+)\.jpg", name)
         label, w, h = m.group(1), int(m.group(2)), int(m.group(3))
@@ -886,12 +918,18 @@ class Handler(BaseHTTPRequestHandler):
             f.write(f"{method} :{PORT}{path} q={dict(q)} body={body} cookie={self.headers.get('Cookie')} csrf={self.headers.get('X-CSRFToken')} app={self.headers.get('X-IG-App-ID')} xhr={self.headers.get('X-Requested-With')} origin={self.headers.get('Origin')} ua={self.headers.get('User-Agent')}\n")
         if path.startswith("/img/"):
             return self.serve_image(path[5:])
-        if path in ("/giphy/trending", "/giphy/search"):
+        if path.startswith("/anim/"):
+            return self.serve_anim(path[6:])
+        m = re.fullmatch(r"/giphy/(gifs|stickers)/(trending|search)", path)
+        if m:
             if q.get("api_key") != [GIPHY_KEY]:
                 return self.send_json({"meta": {"status": 401, "msg": "Unauthorized"}}, 401)
-            words = q.get("q", ["trending"])[0]
-            return self.send_json({"data": [{"id": f"gif{i}", "url": f"https://giphy.com/gifs/gif{i}",
-                                             "images": {"fixed_width_still": {"url": img(f"gif-{words}-{i}", 200, 150 + 20 * (i % 3)), "width": "200", "height": str(150 + 20 * (i % 3))}}}
+            words, kind = q.get("q", ["trending"])[0], "stk" if m.group(1) == "stickers" else "gif"
+            def images(i):
+                w, h = 100, 75 + 10 * (i % 3)
+                return {"fixed_width_still": {"url": img(f"{kind}-{words}-{i}", w * 2, h * 2), "width": str(w * 2), "height": str(h * 2)},
+                        "fixed_width_small": {"url": "x", "webp": anim(f"{kind}-{words}-{i}", w, h), "width": str(w), "height": str(h)}}
+            return self.send_json({"data": [{"id": f"{kind}{i}", "url": f"https://giphy.com/{m.group(1)}/{kind}{i}", "images": images(i)}
                                             for i in range(0 if words == "nothing" else 9)]})
         if path == "/aud/song.ogg" and AUDIO:
             return self.serve_file(AUDIO, "audio/ogg")

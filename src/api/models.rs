@@ -691,7 +691,8 @@ pub enum DmContent {
         url: Option<String>,
         duration_ms: i64,
     },
-    Gif(Option<String>),
+    /// A GIF or a sticker (no bubble); `aspect` is height / width.
+    Gif { url: Option<String>, aspect: f64, sticker: bool },
     Disappearing(Disappearing),
     Info(String),
 }
@@ -949,11 +950,14 @@ impl DmItem {
                 }
             }
             "animated_media" => {
-                let images = &self.get("animated_media")["images"];
-                DmContent::Gif(
-                    non_empty(str_at(images, &["fixed_height", "url"]))
-                        .or_else(|| non_empty(str_at(images, &["fixed_height", "webp"]))),
-                )
+                let a = self.get("animated_media");
+                let size = &a["images"]["fixed_height"];
+                let (w, h) = (value_i64(&size["width"]), value_i64(&size["height"]));
+                DmContent::Gif {
+                    url: non_empty(str_at(size, &["url"])).or_else(|| non_empty(str_at(size, &["webp"]))),
+                    aspect: if w > 0 && h > 0 { h as f64 / w as f64 } else { 1.0 },
+                    sticker: a["is_sticker"].as_bool() == Some(true),
+                }
             }
             "action_log" => DmContent::Info(
                 non_empty(str_at(self.get("action_log"), &["description"]))
@@ -1021,7 +1025,8 @@ impl DmContent {
             ),
             DmContent::Shared { title, .. } => title.clone(),
             DmContent::Voice { .. } => "Voice message".into(),
-            DmContent::Gif(_) => "Sent a GIF".into(),
+            DmContent::Gif { sticker: true, .. } => "Sent a sticker".into(),
+            DmContent::Gif { .. } => "Sent a GIF".into(),
             DmContent::Disappearing(d) => format!("Sent a disappearing {}", d.kind()),
             DmContent::Info(i) => i.clone(),
         }

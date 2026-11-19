@@ -93,6 +93,12 @@ fn media(image: &str, width: i64, height: i64, video: Option<&str>) -> Value {
     m
 }
 
+/// A GIF or a sticker, as the older chat route sends it.
+fn animated(v: &mut Value, url: &str, width: i64, height: i64, sticker: bool) {
+    v["item_type"] = "animated_media".into();
+    v["animated_media"] = json!({"images": {"fixed_height": {"url": url, "width": width, "height": height}}, "is_sticker": sticker});
+}
+
 fn placeholder(v: &mut Value, message: &str) {
     v["item_type"] = "placeholder".into();
     v["placeholder"] = json!({"message": message});
@@ -224,10 +230,13 @@ impl SlideState {
             "SlideMessageAnimatedMediaContent" => {
                 let a = first("animated_media");
                 match url(&a, &["attachment_webp_url", "preview_cdn_url"]) {
-                    Some(image) => {
-                        v["item_type"] = "media".into();
-                        v["media"] = media(&image, n(&a["preview_width"]), n(&a["preview_height"]), None);
-                    }
+                    Some(image) => animated(
+                        &mut v,
+                        &image,
+                        n(&a["preview_width"]),
+                        n(&a["preview_height"]),
+                        a["is_sticker"].as_bool() == Some(true),
+                    ),
                     None => placeholder(&mut v, "GIF. Open it on instagram.com."),
                 }
             }
@@ -235,10 +244,7 @@ impl SlideState {
             | "SlideMessageCutoutStickerXMAContent"
             | "SlideMessageAIStickerXMAContent"
             | "SlideMessageAvatarStickerXMAContent" => match url(c, &["preview_url"]) {
-                Some(image) => {
-                    v["item_type"] = "media".into();
-                    v["media"] = media(&image, n(&c["preview_width"]), n(&c["preview_height"]), None);
-                }
+                Some(image) => animated(&mut v, &image, n(&c["preview_width"]), n(&c["preview_height"]), true),
                 None => placeholder(&mut v, "Sticker."),
             },
             "SlideMessageXMAContent" => {
@@ -664,13 +670,13 @@ impl Client {
         &self,
         st: &mut DmState,
         to: &Recipient,
-        gif_id: &str,
+        gif: &crate::api::Gif,
         reply_to: Option<&str>,
     ) -> Result<Option<String>> {
         let otid = time_id().to_string();
         let (thread, users) = slide_target(st, to)?;
         let vars = json!({
-            "data": {"is_random": false, "is_sticker": false, "reply_to_message_id": reply_to, "sticker_id": gif_id},
+            "data": {"is_random": false, "is_sticker": gif.sticker, "reply_to_message_id": reply_to, "sticker_id": gif.id},
             "send_data": {
                 "forwarded_from_thread_id": null,
                 "is_forwarded_from_own_message": null,
