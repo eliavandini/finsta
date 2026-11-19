@@ -593,6 +593,13 @@ impl Comment {
                 let (w, h) = (num(&c["width"]), num(&c["height"]));
                 return Some(CommentMedia { url: c["url"].as_str()?.into(), aspect: if w > 0.0 { h / w } else { 1.0 }, animated: false });
             }
+            // Any other picture: a link with its size.
+            if let Some(url) = v["url"].as_str().filter(|u| u.starts_with("http"))
+                && num(&v["width"]) > 0.0
+            {
+                let (w, h) = (num(&v["width"]), num(&v["height"]));
+                return Some(CommentMedia { url: url.into(), aspect: if h > 0.0 { h / w } else { 1.0 }, animated: false });
+            }
             match v {
                 _ if depth == 0 => None,
                 Value::Object(o) => o.values().find_map(|x| find(x, depth - 1)),
@@ -600,7 +607,27 @@ impl Comment {
                 _ => None,
             }
         }
-        self.extra.values().find_map(|v| find(v, 3))
+        self.extra.values().find_map(|v| find(v, 5))
+    }
+
+    /// The layout of `media_comment_info` (key names and value types, no
+    /// values), for the log when its picture isn't found.
+    pub fn media_shape(&self) -> Option<String> {
+        fn shape(v: &Value, depth: u8) -> String {
+            match v {
+                Value::Object(o) if depth > 0 => {
+                    format!("{{{}}}", o.iter().map(|(k, x)| format!("{k}:{}", shape(x, depth - 1))).collect::<Vec<_>>().join(","))
+                }
+                Value::Array(a) if depth > 0 => format!("[{}; {}]", a.len(), a.first().map(|x| shape(x, depth - 1)).unwrap_or_default()),
+                Value::Object(_) => "obj".into(),
+                Value::Array(_) => "list".into(),
+                Value::String(_) => "str".into(),
+                Value::Number(_) => "num".into(),
+                Value::Bool(_) => "bool".into(),
+                Value::Null => "null".into(),
+            }
+        }
+        self.extra.get("media_comment_info").map(|v| shape(v, 6))
     }
 }
 
@@ -1132,12 +1159,15 @@ mod tests {
             {"pk": 2, "text": "look", "media": {"image_versions2": {"candidates": [
                 {"url": "https://i/s.jpg", "width": 150, "height": 200}, {"url": "https://i/l.jpg", "width": 600, "height": 800}]}}},
             {"pk": 3, "text": "plain", "has_translation": true},
+            {"pk": 4, "media_comment_info": {"photo": {"url": "https://i/p.jpg", "width": 400, "height": 300}}},
         ]))
         .unwrap();
         assert_eq!(list[0].media(), Some(CommentMedia { url: "https://g/a.webp".into(), aspect: 0.5, animated: true }));
         let photo = list[1].media().unwrap();
         assert_eq!((photo.url.as_str(), photo.animated), ("https://i/l.jpg", false));
         assert_eq!(list[2].media(), None);
+        assert_eq!(list[3].media().map(|m| m.url), Some("https://i/p.jpg".into()));
+        assert_eq!(list[3].media_shape().as_deref(), Some("{photo:{height:num,url:str,width:num}}"));
     }
 
     /// A song's audio and the part of it a post or story plays.

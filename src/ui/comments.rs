@@ -86,7 +86,10 @@ fn comment_row(main: &Weak<Main>, c: &Comment, avatar_size: i32) -> gtk::Widget 
         }
         // Field names only, to learn the shape of what isn't shown.
         None if c.text.trim().is_empty() => {
-            eprintln!("finsta: a comment with nothing to show; fields {:?}", c.extra.keys().collect::<Vec<_>>())
+            eprintln!("finsta: a comment with nothing to show; fields {:?}", c.extra.keys().collect::<Vec<_>>());
+            if let Some(shape) = c.media_shape() {
+                eprintln!("finsta: its media_comment_info: {shape}");
+            }
         }
         None => {}
     }
