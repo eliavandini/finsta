@@ -165,7 +165,7 @@ impl Sidebar {
             .direction(gtk::ArrowType::Up)
             .css_classes(["flat", "circular"])
             .valign(gtk::Align::Center)
-            .menu_model(&crate::ui::window::accounts_menu(&main.client.user_id()))
+            .popover(&crate::ui::window::accounts_popover(&main.client.user_id()))
             .build();
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         footer.append(&profile_list);

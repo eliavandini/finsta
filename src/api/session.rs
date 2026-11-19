@@ -23,6 +23,9 @@ pub struct Session {
     /// the same one. Empty for pasted cookies (a default is used).
     #[serde(default)]
     pub user_agent: String,
+    /// For the account switcher; refreshed whenever this account is used.
+    #[serde(default)]
+    pub profile_pic_url: String,
 }
 
 impl Session {
@@ -33,6 +36,7 @@ impl Session {
             www_claim: "0".into(),
             username: String::new(),
             user_agent: String::new(),
+            profile_pic_url: String::new(),
         };
         let sessionid = session
             .cookies

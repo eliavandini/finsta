@@ -546,7 +546,14 @@ impl Client {
         let (username, first_name) = self.account().await?;
         let me = User { pk: self.user_id(), username: username.clone(), ..Default::default() };
         match self.profile(&me).await {
-            Ok(u) => Ok(u),
+            Ok(u) => {
+                let mut s = self.inner.session.write().unwrap();
+                if !u.profile_pic_url.is_empty() && s.profile_pic_url != u.profile_pic_url {
+                    s.profile_pic_url = u.profile_pic_url.clone();
+                    let _ = s.save();
+                }
+                Ok(u)
+            }
             Err(e) if is_login_required(&e) => Err(e),
             Err(_) => Ok(User {
                 pk: self.user_id(),

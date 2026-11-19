@@ -76,15 +76,30 @@ fn to_background(window: &adw::ApplicationWindow) {
     eprintln!("finsta: window closed; still running in the background");
 }
 
-/// Your other accounts, to switch to, and adding one (sidebar's profile row).
-pub fn accounts_menu(me: &str) -> gio::Menu {
-    let menu = gio::Menu::new();
+/// Your other accounts with their pictures, to switch to, and adding one
+/// (the sidebar's profile row).
+pub fn accounts_popover(me: &str) -> gtk::Popover {
+    let list = gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).css_classes(["navigation-sidebar"]).build();
+    let row = |icon: &gtk::Widget, text: &str, action: &str, target: Option<glib::Variant>| {
+        let b = gtk::Box::builder().spacing(10).margin_top(4).margin_bottom(4).build();
+        b.append(icon);
+        b.append(&gtk::Label::builder().label(text).xalign(0.0).hexpand(true).build());
+        let row = gtk::ListBoxRow::builder().child(&b).action_name(action).build();
+        row.set_action_target_value(target.as_ref());
+        list.append(&row);
+    };
     for other in Session::all().into_iter().filter(|s| s.user_id() != me) {
+        let user = User { username: other.username.clone(), profile_pic_url: other.profile_pic_url.clone(), ..Default::default() };
         let label = if other.username.is_empty() { "Another account".to_string() } else { format!("@{}", other.username) };
-        menu.append(Some(&label), Some(&format!("win.switch-account::{}", other.user_id())));
+        let avatar = crate::ui::util::avatar(&user, 28);
+        row(avatar.upcast_ref(), &label, "win.switch-account", Some(other.user_id().to_variant()));
     }
-    menu.append(Some("Add Account…"), Some("win.add-account"));
-    menu
+    let add = gtk::Image::builder().icon_name("list-add-symbolic").pixel_size(16).width_request(28).build();
+    row(add.upcast_ref(), "Add Account…", "win.add-account", None);
+    let popover = gtk::Popover::builder().child(&list).build();
+    let p = popover.clone();
+    list.connect_row_activated(move |_, _| p.popdown());
+    popover
 }
 
 /// Drop the shown account's UI state (stops its timers and videos).
