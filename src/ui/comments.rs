@@ -12,20 +12,41 @@ use crate::rt;
 use crate::ui::util;
 use crate::ui::window::Main;
 
-fn comment_row(c: &Comment, avatar_size: i32) -> gtk::Widget {
+/// A comment; its avatar and username open the commenter's profile.
+fn comment_row(main: &Weak<Main>, c: &Comment, avatar_size: i32) -> gtk::Widget {
     let row = gtk::Box::builder().spacing(10).build();
-    let avatar = util::avatar(&c.user, avatar_size);
-    avatar.set_valign(gtk::Align::Start);
+    let open = {
+        let (main, user) = (main.clone(), c.user.clone());
+        move || {
+            let Some(main) = main.upgrade() else { return };
+            // The comments dialog would cover the profile.
+            if let Some(dialog) = main.window.visible_dialog() {
+                dialog.force_close();
+            }
+            main.open_profile(user.clone());
+        }
+    };
+    let avatar = gtk::Button::builder()
+        .child(&util::avatar(&c.user, avatar_size))
+        .css_classes(["flat", "circular"])
+        .tooltip_text(format!("@{}", c.user.username))
+        .valign(gtk::Align::Start)
+        .build();
+    let o = open.clone();
+    avatar.connect_clicked(move |_| o());
     row.append(&avatar);
     let col = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
         .hexpand(true)
         .build();
+    // The name is a link but looks like plain bold text.
+    // shortcut: its color is fixed when the row is made, so a theme switch shows it until the comments reload.
     let text = gtk::Label::builder()
         .use_markup(true)
         .label(format!(
-            "<b>{}</b> {}",
+            "<a href=\"finsta:profile\"><span underline=\"none\" foreground=\"{}\"><b>{}</b></span></a> {}",
+            if adw::StyleManager::default().is_dark() { "#ffffff" } else { "#000000" },
             glib::markup_escape_text(&c.user.username),
             util::linkify(&c.text)
         ))
@@ -33,6 +54,13 @@ fn comment_row(c: &Comment, avatar_size: i32) -> gtk::Widget {
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
         .build();
+    text.connect_activate_link(move |_, uri| {
+        if uri != "finsta:profile" {
+            return glib::Propagation::Proceed;
+        }
+        open();
+        glib::Propagation::Stop
+    });
     let mut meta = util::relative_time(c.created_at);
     if c.comment_like_count > 0 {
         meta.push_str(&format!(" · {}", util::plural(c.comment_like_count, "like", "likes")));
@@ -52,7 +80,7 @@ fn comment_row(c: &Comment, avatar_size: i32) -> gtk::Widget {
 /// button that loads all of them, a page at a time.
 fn comment_thread(main: &Weak<Main>, media_id: &str, c: &Comment) -> gtk::Widget {
     let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).build();
-    column.append(&comment_row(c, 32));
+    column.append(&comment_row(main, c, 32));
     let shown = c.preview_child_comments.len() as i64;
     if c.child_comment_count.max(shown) == 0 {
         return column.upcast();
@@ -64,7 +92,7 @@ fn comment_thread(main: &Weak<Main>, media_id: &str, c: &Comment) -> gtk::Widget
         .margin_start(42)
         .build();
     for r in &c.preview_child_comments {
-        replies.append(&comment_row(r, 24));
+        replies.append(&comment_row(main, r, 24));
     }
     column.append(&replies);
     let hidden = c.child_comment_count - shown;
@@ -106,7 +134,7 @@ fn comment_thread(main: &Weak<Main>, media_id: &str, c: &Comment) -> gtk::Widget
                         list.remove(&button);
                     }
                     for r in &page {
-                        list.append(&comment_row(r, 24));
+                        list.append(&comment_row(&main, r, 24));
                     }
                     if let Some(next) = next {
                         cursor.replace(Some(next));
@@ -262,7 +290,7 @@ impl Panel {
                     {
                         p.list.remove(&first);
                     }
-                    p.list.append(&comment_row(&comment, 32));
+                    p.list.append(&comment_row(&p.main, &comment, 32));
                 }
                 Err(e) => {
                     if let Some(main) = p.main.upgrade() {

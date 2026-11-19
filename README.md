@@ -52,6 +52,7 @@ There are no reels, no explore page, no suggested posts and no ads.
 - **Posts** on a wide window show the photo or video on the left, and the
   account, caption, music, comments and a comment field on the right.
   Replies show under their comment ("View replies" loads all of them).
+  Click a commenter's picture or name to open their profile.
   Under each post: like, comment, share, download and save. After saving,
   "Add to Folder" puts the post in one of your folders.
 - **Sharing**: the paper plane button on posts, reels and stories sends
