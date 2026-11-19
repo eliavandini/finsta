@@ -796,7 +796,7 @@ fn media_content(media: &Media) -> gtk::Widget {
 
 fn single_media(media: &Media) -> gtk::Widget {
     let picture = gtk::Picture::builder()
-        .content_fit(gtk::ContentFit::Cover)
+        .content_fit(gtk::ContentFit::Contain)
         .can_shrink(true)
         .hexpand(true)
         .vexpand(true)
