@@ -123,7 +123,7 @@ To just try it from the source tree: `cargo run --release`.
 The Release workflow (`.github/workflows/release.yml`) builds an AppImage
 for Linux, a zip with `finsta.exe` for Windows and `Finsta.app` for macOS
 on Apple silicon. Pushing a tag like `v0.2.0` publishes them as a GitHub
-release; "Run workflow" on the Actions tab only builds them. The packaging
+release; it runs only then. The packaging
 steps are in `packaging/`. These builds sign in with a session cookie only
 (no WebKitGTK), and the macOS app isn't notarized: the first time, open it
 with right-click → Open.
