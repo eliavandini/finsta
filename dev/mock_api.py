@@ -295,8 +295,9 @@ WEB_MODULES = (
 )
 REPLY_DOC = "24000000000000006"
 REACT_DOC = "24000000000000007"
+SHARE_DOC = "24000000000000008"
 SLIDE_DOCS = {INBOX_DOC: "inbox", LIST_DOC: "more threads", MESSAGES_DOC: "messages", SEND_DOC: "send", MARK_DOC: "mark read", REPLY_DOC: "story reply",
-              REACT_DOC: "react"}
+              REACT_DOC: "react", SHARE_DOC: "story share"}
 REPLY_FAILS = "--reply-fails" in sys.argv  # story replies fail natively (as on instagram.com in November 2026)
 OFFMSYS = "--offmsys" in sys.argv  # instagram.com as of November 2026
 EMBED = "--embed" in sys.argv  # put the conversations in the page, as instagram.com did until late 2026
@@ -347,6 +348,7 @@ def script(name):
                 '__d("useIGDMarkThreadAsReadMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + MARK_DOC + '"}),null);'
                 '__d("IGDirectStoryShareReplyMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + REPLY_DOC + '"}),null);'
                 '__d("IGDirectReactionSendMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + REACT_DOC + '"}),null);'
+                '__d("IGDirectStoryShareMutation_instagramRelayOperation",[],(function(a,b,c,d,e,f){e.exports="' + SHARE_DOC + '"}),null);'
                 + "".join(f'__d("{n}_instagramRelayOperation",[],(function(a,b,c,d,e,f){{e.exports="{d}"}}),null);' for d, n in WEB_DOCS.items())
                 + WEB_MODULES +
                 '__d("IGDMaxUnreadMessagesCount.relayprovider",[],(function(t,n,r,o,a,i,l){l.get=function(){return 20}}),null);'
@@ -458,6 +460,21 @@ def slide_answer(op, v):
         if i["reaction_status"] == "created":
             m["reactions"].append((i["emoji"], ME_CHAT))
         return {"data": {"xig_direct_reaction_send_with_slide_messaging_response": {"success": True}}}
+    if op == "story share":
+        # As instagram.com's IGDMAPISendStoryShare builds it.
+        d, sd = v.get("data") or {}, v.get("send_data") or {}
+        if set(d) != {"is_shh_mode", "mutation_token", "nullable_text", "reel_id", "sampled", "share_client_context", "story_media_id", "story_share_type"} \
+                or set(sd) != {"forwarded_from_thread_id", "is_forwarded_from_own_message", "offline_threading_id", "recipient_users", "reply_to_message_id", "thread_id"}:
+            return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        pk = str(d.get("story_media_id", ""))
+        key = int(sd["thread_id"]) if str(sd.get("thread_id") or "").isdigit() and int(sd["thread_id"]) in MESSAGES else \
+            one_to_one(json.loads(sd["recipient_users"])[0]) if isinstance(sd.get("recipient_users"), str) else None
+        if not pk.isdigit() or pk[1:5] not in USERS or key is None or not sd.get("offline_threading_id"):
+            return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
+        sent = msg(f"st{time.time_ns()}", ME_CHAT, 0, attach=("xma", f"https://www.instagram.com/stories/{USERS[pk[1:5]]['username']}/{pk}/", None))
+        sent["ts"] = time.time_ns() // 1_000_000  # now, so messages sent one after another keep their order
+        MESSAGES[key].append(sent)
+        return {"data": {"direct_story_share_with_slide_message_response": {"message_id": sent["mid"], "timestamp_ms": str(sent["ts"]), "id": "x"}}}
     if op == "story reply":
         if REPLY_FAILS:
             return {"errors": [{"message": "A server error noncoercible_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
@@ -486,6 +503,7 @@ def slide_answer(op, v):
         if key is None or not v.get("offline_threading_id") or not v.get("text"):
             return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
         sent = msg(f"s{time.time_ns()}", ME_CHAT, 0, v["text"])
+        sent["ts"] = time.time_ns() // 1_000_000  # now, so messages sent one after another keep their order
         if v.get("reply_to_message_id") is not None:  # a reply: to a message id in this conversation
             sent["reply"] = next((m for m in MESSAGES[key] if m["mid"] == v["reply_to_message_id"]), None)
             if sent["reply"] is None:

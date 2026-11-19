@@ -151,9 +151,9 @@ iPhone app, which Instagram now rejects.) That means:
 - Message reactions, search, saving posts and saved folders use requests
   whose exact format Finsta learns from the website's scripts; until it has
   seen them, some of these may fail and say so in the log.
-- Shared posts, reels and stories are sent as links, which Instagram shows
-  as a preview. Sending them the way the app does needs a format Finsta
-  hasn't learned yet.
+- Shared posts and reels are sent as links, which Instagram shows as a
+  preview. Stories are sent as stories, like on instagram.com; if Instagram
+  turns that down, as a link.
 - Saved songs stay in Finsta (`~/.config/finsta/saved_songs.json`):
   instagram.com has no way to save a sound, so they don't appear in the
   app's saved audio.

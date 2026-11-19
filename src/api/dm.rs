@@ -1913,6 +1913,18 @@ impl Client {
 
     /// React to a message with an emoji, or take back your reaction (`on`
     /// false, with the emoji you had reacted with).
+    /// Share a story (its numeric id) as a story, not a link.
+    pub async fn share_story(&self, to: &Recipient, media_pk: &str) -> Result<()> {
+        let mut st = self.inner.dm.lock().await;
+        if st.config.is_none() {
+            self.dm_load_page(&mut st).await?;
+        }
+        if !Self::slide_mode(&st) {
+            bail!("not available on the older chat route");
+        }
+        self.slide_story_share(&mut st, to, media_pk).await
+    }
+
     pub async fn react(&self, thread_id: &str, item_id: &str, emoji: &str, on: bool) -> Result<()> {
         let mut st = self.inner.dm.lock().await;
         if st.config.is_none() {

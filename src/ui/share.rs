@@ -336,7 +336,20 @@ pub fn open(main: &Rc<Main>, shared: Shared, notify: Option<Notify>, on_closed: 
                     let mut last_err = None;
                     for to in &recipients {
                         let r = async {
-                            client.send_text(to, &url, None).await?;
+                            let as_story = match crate::api::web::story_link_pk(&url) {
+                                Some(pk) => match client.share_story(to, &pk).await {
+                                    Ok(()) => true,
+                                    Err(e) if crate::api::is_login_required(&e) => return Err(e),
+                                    Err(e) => {
+                                        eprintln!("finsta: share: story share failed ({e}); sending the link");
+                                        false
+                                    }
+                                },
+                                None => false,
+                            };
+                            if !as_story {
+                                client.send_text(to, &url, None).await?;
+                            }
                             if !text.is_empty() {
                                 client.send_text(to, &text, None).await?;
                             }
@@ -352,7 +365,7 @@ pub fn open(main: &Rc<Main>, shared: Shared, notify: Option<Notify>, on_closed: 
                 })
                 .await;
                 let (sent, err) = res;
-                eprintln!("finsta: share: sent a {} link to {sent} of {total} conversations", kind.name());
+                eprintln!("finsta: share: sent a {} to {sent} of {total} conversations", kind.name());
                 if let Some(d) = dialog.upgrade() {
                     d.close();
                 }

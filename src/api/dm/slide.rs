@@ -29,6 +29,7 @@ const MESSAGES: &str = "IGDMessageListOffMsysQuery";
 const SEND_TEXT: &str = "IGDirectTextSendMutation";
 const MARK_READ: &str = "useIGDMarkThreadAsReadMutation";
 const STORY_REPLY: &str = "IGDirectStoryShareReplyMutation";
+const STORY_SHARE: &str = "IGDirectStoryShareMutation";
 const REACT: &str = "IGDirectReactionSendMutation";
 
 /// Values the website computes on its side ("provided variables").
@@ -619,6 +620,46 @@ impl Client {
         let sent = &data["direct_story_share_reply_with_slide_message_response"];
         if s(&sent["message_id"]).is_empty() && s(&sent["id"]).is_empty() {
             bail!("Instagram didn't confirm the reply");
+        }
+        Ok(())
+    }
+
+    /// Share a story (its numeric id) the way instagram.com's
+    /// IGDMAPISendStoryShare does when forwarding one.
+    pub(super) async fn slide_story_share(&self, st: &mut DmState, to: &Recipient, media_pk: &str) -> Result<()> {
+        let otid = time_id().to_string();
+        let (thread, users) = match to {
+            Recipient::Thread(id) => {
+                let t = st.slide.threads.get(id).cloned().unwrap_or_default();
+                let fbid = [&t["thread_fbid"], &t["thread_key"]].into_iter().map(s).find(|x| !x.is_empty());
+                (Some(fbid.ok_or_else(|| anyhow!("Couldn't find this conversation's id"))?), None)
+            }
+            Recipient::User(pk) => (None, Some(json!([pk]).to_string())),
+        };
+        let vars = json!({
+            "data": {
+                "is_shh_mode": false,
+                "mutation_token": otid,
+                "nullable_text": null,
+                "reel_id": null,
+                "sampled": false,
+                "share_client_context": otid,
+                "story_media_id": media_pk,
+                "story_share_type": null,
+            },
+            "send_data": {
+                "forwarded_from_thread_id": null,
+                "is_forwarded_from_own_message": null,
+                "offline_threading_id": otid,
+                "recipient_users": users,
+                "reply_to_message_id": null,
+                "thread_id": thread,
+            },
+        });
+        let data = self.slide_op(st, STORY_SHARE, vars).await?;
+        let sent = &data["direct_story_share_with_slide_message_response"];
+        if s(&sent["message_id"]).is_empty() && s(&sent["id"]).is_empty() {
+            bail!("Instagram didn't confirm the story");
         }
         Ok(())
     }
