@@ -351,6 +351,7 @@ fn caption(media: &Media) -> Option<gtk::Widget> {
         .xalign(0.0)
         .lines(3)
         .ellipsize(gtk::pango::EllipsizeMode::End)
+        .selectable(true)
         .margin_start(12)
         .margin_end(12)
         .margin_top(6)

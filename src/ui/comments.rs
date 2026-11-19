@@ -53,6 +53,7 @@ fn comment_row(main: &Weak<Main>, c: &Comment, avatar_size: i32) -> gtk::Widget 
         .wrap(true)
         .wrap_mode(gtk::pango::WrapMode::WordChar)
         .xalign(0.0)
+        .selectable(true)
         .build();
     text.connect_activate_link(move |_, uri| {
         if uri != "finsta:profile" {
