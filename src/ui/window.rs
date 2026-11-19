@@ -76,6 +76,17 @@ fn to_background(window: &adw::ApplicationWindow) {
     eprintln!("finsta: window closed; still running in the background");
 }
 
+/// Your other accounts, to switch to, and adding one (sidebar's profile row).
+pub fn accounts_menu(me: &str) -> gio::Menu {
+    let menu = gio::Menu::new();
+    for other in Session::all().into_iter().filter(|s| s.user_id() != me) {
+        let label = if other.username.is_empty() { "Another account".to_string() } else { format!("@{}", other.username) };
+        menu.append(Some(&label), Some(&format!("win.switch-account::{}", other.user_id())));
+    }
+    menu.append(Some("Add Account…"), Some("win.add-account"));
+    menu
+}
+
 /// Drop the shown account's UI state (stops its timers and videos).
 fn drop_main(window: &adw::ApplicationWindow) {
     crate::ui::video::stop_all();
@@ -143,19 +154,8 @@ impl Main {
 
         let header = adw::HeaderBar::new();
         let app_menu = gio::Menu::new();
-        // Your other accounts, to switch to, and adding one.
-        let accounts = gio::Menu::new();
-        let me = client.user_id();
-        for other in Session::all().into_iter().filter(|s| s.user_id() != me) {
-            let label = if other.username.is_empty() { "Another account".to_string() } else { format!("@{}", other.username) };
-            accounts.append(Some(&label), Some(&format!("win.switch-account::{}", other.user_id())));
-        }
-        accounts.append(Some("Add Account…"), Some("win.add-account"));
-        app_menu.append_section(None, &accounts);
-        let general = gio::Menu::new();
-        general.append(Some("Preferences"), Some("win.preferences"));
-        general.append(Some("Quit"), Some("app.quit"));
-        app_menu.append_section(None, &general);
+        app_menu.append(Some("Preferences"), Some("win.preferences"));
+        app_menu.append(Some("Quit"), Some("app.quit"));
         header.pack_end(
             &gtk::MenuButton::builder()
                 .icon_name("open-menu-symbolic")

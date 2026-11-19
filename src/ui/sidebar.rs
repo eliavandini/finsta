@@ -159,8 +159,17 @@ impl Sidebar {
             .valign(gtk::Align::Center)
             .margin_end(8)
             .build();
+        let accounts_button = gtk::MenuButton::builder()
+            .icon_name("pan-up-symbolic")
+            .tooltip_text("Switch Account")
+            .direction(gtk::ArrowType::Up)
+            .css_classes(["flat", "circular"])
+            .valign(gtk::Align::Center)
+            .menu_model(&crate::ui::window::accounts_menu(&main.client.user_id()))
+            .build();
         let footer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         footer.append(&profile_list);
+        footer.append(&accounts_button);
         footer.append(&saved_button);
         widget.append(&footer);
 

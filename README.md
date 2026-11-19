@@ -137,8 +137,9 @@ with right-click → Open.
 Each account's session is stored in `~/.config/finsta/accounts/` with `0600`
 permissions. **Log Out** on your profile removes it.
 
-**Multiple accounts:** the main menu's **Add Account…** signs in another one;
-your other accounts are listed there to switch to. Finsta shows one account
+**Multiple accounts:** the arrow beside **Profile** at the bottom of the
+sidebar lists your other accounts to switch to, and **Add Account…** signs in
+another one. Finsta shows one account
 at a time and reopens the last one used. Logging out of one switches to
 another.
 
