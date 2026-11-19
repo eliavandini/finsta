@@ -276,7 +276,8 @@ WEB_DOCS = {"25000000000000006": "PolarisFeedTimelineRootV2Query", "250000000000
             "25000000000000008": "usePolarisStoryLikesLikeMutation", "25000000000000009": "usePolarisStoryLikesUnlikeMutation",
             "25000000000000010": "PolarisPostRootQuery", "25000000000000011": "PolarisSearchBoxRefetchableQuery",
             "25000000000000012": "IGDOmniPickerSearchResultsListQuery", "25000000000000013": "usePolarisSaveMediaSaveMutation",
-            "25000000000000014": "usePolarisSaveMediaUnsaveMutation", "25000000000000015": "PolarisSavedCollectionPickerQuery"}
+            "25000000000000014": "usePolarisSaveMediaUnsaveMutation", "25000000000000015": "PolarisSavedCollectionPickerQuery",
+            "25000000000000016": "usePolarisCommentCreateMutation"}
 SAVED = {"703": True}  # media pk -> saved
 FOLDERS = {"17841": ["Recipes", set()], "17842": ["Travel", set()]}
 SAVE_FAILS = "--save-fails" in sys.argv  # the website's save mutation fails, so the older route is used
@@ -678,6 +679,14 @@ def web_answer(name, v):
     if name == "PolarisStoriesV3ReelPageStandaloneQuery":
         reels = [{**reel(i), "id": str(i), "items": [nulls(x) for x in story_items(i, 5)], "cover_media": None, "title": None} for i in v["reel_ids_arr"] if i in USERS]
         return {"data": {"xdt_api__v1__feed__reels_media": {"reels_media": reels, "unviewable_authors_infos": []}, "xdt_viewer": {"user": {"id": ME}}}}
+    if name == "usePolarisCommentCreateMutation":
+        d = v.get("data") or {}
+        if not d.get("media_id") or not d.get("comment_text"):
+            return {"errors": [{"message": f'Variable "$data" got invalid value {json.dumps(d)}.', "severity": "CRITICAL", "code": 1675012}], "data": None}
+        me = USERS[ME]
+        return {"data": {"xig_comment_create": {"__typename": "XIGCommentCreateMutationSuccessResponse", "comment": {
+            "pk": "9002", "text": d["comment_text"], "created_at": NOW,
+            "user": {"pk": ME, "username": me["username"], "full_name": me["full_name"], "profile_pic_url": me["profile_pic_url"]}}}}}
     if name.startswith("usePolarisLikeMedia"):
         like = "XIGLike" in name
         i = v.get("input") or {}

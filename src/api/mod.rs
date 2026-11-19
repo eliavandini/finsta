@@ -956,8 +956,31 @@ impl Client {
         Ok((parse(&v["child_comments"]).unwrap_or_default(), next))
     }
 
-    /// Comment on a post, or with `reply_to` (a top-level comment's pk) reply in its thread.
+    /// Comment on a post, or with `reply_to` (a top-level comment's pk) reply
+    /// in its thread: the way instagram.com does it now, else the older route
+    /// (which answered 404 by 2026-11).
     pub async fn add_comment(&self, media_id: &str, text: &str, reply_to: Option<&str>) -> Result<Comment> {
+        // Inputs as in the like mutation; unconfirmed until the website's caller is saved.
+        let mut data = json!({"media_id": media_pk(media_id), "comment_text": text, "container_module": "feed_timeline"});
+        if let Some(pk) = reply_to {
+            data["replied_to_comment_id"] = json!(pk);
+        }
+        match self.web_query("usePolarisCommentCreateMutation", json!({"data": data, "root_connections": []}), WEB_REFERER).await {
+            Ok(d) => match parse::<Comment>(&d["xig_comment_create"]["comment"]) {
+                Some(mut comment) => {
+                    if comment.text.is_empty() {
+                        comment.text = text.to_string();
+                    }
+                    if comment.user.username.is_empty() {
+                        comment.user.username = self.session().username;
+                    }
+                    return Ok(comment);
+                }
+                None => eprintln!("finsta: comment: answered without the comment; trying the older route"),
+            },
+            Err(e) if is_login_required(&e) || is_rate_limited(&e) => return Err(e),
+            Err(e) => eprintln!("finsta: comment query failed ({e}); trying the older route"),
+        }
         let v = self
             .post(
                 &format!("web/comments/{}/add/", media_pk(media_id)),

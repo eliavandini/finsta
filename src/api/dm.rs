@@ -671,7 +671,7 @@ struct Meta {
 }
 
 /// Bumped when the way scripts are searched changes, so old results are redone.
-const META_SCANNER: u64 = 12;
+const META_SCANNER: u64 = 13;
 
 /// How a story reply was delivered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -680,6 +680,18 @@ pub enum StoryReply {
     Reply,
     /// As a message with a link to the story (when replies didn't work).
     Message,
+}
+
+/// An error message with quoted values hidden: "got invalid value {...}"
+/// errors quote what was sent (message text). Quoted field names stay.
+fn redact_quoted(s: &str) -> String {
+    let re = regex::Regex::new(r#"\{[^{}]*\}|"[^"]*""#).unwrap();
+    re.replace_all(s, |c: &regex::Captures| {
+        let m = &c[0];
+        let inner = m.trim_matches('"').trim_start_matches('$');
+        if m.starts_with('"') && is_identifier(inner) { m.to_string() } else { "…".to_string() }
+    })
+    .into_owned()
 }
 
 /// Website code that calls the operations Finsta uses: saved (to
@@ -692,6 +704,8 @@ const CALLER_NEEDLES: &[&str] = &[
     "PolarisStoriesV3ReelPageStandaloneQuery",
     "PolarisStoriesV3TrayContainerQuery",
     "usePolarisLikeMediaXIGLikeMutation",
+    "usePolarisCommentCreateMutation",
+    "usePolarisCommentSubmitMutation",
     "PolarisAPIReelSeenMutation",
     "usePolarisStoryLikesLikeMutation",
     "IGDirectStoryShareReplyMutation",
@@ -827,7 +841,7 @@ impl GraphqlAnswer {
             self.status, self.bytes, self.parts
         );
         for e in v["errors"].as_array().into_iter().flatten().take(4) {
-            let text = |k: &str| e[k].as_str().unwrap_or_default().chars().take(200).collect::<String>();
+            let text = |k: &str| redact_quoted(e[k].as_str().unwrap_or_default()).chars().take(200).collect::<String>();
             let path: Vec<String> = e["path"]
                 .as_array()
                 .into_iter()
@@ -2017,5 +2031,14 @@ impl Client {
     /// Finsta doesn't speak yet.
     pub async fn mark_visual_seen(&self, _thread_id: &str, _item_id: &str, _replay: bool) -> Result<()> {
         bail!("Disappearing photos can't be opened in Finsta yet. Open them on instagram.com.")
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    #[test]
+    fn hides_values() {
+        let m = r#"Variable "$data" got invalid value {"comment_text":"hi there","media_id":"1"}; Field "foo_bar" unknown, "a b""#;
+        assert_eq!(super::redact_quoted(m), r#"Variable "$data" got invalid value …; Field "foo_bar" unknown, …"#);
     }
 }
