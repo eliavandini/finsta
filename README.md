@@ -53,7 +53,8 @@ There are no reels, no explore page, no suggested posts and no ads.
   account, caption, music, comments and a comment field on the right.
   Replies show under their comment ("View replies" loads all of them).
   Click a commenter's picture or name to open their profile.
-  GIFs and photos in comments show under their text.
+  GIFs in comments show under their text. Instagram doesn't send photos in
+  comments to apps like Finsta, so those show its placeholder note instead.
   Under each post: like, comment, share, download and save. After saving,
   "Add to Folder" puts the post in one of your folders.
 - **Sharing**: the paper plane button on posts, reels and stories sends

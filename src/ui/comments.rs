@@ -84,6 +84,16 @@ fn comment_row(main: &Weak<Main>, c: &Comment, avatar_size: i32) -> gtk::Widget 
             thumb.set_margin_top(4);
             col.append(&thumb);
         }
+        None if c.media_placeholder().is_some() => {
+            let note = gtk::Label::builder()
+                .label(c.media_placeholder().unwrap_or_default())
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["dim-label"])
+                .build();
+            note.add_css_class("caption");
+            col.append(&note);
+        }
         // Field names only, to learn the shape of what isn't shown.
         None if c.text.trim().is_empty() => {
             eprintln!("finsta: a comment with nothing to show; fields {:?}", c.extra.keys().collect::<Vec<_>>());

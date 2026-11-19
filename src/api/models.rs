@@ -610,6 +610,12 @@ impl Comment {
         self.extra.values().find_map(|v| find(v, 5))
     }
 
+    /// What Instagram shows in place of a photo it doesn't send (the web
+    /// API gives only this text for photo comments).
+    pub fn media_placeholder(&self) -> Option<String> {
+        self.extra.get("media_comment_info")?["placeholder_text"].as_str().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string)
+    }
+
     /// The layout of `media_comment_info` (key names and value types, no
     /// values), for the log when its picture isn't found.
     pub fn media_shape(&self) -> Option<String> {
@@ -1160,6 +1166,7 @@ mod tests {
                 {"url": "https://i/s.jpg", "width": 150, "height": 200}, {"url": "https://i/l.jpg", "width": 600, "height": 800}]}}},
             {"pk": 3, "text": "plain", "has_translation": true},
             {"pk": 4, "media_comment_info": {"photo": {"url": "https://i/p.jpg", "width": 400, "height": 300}}},
+            {"pk": 5, "media_comment_info": {"placeholder_text": "Photo"}},
         ]))
         .unwrap();
         assert_eq!(list[0].media(), Some(CommentMedia { url: "https://g/a.webp".into(), aspect: 0.5, animated: true }));
@@ -1168,6 +1175,7 @@ mod tests {
         assert_eq!(list[2].media(), None);
         assert_eq!(list[3].media().map(|m| m.url), Some("https://i/p.jpg".into()));
         assert_eq!(list[3].media_shape().as_deref(), Some("{photo:{height:num,url:str,width:num}}"));
+        assert_eq!((list[4].media(), list[4].media_placeholder().as_deref()), (None, Some("Photo")));
     }
 
     /// A song's audio and the part of it a post or story plays.
