@@ -336,9 +336,9 @@ pub fn open(main: &Rc<Main>, shared: Shared, notify: Option<Notify>, on_closed: 
                     let mut last_err = None;
                     for to in &recipients {
                         let r = async {
-                            client.send_text(to, &url).await?;
+                            client.send_text(to, &url, None).await?;
                             if !text.is_empty() {
-                                client.send_text(to, &text).await?;
+                                client.send_text(to, &text, None).await?;
                             }
                             anyhow::Ok(())
                         }

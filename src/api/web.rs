@@ -73,6 +73,13 @@ pub fn link_code(url: &str) -> Option<String> {
         .then(|| code.to_string())
 }
 
+/// The story id in an instagram.com/stories/<user>/<id>/ link.
+pub fn story_link_pk(url: &str) -> Option<String> {
+    let path = url.split("instagram.com/stories/").nth(1)?;
+    let pk = path.split(['/', '?', '#']).nth(1)?;
+    (!pk.is_empty() && pk.bytes().all(|c| c.is_ascii_digit())).then(|| pk.to_string())
+}
+
 fn looks_like_media(o: &serde_json::Map<String, Value>) -> bool {
     o.get("code").and_then(Value::as_str).is_some_and(|c| !c.is_empty())
         && ["image_versions2", "carousel_media", "video_versions"]
@@ -165,8 +172,13 @@ impl Client {
             Err(e) => eprintln!("finsta: post query failed ({e}); trying the older route"),
         }
         let pk = shortcode_pk(code).ok_or_else(|| anyhow!("That isn't a link to a post"))?;
+        self.media_info(&pk).await
+    }
+
+    /// A post or story by its numeric id.
+    pub async fn media_info(&self, pk: &str) -> Result<Media> {
         let v = self.get(&format!("media/{pk}/info/"), &[]).await?;
-        parse::<Media>(&v["items"][0]).ok_or_else(|| anyhow!("This post isn't available"))
+        parse::<Media>(&v["items"][0]).ok_or_else(|| anyhow!("This isn't available anymore"))
     }
 
     /// The audio of a photo post's or photo story's song. instagram.com's
@@ -378,6 +390,8 @@ mod tests {
         assert_eq!(link_code("https://www.instagram.com/reel/ABC123/").as_deref(), Some("ABC123"));
         assert_eq!(link_code("https://www.instagram.com/someone/p/XYZ/").as_deref(), Some("XYZ"));
         assert_eq!(link_code("https://www.instagram.com/stories/someone/123/"), None);
+        assert_eq!(story_link_pk("https://www.instagram.com/stories/someone/123/?igsh=x").as_deref(), Some("123"));
+        assert_eq!(story_link_pk("https://www.instagram.com/stories/someone/"), None);
         assert_eq!(hashtag("#Sunset").as_deref(), Some("sunset"));
         assert_eq!(hashtag("sunset"), Some("sunset".into()));
         assert_eq!(hashtag("two words"), None);

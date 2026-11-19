@@ -1853,15 +1853,20 @@ impl Client {
         Ok(key.and_then(|k| parse(&st.store.thread_value(k, &self.user_id(), PAGE_SIZE, None))))
     }
 
-    /// Sends a text message and returns the id of the conversation it went to.
-    pub async fn send_text(&self, to: &Recipient, text: &str) -> Result<Option<String>> {
+    /// Sends a text message, as a reply to the message `reply_to` if given,
+    /// and returns the id of the conversation it went to.
+    pub async fn send_text(&self, to: &Recipient, text: &str, reply_to: Option<&str>) -> Result<Option<String>> {
         {
             let mut st = self.inner.dm.lock().await;
             if st.config.is_none() {
                 self.dm_load_page(&mut st).await?;
             }
             if Self::slide_mode(&st) {
-                return self.slide_send(&mut st, to, text).await;
+                return self.slide_send(&mut st, to, text, reply_to).await;
+            }
+            if reply_to.is_some() {
+                // shortcut: the older chat route sends replies as plain messages; add its reply field if accounts still use it.
+                eprintln!("finsta: dm: reply sent as a plain message (older chat route)");
             }
         }
         let key: i64 = match to {
@@ -1960,7 +1965,7 @@ impl Client {
             Err(e) => eprintln!("finsta: story reply: older route failed ({e})"),
         }
         let link = format!("https://www.instagram.com/stories/{}/{pk}/", owner.username);
-        self.send_text(&Recipient::User(owner.pk.clone()), &format!("{text}\n{link}")).await?;
+        self.send_text(&Recipient::User(owner.pk.clone()), &format!("{text}\n{link}"), None).await?;
         eprintln!("finsta: story reply: sent as a message with a link");
         Ok(StoryReply::Message)
     }

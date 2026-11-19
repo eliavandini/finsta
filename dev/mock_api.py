@@ -175,7 +175,7 @@ OLDER_CONVOS = {30004: ["", 1, [20005], (NOW - 864000) * 1000]}
 
 
 def msg(mid, sender, ago, text="", attach=None):
-    return {"mid": f"mid.$mock{mid}", "sender": sender, "ts": (NOW - ago) * 1000, "text": text, "attach": attach}
+    return {"mid": f"mid.$mock{mid}", "sender": sender, "ts": (NOW - ago) * 1000, "text": text, "attach": attach, "reply": None}
 
 
 MESSAGES = {
@@ -183,12 +183,13 @@ MESSAGES = {
         msg("a1", 20001, 90500, "Did you see the photos from Saturday?"),
         msg("a2", ME_CHAT, 90000, "Not yet, send them!"),
         msg("a3", 20001, 3100, attach=("blob", img("dmphoto", 1080, 1350))),
-        {**msg("a4", ME_CHAT, 3000, "Wow 😍"), "reactions": [("❤️", 20001)]},
+        {**msg("a4", ME_CHAT, 3000, "Wow 😍"), "reactions": [("\u2764", 20001)]},
         msg("a5", 20001, 320, attach=("xma", "https://www.instagram.com/p/C503xyz/", "Golden hour in Bologna")),
         msg("a5r", 20001, 315, attach=("xma", "https://www.instagram.com/reel/C777xyz/", "A reel about mountains")),
+        msg("a5s", 20001, 312, attach=("xma", "https://www.instagram.com/stories/marta.rossi/910012/?utm_source=ig", None)),
         msg("a5b", 20001, 310, attach=("raven",)),
         msg("a5c", 20001, 305, attach=("audio",)),
-        msg("a6", 20001, 300, "Are you coming tonight? 🍕"),
+        {**msg("a6", 20001, 300, "Are you coming tonight? 🍕"), "reactions": [("\u2764", ME_CHAT), ("\u2764\ufe0f", 20001)]},
     ],
     30002: [msg("g1", ME_CHAT, 4300, "Saturday works for me"), msg("g2", 20002, 4200, "Who has a car?"),
             msg("g3", 20004, 4000, "I'll bring the tent")],
@@ -385,7 +386,7 @@ def slide_content(m):
         return {"__typename": "SlideMessageRavenImageContent", "attachment": {"__typename": "XFBSlideAttachment", "preview_cdn_url": img("secret", 100, 100)}}
     if a[0] == "audio":
         return {"__typename": "SlideMessageAudiosContent", "audio_attachments": [{"attachment_cdn_url": f"{BASE}/vid/{VIDEOS[0]}" if VIDEOS else "x", "playable_duration_ms": 4000}]}
-    reel_link = "/reel/" in a[1]
+    reel_link = "/reel/" in a[1] or "/stories/" in a[1]
     w, h = (720, 1280) if reel_link else (640, 640)
     return {"__typename": "SlideMessageXMAContent", "xma_text_body": None,
             "xma": {"__typename": "SlideMessagePortraitXMA" if reel_link else "SlideMessageStandardXMA", "target_url": a[1],
@@ -396,7 +397,8 @@ def slide_content(m):
 def slide_message(m):
     return {"id": "node" + m["mid"], "message_id": m["mid"], "sender_fbid": str(m["sender"]), "timestamp_ms": str(m["ts"]), "__typename": "SlideMessage",
             "is_reported": False, "tombstone_reason": None, "content": slide_content(m), "igd_snippet": m["text"] or "sent an attachment",
-            "reactions": [{"reaction": e, "sender_fbid": str(s), "reaction_timestamp_ms": str(m["ts"] + 1000)} for e, s in m.get("reactions", [])]}
+            "reactions": [{"reaction": e, "sender_fbid": str(s), "reaction_timestamp_ms": str(m["ts"] + 1000)} for e, s in m.get("reactions", [])],
+            "replied_to_message": m["reply"] and {"id": "node" + m["reply"]["mid"], "sender_fbid": str(m["reply"]["sender"]), "content": slide_content(m["reply"])}}
 
 
 def slide_thread(key, convos):
@@ -484,6 +486,10 @@ def slide_answer(op, v):
         if key is None or not v.get("offline_threading_id") or not v.get("text"):
             return {"errors": [{"message": "A server error missing_required_variable_value occured.", "severity": "CRITICAL", "code": 1675012}], "data": None}
         sent = msg(f"s{time.time_ns()}", ME_CHAT, 0, v["text"])
+        if v.get("reply_to_message_id") is not None:  # a reply: to a message id in this conversation
+            sent["reply"] = next((m for m in MESSAGES[key] if m["mid"] == v["reply_to_message_id"]), None)
+            if sent["reply"] is None:
+                return {"errors": [{"message": "A server error field_exception occured.", "severity": "CRITICAL", "code": 1675030}], "data": None}
         MESSAGES[key].append(sent)
         return {"data": {"xig_direct_text_send_with_slide_messaging_response": {"message_id": sent["mid"], "timestamp_ms": str(sent["ts"]), "id": "x"}}}
 
@@ -1018,7 +1024,7 @@ class Handler(BaseHTTPRequestHandler):
             pk = m.group(1)
             found = next((e["node"]["media"] for e in following_feed() if (e["node"]["media"] or {}).get("pk") == int(pk)), None)
             if found is None and pk.startswith("9") and pk[1:5] in USERS:
-                found = next((x for x in story_items(pk[1:5], 5) if str(x["pk"]) == pk), None)
+                found = next(({**x, "user": USERS[pk[1:5]]} for x in story_items(pk[1:5], 5) if str(x["pk"]) == pk), None)
             return self.send_json({"items": [with_song_audio(found or media_by_code(f"C{pk}xyz"))], "status": "ok"})
         if p == "web/search/topsearch/":
             return self.send_json({"users": [{"position": i, "user": USERS[k]} for i, k in enumerate(["1001", "1005", "2002"])], "places": [], "hashtags": [], "status": "ok"})

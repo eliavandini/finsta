@@ -23,7 +23,8 @@ There are no reels, no explore page, no suggested posts and no ads.
   older conversations load only when you press a button.
 - **Shared posts and reels open one at a time.** A post or reel sent in a
   chat shows a preview; clicking it opens just that post, with its
-  comments, so a conversation can't turn into a reel feed.
+  comments, so a conversation can't turn into a reel feed. A shared story
+  opens in the story viewer.
 - **Videos play by themselves while they're on screen**, muted and one at a
   time, and stop when you scroll past them. The speaker button turns the
   sound on for all of them, and also plays the song of a photo post that
@@ -67,7 +68,8 @@ There are no reels, no explore page, no suggested posts and no ads.
   the link, view the profile, send a message.
 - **Messages**: right-click a message to react with an emoji (pick yours
   again to take it back), copy its text or open what it shares; reactions
-  show under the message.
+  show under the message. Double-click a message to reply to it. Type `:`
+  and a name (`:pizza`) to search for an emoji while you write.
 - **Preferences** (main menu, <kbd>Ctrl</kbd>+<kbd>,</kbd>): run in the
   background (closing the window keeps Finsta running; Quit is in the main
   menu, <kbd>Ctrl</kbd>+<kbd>Q</kbd>), start at login, and notifications.

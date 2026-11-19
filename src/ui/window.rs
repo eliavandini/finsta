@@ -507,9 +507,14 @@ impl Main {
         self.nav.push(&page);
     }
 
-    /// Open an instagram.com link to a post or reel as a post page; anything
-    /// else (or a post that can't be loaded) opens in the browser.
+    /// Open an instagram.com link to a post or reel as a post page, and one
+    /// to a story in the story viewer; anything else (or a post that can't be
+    /// loaded) opens in the browser.
     pub fn open_link(self: &Rc<Self>, url: &str) {
+        if let Some(pk) = api::web::story_link_pk(url) {
+            self.open_story(pk);
+            return;
+        }
         let Some(code) = api::web::link_code(url) else {
             crate::ui::util::open_uri(&self.window, url);
             return;
@@ -527,6 +532,28 @@ impl Main {
                     eprintln!("finsta: couldn't load a linked post: {e}");
                     main.toast("Couldn't load this post here, so it opens in your browser");
                     crate::ui::util::open_uri(&main.window, &url);
+                }
+            }
+        });
+    }
+
+    /// A single story, by its id, in the story viewer.
+    fn open_story(self: &Rc<Self>, pk: String) {
+        let weak = Rc::downgrade(self);
+        let client = self.client.clone();
+        glib::spawn_future_local(async move {
+            let res = rt::bg(async move { client.media_info(&pk).await }).await;
+            let Some(main) = weak.upgrade() else { return };
+            match res {
+                Ok(story) => {
+                    let user = story.user.clone().unwrap_or_default();
+                    let reel = Reel { id: user.pk.clone(), user, items: vec![story], ..Default::default() };
+                    main.open_stories(vec![reel], 0);
+                }
+                Err(e) if api::is_login_required(&e) => main.handle_error(&e),
+                Err(e) => {
+                    eprintln!("finsta: couldn't load a shared story: {e}");
+                    main.toast("This story isn't available anymore");
                 }
             }
         });

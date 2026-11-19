@@ -175,12 +175,16 @@ impl SlideState {
             .into_iter()
             .flatten()
             .filter_map(|r| {
-                let emoji = s(&r["reaction"]);
+                let emoji = igd_heart(s(&r["reaction"]));
                 (!emoji.is_empty()).then(|| json!({"emoji": emoji, "sender_id": self.sender(t, &s(&r["sender_fbid"]), viewer_pk)}))
             })
             .collect();
         if !reactions.is_empty() {
             v["reactions"] = json!({"emojis": reactions});
+        }
+        if m["replied_to_message"].is_object() {
+            let quoted = s(&m["replied_to_message"]["content"]["text_body"]);
+            v["replied_to_message"] = json!({"text": if quoted.is_empty() { "an attachment".into() } else { quoted }});
         }
         let c = &m["content"];
         if !m["tombstone_reason"].is_null() && m["tombstone_reason"] != "" {
@@ -576,7 +580,7 @@ impl Client {
             );
         }
         let input = json!({
-            "emoji": emoji,
+            "emoji": if emoji == IGD_HEART { SLIDE_HEART } else { emoji },
             "item_id": "",
             "message_id": message_id,
             "reaction_status": if on { "created" } else { "deleted" },
@@ -619,7 +623,13 @@ impl Client {
         Ok(())
     }
 
-    pub(super) async fn slide_send(&self, st: &mut DmState, to: &Recipient, text: &str) -> Result<Option<String>> {
+    pub(super) async fn slide_send(
+        &self,
+        st: &mut DmState,
+        to: &Recipient,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Option<String>> {
         let viewer_pk = self.user_id();
         let (thread, recipients) = match to {
             Recipient::Thread(id) => (Some(id.clone()), None),
@@ -638,6 +648,7 @@ impl Client {
             "offline_threading_id": time_id().to_string(),
             "text": text,
             "send_attribution": "direct_thread",
+            "reply_to_message_id": reply_to,
         });
         let data = self.slide_op(st, SEND_TEXT, vars).await?;
         let sent = &data["xig_direct_text_send_with_slide_messaging_response"];
@@ -711,6 +722,15 @@ impl Client {
         }
         Ok(())
     }
+}
+
+/// The heart as instagram.com shows it, and as its chat service stores it
+/// (IGDEmojiUtils' maybeConvertHeartEmojiForIGD/ForSlide): one reaction, two forms.
+const IGD_HEART: &str = "\u{2764}\u{fe0f}";
+const SLIDE_HEART: &str = "\u{2764}";
+
+fn igd_heart(emoji: String) -> String {
+    if emoji == SLIDE_HEART { IGD_HEART.into() } else { emoji }
 }
 
 /// What an Instagram link points to: "post", "reel" or "story".
@@ -791,5 +811,12 @@ mod tests {
         let item: crate::api::DmItem = parse(&st.item(&t, &reacted, "7")).unwrap();
         assert_eq!(item.reactions(), vec!["😂".to_string()]);
         assert_eq!(item.reaction_by("42").as_deref(), Some("😂"));
+        // Both forms of the heart are one reaction; a reply carries what it quotes.
+        let hearts = json!({"id": "m8", "sender_fbid": "100007", "content": {"__typename": "SlideMessageText", "text_body": "y"},
+            "reactions": [{"reaction": "\u{2764}", "sender_fbid": "100042"}, {"reaction": "\u{2764}\u{fe0f}", "sender_fbid": "100007"}],
+            "replied_to_message": {"id": "m7", "content": {"__typename": "SlideMessageText", "text_body": "x"}}});
+        let item: crate::api::DmItem = parse(&st.item(&t, &hearts, "7")).unwrap();
+        assert_eq!(item.reactions(), vec![IGD_HEART.to_string(), IGD_HEART.to_string()]);
+        assert_eq!(item.replied_to_text().as_deref(), Some("x"));
     }
 }

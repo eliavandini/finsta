@@ -51,6 +51,10 @@ struct Chat {
     empty: gtk::Label,
     entry: gtk::Entry,
     send_button: gtk::Button,
+    reply_bar: gtk::Box,
+    reply_label: gtk::Label,
+    /// The message the next one you send replies to.
+    reply_to: RefCell<Option<(String, String)>>,
     loading: Cell<bool>,
     sending: Cell<bool>,
     stick_to_bottom: Cell<bool>,
@@ -161,6 +165,8 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
     let entry = gtk::Entry::builder()
         .placeholder_text("Message…")
         .hexpand(true)
+        // Type ":" and a name to search emoji.
+        .enable_emoji_completion(true)
         .build();
     let send_button = gtk::Button::builder()
         .icon_name("mail-send-symbolic")
@@ -170,9 +176,26 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
     let composer_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     composer_row.append(&entry);
     composer_row.append(&send_button);
+    let reply_label = gtk::Label::builder()
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    let reply_cancel = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Don't Reply")
+        .css_classes(["flat", "circular"])
+        .build();
+    let reply_bar = gtk::Box::builder().spacing(6).visible(false).build();
+    reply_bar.append(&reply_label);
+    reply_bar.append(&reply_cancel);
+    let composer_column = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    composer_column.append(&reply_bar);
+    composer_column.append(&composer_row);
     let composer = adw::Clamp::builder()
         .maximum_size(780)
-        .child(&composer_row)
+        .child(&composer_column)
         .css_classes(["composer"])
         .build();
 
@@ -215,6 +238,9 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
         empty,
         entry,
         send_button,
+        reply_bar,
+        reply_label,
+        reply_to: RefCell::new(None),
         loading: Cell::new(false),
         sending: Cell::new(false),
         stick_to_bottom: Cell::new(true),
@@ -227,6 +253,12 @@ pub fn page(main: &Rc<Main>, target: ChatTarget) -> adw::NavigationPage {
         opening: Cell::new(false),
     });
 
+    let weak = Rc::downgrade(&chat);
+    reply_cancel.connect_clicked(move |_| {
+        if let Some(c) = weak.upgrade() {
+            c.set_reply(None);
+        }
+    });
     chat.render_header();
     chat.connect(&refresh);
     // Show the preview messages from the inbox right away.
@@ -689,6 +721,17 @@ impl Chat {
         });
     }
 
+    /// Reply to `item` with the next message you send (None: don't).
+    fn set_reply(&self, item: Option<&DmItem>) {
+        let reply = item.map(|i| (i.item_id.clone(), i.content().summary()));
+        if let Some((_, quote)) = &reply {
+            self.reply_label.set_label(&format!("Replying to: {quote}"));
+            self.entry.grab_focus();
+        }
+        self.reply_bar.set_visible(reply.is_some());
+        self.reply_to.replace(reply);
+    }
+
     fn send(self: &Rc<Self>) {
         let text = self.entry.text().trim().to_string();
         if text.is_empty() || self.sending.get() {
@@ -705,9 +748,14 @@ impl Chat {
         self.sending.set(true);
         self.send_button.set_sensitive(false);
         self.entry.set_text("");
+        let reply = self.reply_to.borrow().clone();
+        self.set_reply(None);
 
         let mut extra = serde_json::Map::new();
         extra.insert("text".into(), Value::String(text.clone()));
+        if let Some((_, quote)) = &reply {
+            extra.insert("replied_to_message".into(), serde_json::json!({ "text": quote }));
+        }
         self.pending.borrow_mut().push(DmItem {
             item_id: format!("pending:{}", uuid::Uuid::new_v4()),
             user_id: self.viewer_id.clone(),
@@ -723,7 +771,7 @@ impl Chat {
         glib::spawn_future_local(async move {
             let t = text.clone();
             let res = rt::bg(async move {
-                let thread_id = client.send_text(&recipient, &t).await?;
+                let thread_id = client.send_text(&recipient, &t, reply.as_ref().map(|(id, _)| id.as_str())).await?;
                 // Fetch the conversation so the sent message shows up for real.
                 let thread = match (thread_id, &recipient) {
                     (Some(id), _) => client.thread(&id, None).await.ok(),
@@ -1010,7 +1058,9 @@ fn shared_card(
     url: Option<String>,
     aspect: f64,
 ) -> gtk::Widget {
-    let in_app = url.as_deref().and_then(crate::api::web::link_code).is_some();
+    let in_app = url
+        .as_deref()
+        .is_some_and(|u| crate::api::web::link_code(u).is_some() || crate::api::web::story_link_pk(u).is_some());
     let is_reel = url.as_deref().is_some_and(|u| u.contains("/reel"));
     let width = if aspect > 1.1 { 200 } else { 240 };
     let card = gtk::Box::builder()
@@ -1334,6 +1384,20 @@ fn message_widget(
     column.append(&bubble);
     if !pending {
         message_menu(chat, &bubble, item);
+        if !item.item_id.is_empty() && !item.item_id.starts_with("snippet:") {
+            // Double-click: reply to it. Seen before the text inside, which would select a word.
+            let double = gtk::GestureClick::builder().propagation_phase(gtk::PropagationPhase::Capture).build();
+            let (weak, item) = (Rc::downgrade(chat), item.clone());
+            double.connect_pressed(move |gesture, presses, _, _| {
+                if presses == 2
+                    && let Some(c) = weak.upgrade()
+                {
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                    c.set_reply(Some(&item));
+                }
+            });
+            bubble.add_controller(double);
+        }
     }
 
     let reactions = item.reactions();
