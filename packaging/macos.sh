@@ -26,6 +26,12 @@ cp -RL "$brew/share/icons/Adwaita" "$brew/share/icons/hicolor" "$res/share/icons
 # Opened by GStreamer's souphttpsrc at run time.
 cp -L "$brew/opt/libsoup/lib/libsoup-3.0.0.dylib" "$c/Frameworks/"
 
+# The image loader list, with the bundle's place filled in at launch. Made
+# before the loaders are pointed at Frameworks, while they still load here.
+loaders="$res/lib/gdk-pixbuf-2.0/2.10.0/loaders"
+GDK_PIXBUF_MODULEDIR="$PWD/$loaders" gdk-pixbuf-query-loaders | sed "s#$PWD/$loaders#@LOADERS@#g" > "$res/loaders.cache.in"
+grep -q '@LOADERS@.*svg' "$res/loaders.cache.in" || { echo "no SVG loader in the loader list" >&2; exit 1; }
+
 # Copy every Homebrew library these need into Frameworks and point them there.
 modules=()
 while IFS= read -r f; do modules+=(-x "$f"); done < <(find "$res/lib" "$c/Frameworks" -name '*.so' -o -name '*.dylib')
@@ -34,9 +40,6 @@ while IFS= read -r f; do modules+=(-x "$f"); done < <(find "$res/lib" "$c/Framew
 dylibbundler -of -cd -b -s "$brew/lib" -d "$c/Frameworks" -p @executable_path/../Frameworks/ \
     -x "$c/MacOS/finsta-bin" "${modules[@]}" < /dev/null
 
-# The image loader list, with the bundle's place filled in at launch.
-loaders="$res/lib/gdk-pixbuf-2.0/2.10.0/loaders"
-GDK_PIXBUF_MODULEDIR="$loaders" gdk-pixbuf-query-loaders | sed "s#$PWD/$loaders#@LOADERS@#g" > "$res/loaders.cache.in"
 
 cat > "$c/MacOS/Finsta" <<'LAUNCH'
 #!/bin/sh
