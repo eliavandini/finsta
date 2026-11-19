@@ -52,7 +52,8 @@ There are no reels, no explore page, no suggested posts and no ads.
 - **Posts** on a wide window show the photo or video on the left, and the
   account, caption, music, comments and a comment field on the right.
   Replies show under their comment ("View replies" loads all of them).
-  Click a commenter's picture or name to open their profile.
+  Click a commenter's picture or name to open their profile, or **Reply**
+  to answer in that comment's thread.
   GIFs in comments show under their text. Instagram doesn't send photos in
   comments to apps like Finsta, so those show its placeholder note instead.
   Under each post: like, comment, share, download and save. After saving,

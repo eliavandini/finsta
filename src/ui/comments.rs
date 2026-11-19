@@ -1,7 +1,7 @@
 //! A post's comments (the first page) with a field to add one: in a dialog,
 //! or as a panel beside or below a post.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 
 use adw::prelude::*;
@@ -12,8 +12,13 @@ use crate::rt;
 use crate::ui::util;
 use crate::ui::window::Main;
 
-/// A comment; its avatar and username open the commenter's profile.
-fn comment_row(main: &Weak<Main>, c: &Comment, avatar_size: i32) -> gtk::Widget {
+/// Start a reply in a thread: its top comment's pk, who's answered, and the
+/// box its replies go in.
+type ReplyTo = Rc<dyn Fn(String, String, gtk::Box)>;
+
+/// A comment; its avatar and username open the commenter's profile, and
+/// `reply` (if any) adds a Reply button.
+fn comment_row(main: &Weak<Main>, c: &Comment, avatar_size: i32, reply: Option<Rc<dyn Fn()>>) -> gtk::Widget {
     let row = gtk::Box::builder().spacing(10).build();
     let open = {
         let (main, user) = (main.clone(), c.user.clone());
@@ -103,30 +108,50 @@ fn comment_row(main: &Weak<Main>, c: &Comment, avatar_size: i32) -> gtk::Widget 
         }
         None => {}
     }
-    col.append(&meta);
+    match reply {
+        Some(reply) => {
+            let line = gtk::Box::builder().spacing(4).build();
+            line.append(&meta);
+            let button = gtk::Button::builder()
+                .label("Reply")
+                .css_classes(["flat", "caption", "dim-label", "comment-reply"])
+                .build();
+            button.connect_clicked(move |_| reply());
+            line.append(&button);
+            col.append(&line);
+        }
+        None => col.append(&meta),
+    }
     row.append(&col);
     row.upcast()
 }
 
+/// The Reply action for a row in the thread of `top` (`pk`), whose replies go in `replies`.
+fn reply_action(reply: &ReplyTo, top_pk: &str, c: &Comment, replies: &gtk::Box) -> Option<Rc<dyn Fn()>> {
+    if top_pk.is_empty() {
+        return None;
+    }
+    let (reply, pk, user, replies) = (reply.clone(), top_pk.to_string(), c.user.username.clone(), replies.clone());
+    Some(Rc::new(move || reply(pk.clone(), user.clone(), replies.clone())))
+}
+
 /// A comment and, below it, its replies: those that came with it, and a
 /// button that loads all of them, a page at a time.
-fn comment_thread(main: &Weak<Main>, media_id: &str, c: &Comment) -> gtk::Widget {
+fn comment_thread(main: &Weak<Main>, media_id: &str, c: &Comment, reply: &ReplyTo) -> gtk::Widget {
     let column = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(10).build();
-    column.append(&comment_row(main, c, 32));
-    let shown = c.preview_child_comments.len() as i64;
-    if c.child_comment_count.max(shown) == 0 {
-        return column.upcast();
-    }
-    // Lined up with the comment's text.
+    // Lined up with the comment's text; hidden until it has replies.
     let replies = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
         .margin_start(42)
         .build();
-    for r in &c.preview_child_comments {
-        replies.append(&comment_row(main, r, 24));
-    }
+    column.append(&comment_row(main, c, 32, reply_action(reply, &c.pk, c, &replies)));
     column.append(&replies);
+    let shown = c.preview_child_comments.len() as i64;
+    replies.set_visible(c.child_comment_count.max(shown) > 0);
+    for r in &c.preview_child_comments {
+        replies.append(&comment_row(main, r, 24, reply_action(reply, &c.pk, r, &replies)));
+    }
     let hidden = c.child_comment_count - shown;
     if hidden <= 0 || c.pk.is_empty() {
         return column.upcast();
@@ -144,13 +169,13 @@ fn comment_thread(main: &Weak<Main>, media_id: &str, c: &Comment) -> gtk::Widget
     replies.append(&more);
     // None: nothing loaded yet (the first page replaces the replies shown).
     let cursor: Rc<std::cell::RefCell<Option<String>>> = Rc::default();
-    let (main, media_id, pk) = (main.clone(), media_id.to_string(), c.pk.clone());
+    let (main, media_id, pk, reply) = (main.clone(), media_id.to_string(), c.pk.clone(), reply.clone());
     let list = replies.downgrade();
     more.connect_clicked(move |button| {
         let Some(client) = main.upgrade().map(|m| m.client.clone()) else { return };
         button.set_sensitive(false);
         let (media_id, pk, after) = (media_id.clone(), pk.clone(), cursor.borrow().clone());
-        let (main, cursor, list, button) = (main.clone(), cursor.clone(), list.clone(), button.downgrade());
+        let (main, cursor, list, button, reply, top) = (main.clone(), cursor.clone(), list.clone(), button.downgrade(), reply.clone(), pk.clone());
         glib::spawn_future_local(async move {
             let first = after.is_none();
             let res = rt::bg(async move { client.comment_replies(&media_id, &pk, after.as_deref()).await }).await;
@@ -166,7 +191,7 @@ fn comment_thread(main: &Weak<Main>, media_id: &str, c: &Comment) -> gtk::Widget
                         list.remove(&button);
                     }
                     for r in &page {
-                        list.append(&comment_row(&main, r, 24));
+                        list.append(&comment_row(&main, r, 24, reply_action(&reply, &top, r, &list)));
                     }
                     if let Some(next) = next {
                         cursor.replace(Some(next));
@@ -210,6 +235,10 @@ pub struct Panel {
     pub entry: gtk::Entry,
     post: gtk::Button,
     loaded: Cell<bool>,
+    /// Replying in a thread: its top comment's pk and its replies box.
+    replying: RefCell<Option<(String, glib::WeakRef<gtk::Box>)>>,
+    /// Stops replying.
+    cancel: gtk::Button,
 }
 
 pub fn panel(main: &Rc<Main>, media: &Media) -> Rc<Panel> {
@@ -227,6 +256,14 @@ pub fn panel(main: &Rc<Main>, media: &Media) -> Rc<Panel> {
         .css_classes(["suggested-action"])
         .build();
     let composer = gtk::Box::builder().spacing(8).css_classes(["composer"]).build();
+    let cancel = gtk::Button::builder()
+        .icon_name("window-close-symbolic")
+        .tooltip_text("Cancel Reply")
+        .css_classes(["flat", "circular"])
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    composer.append(&cancel);
     composer.append(&entry);
     composer.append(&post);
     composer.set_visible(!media.comments_disabled);
@@ -240,8 +277,17 @@ pub fn panel(main: &Rc<Main>, media: &Media) -> Rc<Panel> {
         entry,
         post,
         loaded: Cell::new(false),
+        replying: RefCell::new(None),
+        cancel,
     });
     let weak = Rc::downgrade(&panel);
+    let w = weak.clone();
+    panel.cancel.connect_clicked(move |_| {
+        if let Some(p) = w.upgrade() {
+            p.stop_reply();
+            p.entry.set_text("");
+        }
+    });
     panel.entry.connect_activate(glib::clone!(
         #[strong]
         weak,
@@ -262,6 +308,25 @@ pub fn panel(main: &Rc<Main>, media: &Media) -> Rc<Panel> {
 }
 
 impl Panel {
+    fn reply_to(self: &Rc<Self>) -> ReplyTo {
+        let weak = Rc::downgrade(self);
+        Rc::new(move |pk, user, replies: gtk::Box| {
+            let Some(p) = weak.upgrade() else { return };
+            p.replying.replace(Some((pk, replies.downgrade())));
+            p.entry.set_placeholder_text(Some(&format!("Reply to @{user}…")));
+            p.entry.set_text(&format!("@{user} "));
+            p.cancel.set_visible(true);
+            p.entry.grab_focus();
+            p.entry.set_position(-1);
+        })
+    }
+
+    fn stop_reply(&self) {
+        self.replying.replace(None);
+        self.entry.set_placeholder_text(Some("Add a comment…"));
+        self.cancel.set_visible(false);
+    }
+
     /// Load the comments (once).
     pub fn load(self: &Rc<Self>) {
         if self.loaded.replace(true) {
@@ -283,8 +348,9 @@ impl Panel {
             match res {
                 Ok(comments) if comments.is_empty() => p.list.append(&note("No comments yet")),
                 Ok(comments) => {
+                    let reply = p.reply_to();
                     for c in &comments {
-                        p.list.append(&comment_thread(&p.main, &p.media_id, c));
+                        p.list.append(&comment_thread(&p.main, &p.media_id, c, &reply));
                     }
                 }
                 Err(e) => {
@@ -308,9 +374,11 @@ impl Panel {
         self.post.set_sensitive(false);
         let client = main.client.clone();
         let media_id = self.media_id.clone();
+        let replying = self.replying.borrow().clone();
+        let reply_pk = replying.as_ref().map(|r| r.0.clone());
         let weak = Rc::downgrade(self);
         glib::spawn_future_local(async move {
-            let res = rt::bg(async move { client.add_comment(&media_id, &text).await }).await;
+            let res = rt::bg(async move { client.add_comment(&media_id, &text, reply_pk.as_deref()).await }).await;
             let Some(p) = weak.upgrade() else { return };
             p.post.set_sensitive(true);
             match res {
@@ -322,7 +390,20 @@ impl Panel {
                     {
                         p.list.remove(&first);
                     }
-                    p.list.append(&comment_row(&p.main, &comment, 32));
+                    let reply = p.reply_to();
+                    match replying.and_then(|(pk, b)| Some((pk, b.upgrade()?))) {
+                        Some((pk, replies)) => {
+                            let row = comment_row(&p.main, &comment, 24, reply_action(&reply, &pk, &comment, &replies));
+                            // Above a "View replies" button, if there is one.
+                            match replies.last_child().filter(|w| w.is::<gtk::Button>()) {
+                                Some(more) => replies.insert_child_after(&row, more.prev_sibling().as_ref()),
+                                None => replies.append(&row),
+                            }
+                            replies.set_visible(true);
+                        }
+                        None => p.list.append(&comment_thread(&p.main, &p.media_id, &comment, &reply)),
+                    }
+                    p.stop_reply();
                 }
                 Err(e) => {
                     if let Some(main) = p.main.upgrade() {

@@ -956,11 +956,12 @@ impl Client {
         Ok((parse(&v["child_comments"]).unwrap_or_default(), next))
     }
 
-    pub async fn add_comment(&self, media_id: &str, text: &str) -> Result<Comment> {
+    /// Comment on a post, or with `reply_to` (a top-level comment's pk) reply in its thread.
+    pub async fn add_comment(&self, media_id: &str, text: &str, reply_to: Option<&str>) -> Result<Comment> {
         let v = self
             .post(
                 &format!("web/comments/{}/add/", media_pk(media_id)),
-                &[("comment_text", text.to_string()), ("replied_to_comment_id", String::new())],
+                &[("comment_text", text.to_string()), ("replied_to_comment_id", reply_to.unwrap_or_default().to_string())],
             )
             .await?;
         // The website gets {"id", "text", "created_time", "from": {...}} back.
