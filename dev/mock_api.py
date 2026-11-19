@@ -1131,6 +1131,10 @@ class Handler(BaseHTTPRequestHandler):
                 {"pk": 2, "text": "Where is this?", "user": USERS["1004"], "created_at": NOW - 4000, "preview_child_comments": None},
                 {"pk": 3, "text": "Which camera do you use?", "user": USERS["1005"], "created_at": NOW - 3900, "child_comment_count": 25,
                  "preview_child_comments": []},
+                {"pk": 4, "text": "", "user": USERS["1001"], "created_at": NOW - 3800, "giphy_media_info": {"first_party_cdn_proxied_images":
+                 {"fixed_height": {"url": anim("gif", 200, 150), "width": "200", "height": "150"}}}},
+                {"pk": 5, "text": "Here's mine", "user": USERS["1003"], "created_at": NOW - 3700, "comment_media": {"image_versions2":
+                 {"candidates": [{"url": img("cmt", 600, 800), "width": 600, "height": 800}]}}},
             ], "status": "ok"})
         if re.match(r"media/.+/(like|unlike)/", p):
             return self.send_json({"status": "ok"})

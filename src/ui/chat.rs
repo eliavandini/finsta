@@ -1239,14 +1239,14 @@ fn text_label(markup: &str) -> gtk::Label {
 }
 
 /// A GIF or sticker, playing, at most `size` wide and tall.
-fn animated_thumb(url: Option<String>, aspect: f64, size: i32) -> gtk::Widget {
+pub fn animated_thumb(url: Option<String>, aspect: f64, size: i32) -> gtk::Widget {
     let picture = gtk::Picture::builder().content_fit(gtk::ContentFit::Contain).can_shrink(true).build();
     images::load_animated(&picture, url);
     let width = (size as f64 / aspect.max(1.0)).round() as i32;
     RatioBin::fixed(aspect, width, &picture).upcast()
 }
 
-fn media_thumb(url: Option<String>, aspect: f64, width: i32, video: bool) -> gtk::Widget {
+pub fn media_thumb(url: Option<String>, aspect: f64, width: i32, video: bool) -> gtk::Widget {
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Cover)
         .can_shrink(true)

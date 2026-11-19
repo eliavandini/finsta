@@ -558,6 +558,50 @@ pub struct Comment {
     pub child_comment_count: i64,
     #[serde(default, deserialize_with = "de_or_default")]
     pub preview_child_comments: Vec<Comment>,
+    /// The other fields, where a GIF or photo attached to it is.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+/// A GIF or photo attached to a comment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommentMedia {
+    pub url: String,
+    /// Height / width.
+    pub aspect: f64,
+    pub animated: bool,
+}
+
+impl Comment {
+    /// Looks for the shapes Instagram uses elsewhere: GIPHY's
+    /// `fixed_height` (GIFs) and `image_versions2` (photos).
+    pub fn media(&self) -> Option<CommentMedia> {
+        fn num(v: &Value) -> f64 {
+            v.as_f64().or_else(|| v.as_str()?.parse().ok()).unwrap_or(0.0)
+        }
+        fn find(v: &Value, depth: u8) -> Option<CommentMedia> {
+            let gif = &v["fixed_height"];
+            let url = gif["webp"].as_str().filter(|u| !u.is_empty()).or(gif["url"].as_str()).filter(|u| !u.is_empty());
+            if let Some(url) = url {
+                let (w, h) = (num(&gif["width"]), num(&gif["height"]));
+                return Some(CommentMedia { url: url.into(), aspect: if w > 0.0 { h / w } else { 1.0 }, animated: true });
+            }
+            if let Some(c) = v["image_versions2"]["candidates"]
+                .as_array()
+                .and_then(|c| c.iter().filter(|c| c["url"].is_string()).max_by_key(|c| num(&c["width"]) as i64))
+            {
+                let (w, h) = (num(&c["width"]), num(&c["height"]));
+                return Some(CommentMedia { url: c["url"].as_str()?.into(), aspect: if w > 0.0 { h / w } else { 1.0 }, animated: false });
+            }
+            match v {
+                _ if depth == 0 => None,
+                Value::Object(o) => o.values().find_map(|x| find(x, depth - 1)),
+                Value::Array(a) => a.iter().find_map(|x| find(x, depth - 1)),
+                _ => None,
+            }
+        }
+        self.extra.values().find_map(|v| find(v, 3))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1078,6 +1122,22 @@ mod tests {
         assert_eq!((list[0].pk.as_str(), list[0].child_comment_count), ("17", 2));
         assert_eq!(list[0].preview_child_comments[0].pk, "18");
         assert!(list[1].preview_child_comments.is_empty());
+    }
+
+    #[test]
+    fn comment_media() {
+        let list: Vec<Comment> = parse(&json!([
+            {"pk": 1, "text": "", "giphy_media_info": {"first_party_cdn_proxied_images": {"fixed_height": {
+                "url": "https://g/a.gif", "webp": "https://g/a.webp", "width": "200", "height": "100"}}}},
+            {"pk": 2, "text": "look", "media": {"image_versions2": {"candidates": [
+                {"url": "https://i/s.jpg", "width": 150, "height": 200}, {"url": "https://i/l.jpg", "width": 600, "height": 800}]}}},
+            {"pk": 3, "text": "plain", "has_translation": true},
+        ]))
+        .unwrap();
+        assert_eq!(list[0].media(), Some(CommentMedia { url: "https://g/a.webp".into(), aspect: 0.5, animated: true }));
+        let photo = list[1].media().unwrap();
+        assert_eq!((photo.url.as_str(), photo.animated), ("https://i/l.jpg", false));
+        assert_eq!(list[2].media(), None);
     }
 
     /// A song's audio and the part of it a post or story plays.

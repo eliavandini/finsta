@@ -72,6 +72,24 @@ fn comment_row(main: &Weak<Main>, c: &Comment, avatar_size: i32) -> gtk::Widget 
         .css_classes(["caption", "dim-label"])
         .build();
     col.append(&text);
+    match c.media() {
+        Some(m) => {
+            let size = 160;
+            let thumb = if m.animated {
+                crate::ui::chat::animated_thumb(Some(m.url), m.aspect, size)
+            } else {
+                crate::ui::chat::media_thumb(Some(m.url), m.aspect, (size as f64 / m.aspect.max(1.0)) as i32, false)
+            };
+            thumb.set_halign(gtk::Align::Start);
+            thumb.set_margin_top(4);
+            col.append(&thumb);
+        }
+        // Field names only, to learn the shape of what isn't shown.
+        None if c.text.trim().is_empty() => {
+            eprintln!("finsta: a comment with nothing to show; fields {:?}", c.extra.keys().collect::<Vec<_>>())
+        }
+        None => {}
+    }
     col.append(&meta);
     row.append(&col);
     row.upcast()
