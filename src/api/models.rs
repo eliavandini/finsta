@@ -480,7 +480,8 @@ impl Media {
             .filter(|u| !u.is_empty())
     }
 
-    /// Height divided by width, clamped to what Instagram allows in feed.
+    /// Height divided by width, between Instagram's widest (1.91:1) and
+    /// tallest (9:16, reels; photos go up to 3:4) shapes.
     pub fn aspect(&self) -> f64 {
         let (w, h) = if self.original_width > 0 && self.original_height > 0 {
             (self.original_width, self.original_height)
@@ -496,7 +497,7 @@ impl Media {
         } else {
             (1, 1)
         };
-        (h as f64 / w as f64).clamp(0.5, 1.25)
+        (h as f64 / w as f64).clamp(0.5, 16.0 / 9.0)
     }
 
     pub fn caption_text(&self) -> String {
