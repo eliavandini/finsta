@@ -75,7 +75,7 @@ pub fn is_rate_limited(err: &anyhow::Error) -> bool {
 
 /// Paused endpoints (ids masked) and when they may be tried again. Instagram
 /// throttles endpoints separately, so one refusing doesn't stop the rest.
-/// Shared by every client, since the limits apply to the account.
+/// Shared by every client and account: limits may also apply to the network.
 static COOLDOWNS: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
 
 /// "users/123/info/" -> "users/*/info/", "feed/user/name/username/" ->

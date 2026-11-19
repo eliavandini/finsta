@@ -134,8 +134,13 @@ with right-click → Open.
 - **Session cookie**: paste the `sessionid` (and optionally `csrftoken`)
   cookie from a browser where you're signed in to instagram.com.
 
-The session is stored in `~/.config/finsta/session.json` with `0600`
+Each account's session is stored in `~/.config/finsta/accounts/` with `0600`
 permissions. **Log Out** on your profile removes it.
+
+**Multiple accounts:** the main menu's **Add Account…** signs in another one;
+your other accounts are listed there to switch to. Finsta shows one account
+at a time and reopens the last one used. Logging out of one switches to
+another.
 
 ## Caveats
 

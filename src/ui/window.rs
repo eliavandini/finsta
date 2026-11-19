@@ -57,7 +57,7 @@ pub fn build(app: &adw::Application, show: bool) {
     let signed_in = session.is_some();
     match session {
         Some(session) => show_main(&window, &toasts, session),
-        None => show_login(&window, &toasts),
+        None => show_login(&window, &toasts, None),
     }
     // Signing in needs the window.
     if show || !signed_in {
@@ -76,11 +76,26 @@ fn to_background(window: &adw::ApplicationWindow) {
     eprintln!("finsta: window closed; still running in the background");
 }
 
-fn show_login(window: &adw::ApplicationWindow, toasts: &adw::ToastOverlay) {
-    // Drop the previous session's UI state (stops its timers).
+/// Drop the shown account's UI state (stops its timers and videos).
+fn drop_main(window: &adw::ApplicationWindow) {
+    crate::ui::video::stop_all();
     unsafe {
         let _ = window.steal_data::<Rc<Main>>("finsta-main");
     }
+}
+
+/// The sign-in page; `back_to` (adding an account) can be gone back to.
+fn show_login(window: &adw::ApplicationWindow, toasts: &adw::ToastOverlay, back_to: Option<Session>) {
+    drop_main(window);
+    let cancel = back_to.map(|session| {
+        Rc::new(glib::clone!(
+            #[weak]
+            window,
+            #[weak]
+            toasts,
+            move || show_main(&window, &toasts, session.clone())
+        )) as Rc<dyn Fn()>
+    });
     let page = login::page(
         window,
         Rc::new(glib::clone!(
@@ -90,11 +105,24 @@ fn show_login(window: &adw::ApplicationWindow, toasts: &adw::ToastOverlay) {
             toasts,
             move |session| show_main(&window, &toasts, session)
         )),
+        cancel,
     );
     toasts.set_child(Some(&page));
 }
 
+/// Show another signed-in account if there is one, else the sign-in page.
+fn show_next_account(window: &adw::ApplicationWindow, toasts: &adw::ToastOverlay) {
+    match Session::load() {
+        Some(session) => show_main(window, toasts, session),
+        None => show_login(window, toasts, None),
+    }
+}
+
 fn show_main(window: &adw::ApplicationWindow, toasts: &adw::ToastOverlay, session: Session) {
+    drop_main(window);
+    if let Err(e) = session.make_current() {
+        eprintln!("finsta: couldn't remember the account in use: {e}");
+    }
     let main = Main::new(window, toasts, Client::new(session));
     toasts.set_child(Some(&main.root));
     unsafe {
@@ -115,8 +143,19 @@ impl Main {
 
         let header = adw::HeaderBar::new();
         let app_menu = gio::Menu::new();
-        app_menu.append(Some("Preferences"), Some("win.preferences"));
-        app_menu.append(Some("Quit"), Some("app.quit"));
+        // Your other accounts, to switch to, and adding one.
+        let accounts = gio::Menu::new();
+        let me = client.user_id();
+        for other in Session::all().into_iter().filter(|s| s.user_id() != me) {
+            let label = if other.username.is_empty() { "Another account".to_string() } else { format!("@{}", other.username) };
+            accounts.append(Some(&label), Some(&format!("win.switch-account::{}", other.user_id())));
+        }
+        accounts.append(Some("Add Account…"), Some("win.add-account"));
+        app_menu.append_section(None, &accounts);
+        let general = gio::Menu::new();
+        general.append(Some("Preferences"), Some("win.preferences"));
+        general.append(Some("Quit"), Some("app.quit"));
+        app_menu.append_section(None, &general);
         header.pack_end(
             &gtk::MenuButton::builder()
                 .icon_name("open-menu-symbolic")
@@ -216,6 +255,23 @@ impl Main {
             }
         });
         self.window.add_action(&preferences);
+        let switch = gio::SimpleAction::new("switch-account", Some(glib::VariantTy::STRING));
+        let w = weak.clone();
+        switch.connect_activate(move |_, id| {
+            let (Some(main), Some(id)) = (w.upgrade(), id.and_then(|v| v.get::<String>())) else { return };
+            if let Some(session) = Session::all().into_iter().find(|s| s.user_id() == id) {
+                show_main(&main.window, &main.toasts, session);
+            }
+        });
+        self.window.add_action(&switch);
+        let add = gio::SimpleAction::new("add-account", None);
+        let w = weak.clone();
+        add.connect_activate(move |_, _| {
+            if let Some(main) = w.upgrade() {
+                show_login(&main.window, &main.toasts, Some(main.client.session()));
+            }
+        });
+        self.window.add_action(&add);
         // A message notification was clicked.
         if let Some(app) = self.window.application() {
             let open = gio::SimpleAction::new("open-thread", Some(glib::VariantTy::STRING));
@@ -614,8 +670,8 @@ impl Main {
         if api::is_login_required(err) {
             if !self.logged_out.replace(true) {
                 self.toast(&err.to_string());
-                Session::delete();
-                show_login(&self.window, &self.toasts);
+                self.client.session().delete();
+                show_next_account(&self.window, &self.toasts);
             }
             return;
         }
@@ -639,7 +695,7 @@ impl Main {
         rt::runtime().spawn(async move {
             let _ = client.logout().await;
         });
-        Session::delete();
-        show_login(&self.window, &self.toasts);
+        self.client.session().delete();
+        show_next_account(&self.window, &self.toasts);
     }
 }

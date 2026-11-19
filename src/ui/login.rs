@@ -9,7 +9,8 @@ use gtk::glib;
 use crate::api::{Client, Session};
 use crate::rt;
 
-pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) -> gtk::Widget {
+/// The sign-in page; `on_cancel` (adding another account) adds a Cancel button.
+pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>, on_cancel: Option<Rc<dyn Fn()>>) -> gtk::Widget {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(18)
@@ -173,6 +174,11 @@ pub fn page(window: &adw::ApplicationWindow, on_success: Rc<dyn Fn(Session)>) ->
         .build();
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::builder().show_title(false).build();
+    if let Some(cancel) = on_cancel {
+        let button = gtk::Button::with_label("Cancel");
+        button.connect_clicked(move |_| cancel());
+        header.pack_start(&button);
+    }
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&scroller));
     toolbar.upcast()
